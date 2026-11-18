@@ -1,0 +1,912 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>11 · Performance &amp; Profiling — PyTorch</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<button class="sidebar-toggle" aria-label="Toggle navigation">☰ Menu</button>
+<div class="layout">
+<aside class="sidebar">
+  <a href="../index.html" class="brand">PyTorch</a>
+  <span class="brand-sub">a deep dive — 2026</span>
+  <nav>
+    <ol>
+      <li><a href="01-why-pytorch.html">Why PyTorch</a></li>
+      <li><a href="02-tensors.html">Tensors</a></li>
+      <li><a href="03-tensor-math.html">Tensor Math &amp; Broadcasting</a></li>
+      <li><a href="04-autograd.html">Autograd</a></li>
+      <li><a href="05-nn-module.html">nn.Module</a></li>
+      <li><a href="06-transformer-blocks.html">Building a Transformer</a></li>
+      <li><a href="07-losses-optimizers.html">Losses &amp; Optimizers</a></li>
+      <li><a href="08-training-loop.html">The Training Loop</a></li>
+      <li><a href="09-devices-precision.html">Devices &amp; Precision</a></li>
+      <li><a href="10-inference.html">Inference &amp; Sampling</a></li>
+      <li><a href="11-performance.html">Performance &amp; Profiling</a></li>
+      <li><a href="12-debugging.html">Debugging PyTorch</a></li>
+      <li><a href="13-50-questions.html">The 50 Questions</a></li>
+      <li><a href="14-capstone.html">Capstone Project</a></li>
+    </ol>
+    <div class="extras">
+      <a href="../exercises.html">All Exercises</a>
+      <a href="../index.html">← Home</a>
+    </div>
+  </nav>
+  <div class="progress"></div>
+</aside>
+
+<main class="content">
+
+<h1>
+  <span class="chap-num">Chapter 11</span>
+  Performance &amp; Profiling
+</h1>
+<p class="lede">
+  microgpt's fast path runs on one CPU thread, on purpose. This chapter
+  measures why: what a PyTorch operation costs before it does any
+  arithmetic, how to time code that runs asynchronously on a GPU, which
+  innocent calls stall the GPU, how to read a profiler table, the roofline
+  model that says whether you are short of FLOPs or of bytes, and what
+  <code>torch.compile</code> does about it. Every number here was measured,
+  and the method matters more than the numbers.
+</p>
+
+<h2 id="overhead">Why microgpt runs on one CPU thread</h2>
+
+<p>The first lines of <code>run_fast_training()</code>:</p>
+<div class="code" data-lang="python">
+<div class="code-hdr"><span class="lang">python</span><span class="title">microgpt.py</span></div>
+<pre><code># This model is too small to benefit from GPU kernel launches. One CPU
+# thread is considerably faster for its many tiny tensor operations.
+torch.set_num_threads(1)</code></pre>
+</div>
+
+<p>To see why, follow one operation, <code>a + b</code>, from Python to the result:</p>
+<ol>
+  <li>Python calls <code>Tensor.__add__</code>, which crosses into C++.</li>
+  <li>The <strong>dispatcher</strong>, PyTorch's routing table, picks an implementation from the tensors' device and dtype, checks that the shapes broadcast, and allocates the output tensor. If any input requires grad, autograd records a node.</li>
+  <li>The <strong>kernel</strong>, the function that does the arithmetic, runs. On CPU it may split the work across threads. On a GPU the CPU instead <strong>launches</strong> the kernel: it puts a command in the GPU's queue and returns before the work is done.</li>
+</ol>
+<p>Steps 1 and 2 cost about the same for 16 numbers as for 16 million. Measure it:</p>
+
+<div class="code" data-lang="python">
+<pre><code>import time
+import statistics
+import torch
+
+
+def time_op(fn, repeats=200):
+    for _ in range(10):                      # warm-up
+        fn()
+    times = []
+    for _ in range(repeats):
+        t0 = time.perf_counter()
+        fn()
+        times.append(time.perf_counter() - t0)
+    return statistics.median(times)
+
+
+torch.set_num_threads(1)
+for n in [16, 1_024, 65_536, 1_048_576, 16_777_216]:
+    a, b = torch.randn(n), torch.randn(n)
+    t = time_op(lambda: a + b, repeats=200 if n &lt; 10**7 else 20)
+    gbs = 3 * n * 4 / t / 1e9                # read a, read b, write the result
+    print(f"n={n:&gt;10,}  {t * 1e6:9.1f} us per add   {gbs:6.1f} GB/s")</code></pre>
+</div>
+<p>Measured on an Apple Silicon laptop CPU (M4 Pro); your numbers will differ.</p>
+<div class="code" data-lang="text">
+<pre><code>n=        16        0.5 us per add      0.4 GB/s
+n=     1,024        0.5 us per add     24.6 GB/s
+n=    65,536        7.2 us per add    109.1 GB/s
+n= 1,048,576      105.6 us per add    119.2 GB/s
+n=16,777,216     1834.4 us per add    109.8 GB/s</code></pre>
+</div>
+
+<p>Adding 16 numbers and adding 1,024 numbers take the same 0.5 µs: that is the fixed <strong>per-op overhead</strong>, and below about a thousand elements it is all you pay for. Only from tens of thousands of elements does the time scale with size, at roughly 110 GB/s, the speed this core can stream memory. microgpt's tensors are <code>16 × 16</code> or <code>16 × 64</code>: every op lives on the flat part of this curve.</p>
+
+<p>Now a whole microgpt training step (forward, backward, Adam) for one 10-token name, on one CPU thread, ten CPU threads, and the laptop's GPU through MPS (Chapter 9), using <code>TinyGPT</code> from Chapter 10 saved as <code>tinygpt.py</code>:</p>
+
+<div class="code" data-lang="python">
+<pre><code>import time
+import statistics
+import torch
+import torch.nn.functional as F
+from tinygpt import TinyGPT
+
+
+def train_step_time(device, threads, repeats=200):
+    torch.set_num_threads(threads)
+    torch.manual_seed(0)
+    model = TinyGPT().to(device)
+    opt = torch.optim.Adam(model.parameters(), lr=0.01)
+    x = torch.randint(0, 27, (1, 10), device=device)       # one 10-token name
+    y = torch.randint(0, 27, (1, 10), device=device)
+
+    def step():
+        loss = F.cross_entropy(model(x).flatten(0, 1), y.flatten())
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        if device == "mps":
+            torch.mps.synchronize()                          # wait for the GPU
+
+    for _ in range(20):
+        step()
+    times = []
+    for _ in range(repeats):
+        t0 = time.perf_counter()
+        step()
+        times.append(time.perf_counter() - t0)
+    return statistics.median(times)
+
+
+for device, threads in [("cpu", 1), ("cpu", 10), ("mps", 1)]:
+    t = train_step_time(device, threads)
+    print(f"{device} threads={threads:2d}: {t * 1e6:7.0f} us per step  ({1 / t:6.0f} names/s)")</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>cpu threads= 1:     400 us per step  (  2498 names/s)
+cpu threads=10:     673 us per step  (  1487 names/s)
+mps threads= 1:    2224 us per step  (   450 names/s)</code></pre>
+</div>
+
+<p>Your comment is right, by a lot. Ten threads are 1.7x <em>slower</em> than one: splitting a 16-element op across threads costs more in coordination than the op itself. The GPU is 5.6x slower than one thread: each of the few hundred ops per step becomes a kernel launch plus queue round-trip, and the GPU's thousands of cores have nothing to do with 16 numbers. A second run gave 362, 604 and 2,270 µs.</p>
+
+<h4>Many small ops versus one fused op</h4>
+<p>The overhead is per <em>op</em>, so the same math in fewer ops is faster. Here is your scalar <code>softmax</code> written as five tensor ops (max, subtract, exp, sum, divide), against PyTorch's single softmax kernel:</p>
+
+<div class="code" data-lang="python">
+<pre><code>import torch.nn.functional as F
+from torch.utils import benchmark
+
+torch.set_num_threads(1)
+
+
+def softmax_by_hand(x):                   # microgpt_scalar's softmax, as tensor ops
+    m = x.max(dim=-1, keepdim=True).values
+    e = (x - m).exp()
+    return e / e.sum(dim=-1, keepdim=True)
+
+
+for shape in [(16,), (4096, 4096)]:
+    x = torch.randn(shape)
+    torch.testing.assert_close(softmax_by_hand(x), F.softmax(x, dim=-1))
+    for stmt in ["softmax_by_hand(x)", "F.softmax(x, dim=-1)"]:
+        t = benchmark.Timer(stmt=stmt, globals=dict(x=x, F=F, softmax_by_hand=softmax_by_hand))
+        m = t.blocked_autorange(min_run_time=0.5)
+        print(f"{str(shape):14} {stmt:22} {m.median * 1e6:10.1f} us")</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>(16,)          softmax_by_hand(x)            2.8 us
+(16,)          F.softmax(x, dim=-1)          0.4 us
+(4096, 4096)   softmax_by_hand(x)        18926.0 us
+(4096, 4096)   F.softmax(x, dim=-1)      16951.9 us</code></pre>
+</div>
+
+<p>At 16 elements, five ops cost seven times one op: pure overhead. At 16.7 million elements the fused kernel is only about 10% faster here, because on one CPU core the bottleneck is computing 16.7 million exponentials, not moving the data. On a GPU, where arithmetic is cheap relative to memory traffic, the unfused version's extra passes over memory (write <code>e</code>, read it back for the sum, read it again for the divide) are what dominate. The roofline section below makes that precise.</p>
+
+<h2 id="timing">Timing correctly</h2>
+
+<p>A benchmark that measures the wrong thing is worse than none, because you will act on it. Four rules:</p>
+<ol>
+  <li><strong>Use <code>time.perf_counter()</code></strong>: the highest-resolution clock Python has, and it never jumps backwards.</li>
+  <li><strong>Warm up.</strong> The first calls pay one-time costs: memory allocator growth, lazy initialisation, CPU caches, and for <code>torch.compile</code> the whole compilation. Run the code a few times before timing.</li>
+  <li><strong>Repeat and take the median.</strong> The OS interrupts you at random; the median ignores those outliers, the mean does not.</li>
+  <li><strong>On a GPU, wait for the GPU.</strong> See below.</li>
+</ol>
+
+<h4>GPU kernels are asynchronous</h4>
+<p>When you call <code>c = a @ b</code> on a CUDA or MPS tensor, the CPU queues the kernel and returns immediately; <code>c</code> is a handle to a result that does not exist yet. A timer around that line measures the queueing. This runs on the laptop's GPU through MPS:</p>
+
+<div class="code" data-lang="python">
+<pre><code>a = torch.randn(4096, 4096, device="mps")
+b = torch.randn(4096, 4096, device="mps")
+for _ in range(3):                         # warm-up
+    a @ b
+torch.mps.synchronize()
+
+t0 = time.perf_counter()
+c = a @ b
+t1 = time.perf_counter()
+print(f"no sync:   {(t1 - t0) * 1e3:7.2f} ms   (only measures queueing the work)")
+
+t0 = time.perf_counter()
+c = a @ b
+torch.mps.synchronize()                    # block until the GPU has finished
+t1 = time.perf_counter()
+print(f"with sync: {(t1 - t0) * 1e3:7.2f} ms   (the real matmul time)")
+print(f"=&gt; {2 * 4096**3 / (t1 - t0) / 1e12:.1f} TFLOP/s")</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>no sync:      0.16 ms   (only measures queueing the work)
+with sync:   48.59 ms   (the real matmul time)
+=&gt; 2.8 TFLOP/s</code></pre>
+</div>
+
+<p>A 300x error, in the direction that makes your code look great. On CUDA the same pattern uses <code>torch.cuda.synchronize()</code>. The more precise CUDA tool is a pair of <strong>CUDA events</strong>: markers the GPU itself timestamps when it reaches them in its queue, so the measurement excludes CPU-side noise. This needs an NVIDIA GPU, so it was not run here:</p>
+
+<div class="code" data-lang="python">
+<pre><code># CUDA only
+start = torch.cuda.Event(enable_timing=True)
+end = torch.cuda.Event(enable_timing=True)
+start.record()                    # enqueue "timestamp here"
+y = model(x)
+end.record()
+torch.cuda.synchronize()          # wait until the GPU has actually reached `end`
+print(start.elapsed_time(end), "ms")</code></pre>
+</div>
+
+<h4><code>torch.utils.benchmark.Timer</code></h4>
+<p>PyTorch ships a timer that does warm-up, picks the number of repeats, reports the median, and records the thread count. On CUDA it also synchronizes for you. It does <em>not</em> synchronize MPS (its source checks for CUDA, XPU and custom backends only), so on a Mac put <code>torch.mps.synchronize()</code> in the statement.</p>
+
+<div class="code" data-lang="python">
+<pre><code>torch.set_num_threads(1)
+a, b = torch.randn(512, 512), torch.randn(512, 512)
+t = benchmark.Timer(stmt="a @ b", globals={"a": a, "b": b})
+m = t.blocked_autorange(min_run_time=1.0)
+print(m)
+print(m.median)</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>&lt;torch.utils.benchmark.utils.common.Measurement object at 0x10fe5a940&gt;
+a @ b
+  Median: 98.43 us
+  IQR:    2.25 us (97.47 to 99.72)
+  1011 measurements, 10 runs per measurement, 1 thread
+9.842910000004145e-05</code></pre>
+</div>
+<p><strong>IQR</strong> (interquartile range) is the spread of the middle half of the measurements. If it is a large fraction of the median, the machine was busy and the number is not trustworthy.</p>
+
+<h2 id="hidden-syncs">Hidden syncs</h2>
+
+<p>The asynchronous queue is what makes a GPU fast: while kernel <code>n</code> runs, the CPU is already preparing kernel <code>n+1</code>, so the GPU never idles. A <strong>sync</strong> (synchronization) is any point where the CPU must stop and wait for the GPU to finish everything queued, because it needs a value. After the sync, the queue is empty, and the GPU idles while the CPU builds up the next batch of work. Some calls sync without saying so:</p>
+
+<table>
+  <tr><th>Call</th><th>Why it must wait</th></tr>
+  <tr><td><code>loss.item()</code>, <code>t.tolist()</code></td><td>returns a Python number, which lives on the CPU</td></tr>
+  <tr><td><code>t.cpu()</code>, <code>t.to("cpu")</code>, <code>t.numpy()</code></td><td>copies the data to host memory</td></tr>
+  <tr><td><code>print(t)</code>, <code>f"{t}"</code></td><td>formatting reads the values</td></tr>
+  <tr><td><code>if t:</code>, <code>while t &gt; 0:</code>, <code>if (x &lt; best):</code></td><td>Python's <code>if</code> calls <code>bool(t)</code>, which is <code>.item()</code></td></tr>
+  <tr><td><code>t.nonzero()</code>, <code>x[mask]</code>, <code>torch.unique(t)</code></td><td>the output's <em>size</em> depends on the data, and the CPU must know the size to allocate it</td></tr>
+</table>
+
+<p>The cost, measured on the laptop GPU (MPS): 500 iterations of a <code>(64, 1024) @ (1024, 1024)</code> layer, reading the loss each step versus accumulating on the device and reading once.</p>
+
+<div class="code" data-lang="python">
+<pre><code>dev = "mps"
+w = torch.randn(1024, 1024, device=dev) / 32
+x0 = torch.randn(64, 1024, device=dev)
+
+
+def loop(sync_every_step):
+    x = x0
+    total = torch.zeros((), device=dev)
+    for _ in range(500):
+        x = torch.tanh(x @ w)
+        if sync_every_step:
+            total += x.sum().item()          # .item(): copy to CPU -&gt; wait for GPU
+        else:
+            total += x.sum()                 # stays on the GPU, nothing waits
+    return total.item()                      # one sync at the very end
+
+
+loop(True), loop(False)                      # warm-up
+for flag in [True, False]:
+    torch.mps.synchronize()
+    t0 = time.perf_counter()
+    loop(flag)
+    print(f".item() every step={flag!s:5}: {(time.perf_counter() - t0) * 1e3:6.1f} ms")</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>.item() every step=True :   99.6 ms
+.item() every step=False:   20.4 ms</code></pre>
+</div>
+
+<p>Same math, five times slower, because every <code>.item()</code> drains the queue. Two more runs gave 101.9 / 24.3 and 130.3 / 20.4 ms. microgpt's training loop does <code>recent_loss += loss.item()</code> every step; on CPU that costs nothing (there is no queue), which is one more reason the CPU path is right for it. On a GPU, keep the running sum as a tensor and call <code>.item()</code> only when you print.</p>
+
+<div class="callout tip">
+<div class="callout-title">Let PyTorch find them for you (CUDA)</div>
+<p><code>torch.cuda.set_sync_debug_mode("warn")</code> makes PyTorch print a warning at every operation that synchronizes with a CUDA device, and <code>"error"</code> raises instead. Run one training step with it on and read the list. It works only for CUDA.</p>
+</div>
+
+<h2 id="profiler">The profiler</h2>
+
+<p>Timing tells you <em>how long</em>; a <strong>profiler</strong> tells you <em>where</em>. <code>torch.profiler.profile</code> records every op PyTorch runs (and every GPU kernel, with <code>ProfilerActivity.CUDA</code>). <code>record_function("name")</code> adds your own labelled ranges, so you can see phases. Profile 20 batched training steps of <code>TinyGPT</code>, B = 32 names of 16 tokens:</p>
+
+<div class="code" data-lang="python">
+<pre><code>from torch.profiler import profile, record_function, ProfilerActivity
+
+torch.set_num_threads(1)
+torch.manual_seed(0)
+model = TinyGPT()
+opt = torch.optim.Adam(model.parameters(), lr=0.01)
+x = torch.randint(0, 27, (32, 16))
+y = torch.randint(0, 27, (32, 16))
+
+
+def train_step():
+    with record_function("forward"):
+        loss = F.cross_entropy(model(x).flatten(0, 1), y.flatten())
+    with record_function("backward"):
+        opt.zero_grad()
+        loss.backward()
+    with record_function("optimizer"):
+        opt.step()
+
+
+for _ in range(5):                                   # warm-up outside the profile
+    train_step()
+
+with profile(activities=[ProfilerActivity.CPU]) as prof:
+    for _ in range(20):
+        train_step()
+
+print(prof.key_averages().table(sort_by="self_cpu_time_total", row_limit=8))
+
+with profile(activities=[ProfilerActivity.CPU]) as prof:   # one step is enough to look at
+    train_step()
+prof.export_chrome_trace("trace.json")               # open in ui.perfetto.dev</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>-------------------------  ------------  ------------  ------------  ------------  ------------  ------------
+                     Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg    # of Calls
+-------------------------  ------------  ------------  ------------  ------------  ------------  ------------
+                aten::bmm        26.46%      10.750ms        56.60%      22.994ms     191.614us           120
+             aten::select        21.11%       8.575ms        28.38%      11.529ms       0.250us         46080
+         aten::as_strided         7.66%       3.112ms         7.66%       3.112ms       0.066us         47420
+                 backward         7.56%       3.070ms        58.83%      23.900ms       1.195ms            20
+ Optimizer.step#Adam.step         3.51%       1.427ms         6.49%       2.636ms     131.820us            20
+                 aten::mm         3.23%       1.312ms         3.29%       1.336ms       3.180us           420
+              aten::copy_         2.59%       1.053ms         2.59%       1.053ms       0.878us          1200
+                  forward         2.32%     943.986us        34.26%      13.920ms     695.993us            20
+-------------------------  ------------  ------------  ------------  ------------  ------------  ------------
+Self CPU time total: 40.626ms</code></pre>
+</div>
+<p>(Real output, with the padding of the name column narrowed to fit the page.)</p>
+
+<h4>Reading the table</h4>
+<ul>
+  <li><strong>Self CPU</strong> is time spent in the op itself; <strong>CPU total</strong> includes the ops it called. <code>backward</code> has 58.8% total but 7.6% self: it is a label (from <code>record_function</code>) wrapping other work. Sort by self time to find where time actually goes; sort by total time to see which phase is expensive.</li>
+  <li><strong># of Calls</strong> is often the most informative column. <code>aten::select</code>, a function that picks one slice of a tensor (as in <code>t[i]</code>), was called 46,080 times in 20 steps.</li>
+</ul>
+<p>Put those together. There are 120 <code>bmm</code> calls (batched matrix multiply) in 20 steps: two in attention per forward (<code>q @ k.T</code> and <code>att @ v</code>), and two more for each of those in backward. 46,080 / 120 = 384 = 3 × 128, and 128 = B × H = 32 × 4. So on this CPU build, each <code>bmm</code> on these tiny 16 × 4 matrices walks the 128 (sequence, head) pairs one at a time and slices out three matrices for each. The slicing bookkeeping costs nearly as much as the multiplications. That is the per-op overhead story again, hiding <em>inside</em> one op, and no amount of staring at the Python would have shown it. Exercise 11.6 replaces it.</p>
+
+<p><code>export_chrome_trace</code> writes a timeline you can open at <a href="https://ui.perfetto.dev">ui.perfetto.dev</a>: one bar per op, nested by call, on a time axis. Profile few steps; this one-step trace is 1.7 MB and a 20-step one was 35 MB. On a GPU machine, add <code>ProfilerActivity.CUDA</code> to <code>activities</code> and sort by <code>"cuda_time_total"</code>; the trace then shows CPU launches and GPU kernels on separate rows, and gaps in the GPU row are idle time, often caused by a hidden sync. For long runs, <code>profile(schedule=torch.profiler.schedule(wait=1, warmup=1, active=3))</code> with <code>prof.step()</code> once per iteration records only a window of steps.</p>
+
+<h2 id="roofline">Roofline: short of FLOPs, or short of bytes?</h2>
+
+<p>Every kernel needs two resources: arithmetic (FLOPs, floating-point operations) and memory traffic (bytes moved between memory and the compute units). Its <strong>arithmetic intensity</strong> is the ratio, FLOPs per byte. A machine has a peak FLOP rate and a peak memory bandwidth; their ratio is its <strong>ridge point</strong>. A kernel whose intensity is below the ridge cannot use all the arithmetic, because the data cannot arrive fast enough: it is <strong>memory-bound</strong>, and its speed is set by bandwidth. Above the ridge it is <strong>compute-bound</strong>. Plotting attainable FLOP/s against intensity gives a sloped line (bandwidth × intensity) that flattens into a horizontal roof (peak FLOP/s): the <strong>roofline</strong>.</p>
+
+<p>Two kernels, in fp32 (4 bytes per number), for <code>N × N</code> matrices:</p>
+<ul>
+  <li><strong>Add</strong>: <code>N²</code> FLOPs, reads two matrices and writes one: <code>12 N²</code> bytes. Intensity <code>1/12 ≈ 0.08</code>, whatever <code>N</code> is.</li>
+  <li><strong>Matmul</strong>: <code>2N³</code> FLOPs (a multiply and an add per term), and at minimum the same <code>12 N²</code> bytes. Intensity <code>N / 6</code>: 341 at <code>N = 2048</code>. Each number loaded is reused <code>N</code> times.</li>
+</ul>
+
+<div class="code" data-lang="python">
+<pre><code>torch.set_num_threads(1)
+N = 2048
+a, b = torch.randn(N, N), torch.randn(N, N)
+
+mm = benchmark.Timer("a @ b", globals=dict(a=a, b=b)).blocked_autorange(min_run_time=1)
+add = benchmark.Timer("a + b", globals=dict(a=a, b=b)).blocked_autorange(min_run_time=1)
+
+flops_mm, bytes_mm = 2 * N**3, 3 * N * N * 4        # read a, b; write c (fp32)
+flops_add, bytes_add = N * N, 3 * N * N * 4
+
+for name, m, fl, by in [("matmul", mm, flops_mm, bytes_mm), ("add", add, flops_add, bytes_add)]:
+    t = m.median
+    print(f"{name:6}: intensity {fl / by:7.2f} FLOP/byte   {t * 1e3:7.2f} ms   "
+          f"{fl / t / 1e9:7.1f} GFLOP/s   {by / t / 1e9:6.1f} GB/s")</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>matmul: intensity  341.33 FLOP/byte      5.39 ms    3186.0 GFLOP/s      9.3 GB/s
+add   : intensity    0.08 FLOP/byte      0.42 ms       9.9 GFLOP/s    118.5 GB/s</code></pre>
+</div>
+
+<p>The add runs at 118.5 GB/s, the same memory speed as the first table, and gets 9.9 GFLOP/s: memory-bound, it would not go faster with more arithmetic units. The matmul gets 3.2 TFLOP/s, 320 times the add's FLOP rate, while touching memory at only 9.3 GB/s: compute-bound. (One "thread" reaches TFLOP/s here because this PyTorch build calls Apple's Accelerate library for matmul, which uses the chip's dedicated matrix hardware.) The rough ridge of this core is 3186 / 118.5 ≈ 27 FLOP/byte.</p>
+
+<p>A datacenter GPU has a much higher ridge. NVIDIA's H100 SXM datasheet lists about 989 TFLOP/s of dense BF16 tensor-core math and 3.35 TB/s of memory bandwidth: a ridge near 300 FLOP/byte. Consequences that drive inference engineering:</p>
+<ul>
+  <li><strong>Elementwise ops, norms and softmax are always memory-bound</strong> (intensity below 1). Their cost is bytes moved, so the way to speed up a chain of them is to move fewer bytes: <strong>fusion</strong>, one kernel that reads the input once, does all the steps in registers, and writes once.</li>
+  <li><strong>Large matmuls are compute-bound</strong>, which is why training (big batches times long sequences) can keep tensor cores busy.</li>
+  <li><strong>Decode is memory-bound.</strong> One decode step multiplies a <code>(B, d)</code> activation by each <code>(d, d)</code> weight. For <code>B = 1</code> in bf16, that is <code>2d²</code> FLOPs over <code>2d²</code> bytes of weights: intensity about 1, three hundred times below the ridge. Batching <code>B</code> sequences reuses each weight <code>B</code> times, raising the intensity to roughly <code>B</code>. That, and not convenience, is why servers batch decode (Chapter 10), and why the KV cache's size, which limits <code>B</code>, matters so much.</li>
+</ul>
+
+<h2 id="compile"><code>torch.compile</code></h2>
+
+<p>Eager PyTorch is an interpreter: one dispatch and one kernel per op, each reading and writing memory. <code>torch.compile(fn)</code> is a just-in-time compiler that sees many ops at once. Three stages, which a compiler engineer will recognise:</p>
+<ol>
+  <li><strong>TorchDynamo</strong> (graph capture) hooks CPython's frame evaluation, reads the function's bytecode as it is about to run, and extracts the tensor operations into an <strong>FX graph</strong>, PyTorch's IR. It also emits <strong>guards</strong>: cheap checks on the inputs (shapes, dtypes, devices, Python values the trace depended on) that must hold for the compiled code to be reused. Code it cannot trace causes a <strong>graph break</strong>: the graph ends, that piece runs in normal Python, and a new graph starts after it.</li>
+  <li><strong>AOTAutograd</strong> traces the backward pass ahead of time from the forward graph, so forward and backward are both graphs the backend can optimise, and decides which intermediates to save for backward.</li>
+  <li><strong>TorchInductor</strong> (the default backend) lowers the graphs to its own loop-level IR, <strong>fuses</strong> pointwise ops and reductions into combined kernels, and generates code: Triton kernels on NVIDIA and AMD GPUs, C++ with OpenMP and vector intrinsics on CPU. Matmuls usually go to the vendor library (cuBLAS, or here Accelerate).</li>
+</ol>
+
+<p>On this laptop CPU it works. A memory-bound chain of four elementwise ops and a reduction:</p>
+
+<div class="code" data-lang="python">
+<pre><code>torch.set_num_threads(1)
+
+
+def chain(x):
+    return ((x * 2.0 + 1.0).relu() * x).sum(dim=-1)   # 4 elementwise ops + a reduction
+
+
+x = torch.randn(4096, 4096)
+compiled = torch.compile(chain)
+
+t0 = time.perf_counter()
+compiled(x)                                           # first call: trace + codegen + build
+print(f"first call: {time.perf_counter() - t0:.1f} s")
+torch.testing.assert_close(compiled(x), chain(x))
+
+for name, fn in [("eager", chain), ("compiled", compiled)]:
+    m = benchmark.Timer("fn(x)", globals=dict(fn=fn, x=x)).blocked_autorange(min_run_time=1)
+    print(f"{name:9}: {m.median * 1e3:6.1f} ms")</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>first call: 3.1 s
+eager    :    6.1 ms
+compiled :    2.6 ms</code></pre>
+</div>
+
+<p>(Apple Silicon laptop CPU, one thread.) Eager mode writes and re-reads a 64 MB intermediate four times; Inductor generated one loop that reads <code>x</code> once and keeps the intermediates in registers: 2.3x faster. The cost is the first call, 3.1 s here with an empty cache. The very first compile on this machine took 14 s because Inductor also built precompiled C++ headers; a later process that hit Inductor's on-disk cache took 0.8 s. At a saving of 3.5 ms per call, the 3.1 s compile pays for itself after about 900 calls (Exercise 11.5).</p>
+
+<p>On the overhead-bound microgpt forward the gain is smaller, since the fixed per-call costs (guard checks, launching the generated code, the matmul library calls) remain:</p>
+<div class="code" data-lang="python">
+<pre><code>torch.manual_seed(0)
+model = TinyGPT().eval()
+x = torch.randint(0, 27, (1, 10))
+cmodel = torch.compile(model)
+
+with torch.inference_mode():
+    t0 = time.perf_counter()
+    cmodel(x)
+    print(f"first call: {time.perf_counter() - t0:.1f} s")
+    torch.testing.assert_close(cmodel(x), model(x))
+    for name, m in [("eager", model), ("compiled", cmodel)]:
+        r = benchmark.Timer("m(x)", globals=dict(m=m, x=x)).blocked_autorange(min_run_time=1)
+        print(f"{name:9}: {r.median * 1e6:6.1f} us per forward")</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>first call: 6.8 s
+eager    :   52.4 us per forward
+compiled :   38.7 us per forward</code></pre>
+</div>
+
+<h4>Graph breaks</h4>
+<p>Anything Dynamo cannot put in a graph splits it. The classic cause is a data-dependent Python branch, because the branch needs a tensor's <em>value</em> (a sync) and the graph can only hold one path. <code>torch._dynamo.explain</code> reports the breaks:</p>
+<div class="code" data-lang="python">
+<pre><code>import torch._dynamo
+
+
+def f(x):
+    y = x.relu() * 2
+    if y.sum().item() &gt; 0:          # data-dependent Python branch: needs the value
+        y = y + 1
+    return y.exp()
+
+
+explanation = torch._dynamo.explain(f)(torch.randn(8))
+print(explanation.graph_count, explanation.graph_break_count)    # 2 1
+for reason in explanation.break_reasons:
+    print(reason.reason.splitlines()[0])
+# Unsupported Tensor.item() call with capture_scalar_outputs=False</code></pre>
+</div>
+<p>It also logs a warning that starts <code>Graph break from `Tensor.item()`, consider setting: torch._dynamo.config.capture_scalar_outputs = True</code> and points at the source line. Two graphs means two compiled pieces with Python in between, and no fusion across the break. The usual fix is to keep the decision on the device: <code>y = torch.where(y.sum() &gt; 0, y + 1, y)</code>. Other common breaks: <code>print</code>, calls into non-PyTorch libraries, and unsupported Python constructs. <code>torch.compile(fn, fullgraph=True)</code> turns any break into an error, which is what you want while optimising.</p>
+
+<h4>Recompiles and dynamic shapes</h4>
+<p>Guards include input shapes, so a new shape fails a guard and triggers a <strong>recompile</strong>. By default (<code>dynamic=None</code>), the first recompile caused by a changed size marks that dimension as dynamic, and the new code works for any size. <code>dynamic=False</code> specialises on every shape; <code>dynamic=True</code> starts dynamic. Turn on the recompile log to watch:</p>
+<div class="code" data-lang="python">
+<pre><code>import torch
+torch._logging.set_logs(recompiles=True)      # or run with TORCH_LOGS="recompiles"
+
+
+@torch.compile
+def f(x):
+    return (x * 2).relu().sum()
+
+
+for n in [8, 16, 32, 64]:
+    f(torch.randn(n))
+
+g = torch.compile(lambda x: (x * 2).relu().sum(), dynamic=False)
+for n in [8, 16, 32]:
+    g(torch.randn(n))</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>Recompiling function f in recompile_demo.py:5
+    triggered by the following guard failure(s):
+    - 0/0: tensor 'x' size mismatch at index 0. expected 8, actual 16
+Recompiling function &lt;lambda&gt; in recompile_demo.py:13
+    triggered by the following guard failure(s):
+    - 1/0: tensor 'x' size mismatch at index 0. expected 8, actual 16
+Recompiling function &lt;lambda&gt; in recompile_demo.py:13
+    triggered by the following guard failure(s):
+    - 1/1: tensor 'x' size mismatch at index 0. expected 16, actual 32
+    - 1/0: tensor 'x' size mismatch at index 0. expected 8, actual 32</code></pre>
+</div>
+<p>(Saved as <code>recompile_demo.py</code>; the logger's timestamp prefixes and the directory part of the path are trimmed.) <code>f</code> recompiled once, at size 16, then handled 32 and 64 with no further compiles. <code>g</code> recompiled for every new size. In generation, where the sequence length grows by one every step, that difference is everything; Dynamo also caps recompiles per function (<code>torch._dynamo.config.recompile_limit</code>) and falls back to eager after that.</p>
+
+<h4>Modes</h4>
+<p><code>torch.compile(model, mode="reduce-overhead")</code> attacks the launch overhead from the start of this chapter using <strong>CUDA graphs</strong>: the sequence of kernel launches is recorded once and replayed with a single launch, so hundreds of small kernels cost one launch. CUDA graphs need static shapes and fixed memory addresses, so inputs are copied into static buffers, and it needs a CUDA GPU. <code>mode="max-autotune"</code> spends longer compiling to benchmark alternative kernel configurations (for example Triton matmul templates against cuBLAS) and keep the fastest.</p>
+
+<h2 id="custom-kernels">When compile is not enough</h2>
+
+<p>When the compiler cannot find the kernel you need (a fused attention variant, a quantised matmul, a paged-KV-cache read), you write it. <strong>Triton</strong> is a Python-embedded language for GPU kernels in which you program blocks of data rather than individual threads, and it is what Inductor itself generates, so its output is a good starting point. To make your kernel a first-class PyTorch op that <code>torch.compile</code> can trace around without a graph break and autograd can differentiate, register it with <code>torch.library.custom_op</code> (and <code>register_autograd</code> for its backward), or <code>torch.library.triton_op</code> for a Triton kernel that Inductor may inline. The registration part runs on CPU too:</p>
+
+<div class="code" data-lang="python">
+<pre><code>@torch.library.custom_op("mylib::scaled_relu", mutates_args=())
+def scaled_relu(x: torch.Tensor, scale: float) -&gt; torch.Tensor:
+    return (x * scale).clamp(min=0)          # imagine a hand-written kernel here
+
+
+@scaled_relu.register_fake
+def _(x, scale):                             # shape/dtype only, for torch.compile
+    return torch.empty_like(x)
+
+
+f = torch.compile(lambda x: scaled_relu(x, 2.0) + 1)
+print(f(torch.tensor([-1.0, 0.5, 2.0])))     # tensor([1., 2., 5.])</code></pre>
+</div>
+<p>The "fake" implementation tells the compiler the output's shape and dtype without running the kernel. The official "Custom Operators" tutorials on docs.pytorch.org cover the full recipe.</p>
+
+<h2 id="exercises">Exercises</h2>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 11.1</span>
+  <span class="exercise-diff easy">easy</span>
+  <span class="exercise-title">Find the hidden syncs</span>
+</div>
+<div class="exercise-body">
+<p>This loop is meant for a GPU. Name every line that synchronizes, find the one bug that is not about speed, and rewrite it with one sync per 100 steps plus one at the end.</p>
+<div class="code" data-lang="python">
+<pre><code>history, best = [], float("inf")
+for step in range(steps):
+    loss = train_step()
+    history.append(loss.item())
+    if loss &lt; best:
+        best = loss
+    print(f"step {step} loss {loss}")</code></pre>
+</div>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<p>Three syncs per step: <code>loss.item()</code>; <code>if loss &lt; best</code> (the comparison is a tensor, and <code>if</code> calls <code>bool()</code> on it); and formatting <code>loss</code> in the f-string. The non-speed bug: <code>best = loss</code> keeps the loss tensor, and with it the step's whole autograd graph, alive. With a toy <code>train_step</code> on CPU:</p>
+<div class="code" data-lang="python">
+<pre><code>torch.manual_seed(0)
+w = torch.randn(8, requires_grad=True)
+opt = torch.optim.SGD([w], lr=0.1)
+
+
+def train_step():
+    loss = (w ** 2).sum()
+    opt.zero_grad()
+    loss.backward()
+    opt.step()
+    return loss
+
+
+history, best = [], float("inf")
+for step in range(3):
+    loss = train_step()
+    history.append(loss.item())            # sync every step
+    if loss &lt; best:                        # Tensor.__bool__ -&gt; sync every step
+        best = loss                        # also keeps loss's autograd graph alive
+    print(f"step {step} loss {loss}")      # formatting a tensor -&gt; sync
+print(type(best).__name__, best.requires_grad, type(best.grad_fn).__name__)
+# Tensor True SumBackward0
+
+losses = []
+for step in range(300):
+    loss = train_step()
+    losses.append(loss.detach())           # stays on the device, no graph kept
+    if step % 100 == 0:
+        print(f"step {step} loss {loss.item():.4f}")   # one sync per 100 steps
+all_losses = torch.stack(losses)           # (300,)
+best = all_losses.min().item()             # one sync at the end
+print(f"best {best:.6f}")</code></pre>
+</div>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 11.2</span>
+  <span class="exercise-diff easy">easy</span>
+  <span class="exercise-title">Arithmetic intensity by hand</span>
+</div>
+<div class="exercise-body">
+<p>In bf16 (2 bytes), compute the arithmetic intensity of (a) a <code>4096 × 4096</code> matmul, (b) a <code>4096 × 4096</code> add, (c) one decode step through a <code>4096 × 4096</code> weight at batch sizes 1, 8, 64 and 256. Compare with the H100 ridge of about 300 FLOP/byte.</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<div class="code" data-lang="python">
+<pre><code>N = 4096
+bf16 = 2
+matmul = (2 * N**3) / (3 * N * N * bf16)
+add = (N * N) / (3 * N * N * bf16)
+print(f"matmul {matmul:.0f}  add {add:.3f}  FLOP/byte")
+for B in [1, 8, 64, 256]:
+    flops = 2 * B * N * N
+    bytes_ = N * N * bf16 + 2 * B * N * bf16          # weights + read x + write y
+    print(f"decode batch {B:3d}: {flops / bytes_:6.1f} FLOP/byte")
+print(f"H100 SXM ridge: {989e12 / 3.35e12:.0f} FLOP/byte")</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>matmul 1365  add 0.167  FLOP/byte
+decode batch   1:    1.0 FLOP/byte
+decode batch   8:    8.0 FLOP/byte
+decode batch  64:   62.1 FLOP/byte
+decode batch 256:  227.6 FLOP/byte
+H100 SXM ridge: 295 FLOP/byte</code></pre>
+</div>
+<p>The matmul is far above the ridge and the add far below. Decode's intensity is about the batch size, so even 64 concurrent sequences leave an H100 memory-bound; only at a few hundred does decode approach the ridge. (Real decode also reads the KV cache, which is per-sequence and is not amortised by batching, so the true picture is worse.)</p>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 11.3</span>
+  <span class="exercise-diff medium">medium</span>
+  <span class="exercise-title">Write a correct benchmark</span>
+</div>
+<div class="exercise-body">
+<p>Write <code>bench(fn, device)</code> that warms up, synchronizes for <code>"cuda"</code> and <code>"mps"</code>, repeats, and returns the median seconds. Use it on a <code>2048 × 2048</code> matmul on MPS and compare against <code>benchmark.Timer</code> with and without <code>torch.mps.synchronize()</code> in the statement. Explain why the Timer without sync is only a little wrong here, when the single timed call earlier was 300x wrong.</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<div class="code" data-lang="python">
+<pre><code>def bench(fn, device, warmup=5, repeats=30):
+    def sync():
+        if device == "cuda":
+            torch.cuda.synchronize()
+        elif device == "mps":
+            torch.mps.synchronize()
+    for _ in range(warmup):
+        fn()
+    sync()
+    times = []
+    for _ in range(repeats):
+        t0 = time.perf_counter()
+        fn()
+        sync()
+        times.append(time.perf_counter() - t0)
+    return statistics.median(times)
+
+
+a = torch.randn(2048, 2048, device="mps")
+b = torch.randn(2048, 2048, device="mps")
+print(f"bench():                 {bench(lambda: a @ b, 'mps') * 1e3:6.2f} ms")
+g = dict(a=a, b=b, torch=torch)
+m1 = benchmark.Timer("a @ b", globals=g).blocked_autorange(min_run_time=1)
+m2 = benchmark.Timer("a @ b; torch.mps.synchronize()", globals=g).blocked_autorange(min_run_time=1)
+print(f"Timer, no sync:          {m1.median * 1e3:6.2f} ms")
+print(f"Timer, with mps sync:    {m2.median * 1e3:6.2f} ms")</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>bench():                   2.66 ms
+Timer, no sync:            2.42 ms
+Timer, with mps sync:      2.67 ms</code></pre>
+</div>
+<p>The Timer runs the statement many times back to back. The GPU's queue has a limited depth, so after a few calls the CPU blocks waiting for space, and the average settles near the GPU's real throughput; what is missed is the work still queued when the clock stops. One isolated call has no such back-pressure, hence the 300x error. Do not rely on back-pressure: synchronize explicitly.</p>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 11.4</span>
+  <span class="exercise-diff medium">medium</span>
+  <span class="exercise-title">Profile and name the top op</span>
+</div>
+<div class="exercise-body">
+<p>Run the profiler example. Which op has the most self CPU time? Account for its exact call count (120) and for the 46,080 <code>aten::select</code> calls from the shapes in the model. Then re-sort the same profile by <code>"cpu_time_total"</code> and explain why the top rows change.</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<p><code>aten::bmm</code>. Per training step: the forward makes 2 batched matmuls (<code>q @ k.transpose(-2, -1)</code> and <code>att @ v</code>); in backward, each of those becomes a <code>BmmBackward0</code> that computes the gradient for both inputs with one <code>bmm</code> each, so 4. That is 6 per step, 120 in 20 steps. Each bmm works on <code>(B·H, 16, 4)</code>-sized operands with <code>B·H = 32 × 4 = 128</code>, and 46,080 / 120 = 384 = 3 × 128 selects: one slice of each of the three tensors (two inputs, one output) per (sequence, head) pair.</p>
+<p>Sorted by total time, the <code>record_function</code> labels <code>backward</code> and <code>forward</code> and wrappers such as <code>aten::matmul</code> and <code>BmmBackward0</code> rise to the top, because their totals include all the work beneath them. Total time answers "which phase is expensive?"; self time answers "which op actually burns the time?"</p>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 11.5</span>
+  <span class="exercise-diff medium">medium</span>
+  <span class="exercise-title">When does compile pay off?</span>
+</div>
+<div class="exercise-body">
+<p>For <code>chain</code> on a <code>4096 × 4096</code> input, measure the first-call time, eager and compiled steady-state times, and compute the break-even number of calls. Then call the compiled function with a <code>(2048, 4096)</code> input and a <code>(1024, 4096)</code> input and time each first call. Explain the difference.</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<div class="code" data-lang="python">
+<div class="code-hdr"><span class="lang">python</span><span class="title">compile_cost.py</span></div>
+<pre><code>import time
+import torch
+from torch.utils import benchmark
+
+torch.set_num_threads(1)
+
+
+def chain(x):
+    return ((x * 2.0 + 1.0).relu() * x).sum(dim=-1)
+
+
+def timed_call(fn, x):
+    t0 = time.perf_counter()
+    fn(x)
+    return time.perf_counter() - t0
+
+
+compiled = torch.compile(chain)
+x = torch.randn(4096, 4096)
+first = timed_call(compiled, x)
+eager = benchmark.Timer("f(x)", globals=dict(f=chain, x=x)).blocked_autorange(min_run_time=1).median
+steady = benchmark.Timer("f(x)", globals=dict(f=compiled, x=x)).blocked_autorange(min_run_time=1).median
+print(f"first call {first:.2f} s, eager {eager * 1e3:.2f} ms, compiled {steady * 1e3:.2f} ms")
+print(f"break-even after ~{first / (eager - steady):.0f} calls")
+
+x2 = torch.randn(2048, 4096)                     # new shape
+print(f"first call with a new shape: {timed_call(compiled, x2):.2f} s")
+x3 = torch.randn(1024, 4096)                     # another one
+print(f"and another new shape:       {timed_call(compiled, x3):.3f} s")</code></pre>
+</div>
+<div class="code terminal" data-lang="sh">
+<pre><code>$ TORCHINDUCTOR_FORCE_DISABLE_CACHES=1 python compile_cost.py
+first call 3.26 s, eager 6.04 ms, compiled 2.56 ms
+break-even after ~935 calls
+first call with a new shape: 0.63 s
+and another new shape:       0.001 s
+$ python compile_cost.py
+first call 0.71 s, eager 6.05 ms, compiled 2.55 ms
+break-even after ~201 calls
+first call with a new shape: 0.08 s
+and another new shape:       0.001 s</code></pre>
+</div>
+<p>(Laptop CPU, one thread.) Run it as its own script: compile results are cached in memory for the life of the process and on disk across processes, so a measurement taken after an earlier compile in the same session shows a first call of a few hundredths of a second. The environment variable switches the caches off to show the true cold cost; the second run hit the on-disk cache. The 2048-row input failed the size guard and recompiled, this time with dimension 0 marked dynamic; the 1024-row input passed the new, dynamic guard and reused that code. A training job running millions of steps amortises compile easily; a short script or a server that sees a new shape every request may not.</p>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 11.6</span>
+  <span class="exercise-diff hard">hard</span>
+  <span class="exercise-title">Replace the top op</span>
+</div>
+<div class="exercise-body">
+<p>The profile showed attention's <code>bmm</code> dominating. Subclass <code>TinyGPT</code> with a <code>forward(idx)</code> (no cache) that computes attention with <code>F.scaled_dot_product_attention(q, k, v, is_causal=True)</code>. Verify the logits match, then time a training step and report the new top op.</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<p>Without a cache, queries and keys are the same positions, so <code>is_causal=True</code> is exactly the causal mask.</p>
+<div class="code" data-lang="python">
+<pre><code>class TinyGPTSDPA(TinyGPT):
+    def forward(self, idx):
+        B, T = idx.shape
+        H, D, E = self.n_head, self.head_size, self.n_embd
+        x = self.token_embedding_table[idx] + self.position_embedding_table[:T]
+        h = F.rms_norm(x, (E,), eps=1e-5)
+        q = F.linear(h, self.query_weights).view(B, T, H, D).transpose(1, 2)
+        k = F.linear(h, self.key_weights).view(B, T, H, D).transpose(1, 2)
+        v = F.linear(h, self.value_weights).view(B, T, H, D).transpose(1, 2)
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)   # one fused op
+        x = x + F.linear(y.transpose(1, 2).reshape(B, T, E), self.attention_output_weights)
+        h = F.rms_norm(x, (E,), eps=1e-5)
+        x = x + F.linear(F.relu(F.linear(h, self.mlp_expand_weights)), self.mlp_contract_weights)
+        return F.linear(x, self.language_model_head_weights)
+
+
+torch.set_num_threads(1)
+x = torch.randint(0, 27, (32, 16))
+y = torch.randint(0, 27, (32, 16))
+for cls in [TinyGPT, TinyGPTSDPA]:
+    torch.manual_seed(0)
+    model = cls()
+    opt = torch.optim.Adam(model.parameters(), lr=0.01)
+
+    def train_step():
+        loss = F.cross_entropy(model(x).flatten(0, 1), y.flatten())
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        return loss
+
+    for _ in range(5):
+        train_step()
+    times = []
+    for _ in range(50):
+        t0 = time.perf_counter()
+        train_step()
+        times.append(time.perf_counter() - t0)
+    with profile(activities=[ProfilerActivity.CPU]) as prof:
+        train_step()
+    top = sorted(prof.key_averages(), key=lambda e: e.self_cpu_time_total, reverse=True)[0]
+    print(f"{cls.__name__:12} {statistics.median(times) * 1e3:5.2f} ms/step   top op: {top.key}")
+
+torch.manual_seed(0); a = TinyGPT()
+torch.manual_seed(0); b = TinyGPTSDPA()
+torch.testing.assert_close(a(x), b(x))
+print("same logits")</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>TinyGPT       1.18 ms/step   top op: aten::bmm
+TinyGPTSDPA   0.65 ms/step   top op: aten::_scaled_dot_product_flash_attention_for_cpu_backward
+same logits</code></pre>
+</div>
+<p>(Laptop CPU, one thread.) 1.8x faster per step, from one line. The fused kernel never materialises the <code>(B, H, T, T)</code> score tensor as separate ops and has no per-(sequence, head) slicing loop. The new top op is its backward, which is where to look next.</p>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 11.7</span>
+  <span class="exercise-diff hard">hard</span>
+  <span class="exercise-title">Find the CPU/GPU crossover</span>
+</div>
+<div class="exercise-body">
+<p>With your <code>bench()</code>, time an <code>n × n</code> matmul on one CPU thread and on the GPU (<code>"mps"</code> on a Mac, <code>"cuda"</code> elsewhere) for <code>n</code> from 16 to 4096. Where does the GPU start winning, and how does that relate to microgpt's choice?</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<div class="code" data-lang="python">
+<pre><code>torch.set_num_threads(1)
+for n in [16, 64, 256, 512, 1024, 2048, 4096]:
+    row = []
+    for dev in ["cpu", "mps"]:
+        a = torch.randn(n, n, device=dev)
+        b = torch.randn(n, n, device=dev)
+        row.append(bench(lambda: a @ b, dev))
+    winner = "cpu" if row[0] &lt; row[1] else "mps"
+    print(f"n={n:5d}  cpu {row[0] * 1e3:8.3f} ms   mps {row[1] * 1e3:8.3f} ms   -&gt; {winner}")</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>n=   16  cpu    0.001 ms   mps    0.143 ms   -&gt; cpu
+n=   64  cpu    0.002 ms   mps    0.164 ms   -&gt; cpu
+n=  256  cpu    0.024 ms   mps    0.204 ms   -&gt; cpu
+n=  512  cpu    0.177 ms   mps    0.388 ms   -&gt; cpu
+n= 1024  cpu    0.704 ms   mps    0.696 ms   -&gt; mps
+n= 2048  cpu    5.343 ms   mps    2.742 ms   -&gt; mps
+n= 4096  cpu   47.693 ms   mps   20.294 ms   -&gt; mps</code></pre>
+</div>
+<p>(Apple Silicon laptop; a second run called <code>n = 1024</code> for the CPU by a hair.) The GPU has a floor of about 0.15 ms per synchronized call: launch, queue, and the round-trip to find out it finished. Below <code>n ≈ 1000</code> the CPU finishes before the GPU has started. microgpt's largest matmul is <code>16 × 64</code>, two orders of magnitude below the crossover. On a datacenter GPU with CUDA the floor is lower and the peak much higher, but the shape of the curve is the same, which is why serving engines fight launch overhead with fusion, CUDA graphs and batching.</p>
+</div>
+</details>
+</div>
+</div>
+
+<h2 id="recap">Recap</h2>
+<ul>
+  <li>Every op pays a fixed dispatch cost (about 0.5 µs on this laptop CPU) before any arithmetic; GPU ops add a launch. microgpt's tensors are so small that one CPU thread beats ten threads and beats the GPU.</li>
+  <li>Time with <code>perf_counter</code>, warm up, repeat, take the median. GPU work is asynchronous: synchronize (<code>torch.cuda.synchronize()</code>, <code>torch.mps.synchronize()</code>) or use CUDA events. <code>benchmark.Timer</code> syncs CUDA but not MPS.</li>
+  <li><code>.item()</code>, <code>.tolist()</code>, <code>.cpu()</code>, <code>print(t)</code>, <code>if t:</code> and data-dependent sizes (<code>nonzero</code>, <code>x[mask]</code>) all stall the GPU queue. Keep values on the device and read them rarely.</li>
+  <li><code>torch.profiler.profile</code> plus <code>record_function</code> and <code>key_averages().table(sort_by=...)</code> show where time goes; the call-count column often explains it. Export a trace for the timeline.</li>
+  <li>Arithmetic intensity (FLOPs per byte) against the machine's ridge point says memory-bound or compute-bound. Elementwise ops and decode are memory-bound; big matmuls are compute-bound; fusion and batching raise effective intensity.</li>
+  <li><code>torch.compile</code> = Dynamo (bytecode to FX graph, guards) + AOTAutograd (backward graph) + Inductor (fused Triton or C++ kernels). It costs seconds on the first call, breaks graphs on data-dependent Python, recompiles on new shapes unless dimensions are dynamic, and <code>mode="reduce-overhead"</code> adds CUDA graphs. Measured here: 2.3x on a memory-bound chain, 1.35x on the tiny microgpt forward.</li>
+</ul>
+
+<div class="page-nav">
+  <a href="10-inference.html"><span class="lbl">← Prev</span><span class="ttl">Inference &amp; Sampling</span></a>
+  <a href="12-debugging.html" class="next"><span class="lbl">Next →</span><span class="ttl">Debugging PyTorch</span></a>
+</div>
+
+</main>
+</div>
+<script src="../assets/site.js"></script>
+</body>
+</html>

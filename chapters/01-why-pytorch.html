@@ -1,0 +1,791 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>1 · Why PyTorch — PyTorch</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<button class="sidebar-toggle" aria-label="Toggle navigation">☰ Menu</button>
+<div class="layout">
+<aside class="sidebar">
+  <a href="../index.html" class="brand">PyTorch</a>
+  <span class="brand-sub">a deep dive — 2026</span>
+  <nav>
+    <ol>
+      <li><a href="01-why-pytorch.html">Why PyTorch</a></li>
+      <li><a href="02-tensors.html">Tensors</a></li>
+      <li><a href="03-tensor-math.html">Tensor Math &amp; Broadcasting</a></li>
+      <li><a href="04-autograd.html">Autograd</a></li>
+      <li><a href="05-nn-module.html">nn.Module</a></li>
+      <li><a href="06-transformer-blocks.html">Building a Transformer</a></li>
+      <li><a href="07-losses-optimizers.html">Losses &amp; Optimizers</a></li>
+      <li><a href="08-training-loop.html">The Training Loop</a></li>
+      <li><a href="09-devices-precision.html">Devices &amp; Precision</a></li>
+      <li><a href="10-inference.html">Inference &amp; Sampling</a></li>
+      <li><a href="11-performance.html">Performance &amp; Profiling</a></li>
+      <li><a href="12-debugging.html">Debugging PyTorch</a></li>
+      <li><a href="13-50-questions.html">The 50 Questions</a></li>
+      <li><a href="14-capstone.html">Capstone Project</a></li>
+    </ol>
+    <div class="extras">
+      <a href="../exercises.html">All Exercises</a>
+      <a href="../index.html">← Home</a>
+    </div>
+  </nav>
+  <div class="progress"></div>
+</aside>
+
+<main class="content">
+
+<h1>
+  <span class="chap-num">Chapter 01</span>
+  Why PyTorch
+</h1>
+<p class="lede">
+  You already built a GPT where every number is a Python object. This
+  chapter measures what that costs, introduces the one idea that removes
+  the cost (the tensor), and maps the four parts of PyTorch onto code you
+  wrote in <code>microgpt.py</code>. It ends with an install check, so
+  every later chapter can assume a working setup.
+</p>
+
+<h2 id="where-you-are">Where you are: a GPT made of <code>Value</code> objects</h2>
+
+<p>In <code>microgpt_scalar.py</code>, every number in the model is a <code>Value</code>: a Python object holding one float (<code>data</code>), its gradient (<code>grad</code>), and links to the values it was computed from (<code>_children</code>). Those links form the <strong>computation graph</strong>: the record of which operation produced which number, which <code>backward()</code> walks in reverse to apply the chain rule.</p>
+
+<p>Here is the layer that does most of the work, copied from your file:</p>
+
+<div class="code" data-lang="python">
+<div class="code-hdr"><span class="lang">python</span><span class="title">microgpt_scalar.py</span></div>
+<pre><code>def linear(inputs, weights):
+    return [
+        sum(
+            weight * input_value
+            for weight, input_value in zip(output_weights, inputs)
+        )
+        for output_weights in weights
+    ]</code></pre>
+</div>
+
+<p>It is a double loop: for each output row of <code>weights</code>, multiply pairwise with <code>inputs</code> and add up. Count the work for one of microgpt's 16→16 layers (say <code>query_weights</code>) applied to one token:</p>
+
+<ul>
+  <li>16 outputs × 16 inputs = <strong>256 multiplies</strong> and about as many additions.</li>
+  <li>Every <code>*</code> and every <code>+</code> calls <code>Value.__mul__</code> or <code>Value.__add__</code>, which allocates a <em>new</em> <code>Value</code> object with a tuple of two children and a tuple of two local gradients.</li>
+  <li>So one 16→16 <code>linear</code> creates over 500 new <code>Value</code> objects and about a thousand graph edges, to do 256 multiply-adds that a CPU core can finish in nanoseconds. (EX 1.2 asks for the exact count. It is not 512.)</li>
+</ul>
+
+<p>A single <code>gpt_step</code> calls <code>linear</code> six times (query, key, value, attention output, MLP expand, MLP contract) plus the language-model head, and the attention, softmax and RMSNorm add more. One five-token name like <code>"emma"</code> builds a graph of tens of thousands of <code>Value</code> nodes (EX 1.6 has you count them). That is why the scalar engine is only good for learning.</p>
+
+<h2 id="what-is-a-tensor">What a tensor is</h2>
+
+<p>A <strong>tensor</strong> is an n-dimensional grid of numbers where every element has the same type and all of it lives in one place. Three words come with it, and you will see them on every page of this tutorial:</p>
+
+<ul>
+  <li><strong>shape</strong>: the size along each dimension. A list of 16 numbers has shape <code>(16,)</code>. microgpt's <code>query_weights</code> has shape <code>(16, 16)</code>. A batch of 8 names, 16 tokens each, 16 numbers per token, has shape <code>(8, 16, 16)</code>. The number of dimensions is the tensor's <code>ndim</code> (also called its rank).</li>
+  <li><strong>dtype</strong>: the element type, one for the whole tensor. <code>torch.float32</code> (a C <code>float</code>) is the default for real numbers; token ids use <code>torch.int64</code>.</li>
+  <li><strong>device</strong>: where the memory lives. <code>cpu</code> is ordinary RAM; <code>cuda</code> is NVIDIA GPU memory; <code>mps</code> is the GPU on Apple Silicon.</li>
+</ul>
+
+<div class="code" data-lang="python">
+<pre><code>import torch
+
+t = torch.tensor([[1.0, 2.0, 3.0],
+                  [4.0, 5.0, 6.0]])
+print(t)
+# tensor([[1., 2., 3.],
+#         [4., 5., 6.]])
+print(t.shape)
+# torch.Size([2, 3])
+print(t.dtype)
+# torch.float32
+print(t.device)
+# cpu</code></pre>
+</div>
+
+<div class="callout hood">
+<div class="callout-title">Under the hood</div>
+<p>A tensor is a small descriptor (shape, dtype, device, and <em>strides</em>, covered in Chapter 2) pointing at one flat buffer: six <code>float32</code> values are 24 consecutive bytes. Six <code>Value</code>s are six heap objects, each with a <code>__dict__</code> and a boxed float. For a tensor op Python is involved once; the loop over elements runs in compiled C++ (or a GPU kernel) with SIMD instructions and multiple threads.</p>
+</div>
+
+<h4>Your <code>linear</code> as one expression</h4>
+
+<p>Your file has a test for <code>linear</code>: inputs <code>[2, 3]</code>, weights <code>[[1, -1], [0.5, 2]]</code>, expected outputs <code>[-1, 7]</code>. The tensor version is one line:</p>
+
+<div class="code" data-lang="python">
+<pre><code>import torch
+
+x = torch.tensor([2.0, 3.0])          # linear_inputs
+W = torch.tensor([[1.0, -1.0],        # linear_weights: one row per output
+                  [0.5,  2.0]])
+y = x @ W.T                           # all four multiplies, one call
+print(y)  # tensor([-1.,  7.])</code></pre>
+</div>
+
+<p><code>@</code> is matrix multiplication. <code>W.T</code> is the transpose of <code>W</code>: microgpt stores weights as <code>[out][in]</code> (one row per output), and <code>x @ W.T</code> takes the dot product of <code>x</code> with each row. Check by hand: 2·1 + 3·(−1) = −1 and 2·0.5 + 3·2 = 7. Chapter 3 covers <code>@</code> and the <code>[out, in]</code> layout properly.</p>
+
+<p>The same line works for a whole name at once. Stack the five token vectors of <code>BOS e m m a</code> as the rows of a <code>(5, 16)</code> tensor, and one matmul does what five calls of <code>linear</code> did:</p>
+
+<div class="code" data-lang="python">
+<pre><code>import torch
+
+torch.manual_seed(0)
+X = torch.randn(5, 16)     # 5 tokens (BOS e m m a), 16 numbers each
+W = torch.randn(16, 16)    # query_weights: 16 outputs x 16 inputs
+Q = X @ W.T
+print(Q.shape)  # torch.Size([5, 16])</code></pre>
+</div>
+
+<h2 id="measure">Measure it</h2>
+
+<p>The script below runs the same computation, <code>X @ W.T</code>, three ways: microgpt's <code>linear</code> on <code>Value</code> objects, the same loop on plain Python floats (no graph), and PyTorch. It imports <code>Value</code> and <code>linear</code> from <code>scalar.py</code>: a file you make by copying just those definitions out of <code>microgpt_scalar.py</code> (importing that file itself would train a model).</p>
+
+<div class="code" data-lang="python">
+<div class="code-hdr"><span class="lang">python</span><span class="title">bench_linear.py</span></div>
+<pre><code>import random
+import statistics
+import time
+
+import torch
+from scalar import Value, linear
+
+
+def bench(fn, warmup=2, repeats=7):
+    for _ in range(warmup):          # warm-up: first calls pay one-off costs
+        fn()
+    times = []
+    for _ in range(repeats):
+        start = time.perf_counter()
+        fn()
+        times.append(time.perf_counter() - start)
+    return statistics.median(times)  # median ignores a stray slow run
+
+
+def float_linear(rows, weights):
+    # microgpt's linear(), on plain Python floats (no Value, no graph)
+    return [
+        [sum(w * x for w, x in zip(w_row, row)) for w_row in weights]
+        for row in rows
+    ]
+
+
+def value_linear(rows, weights):
+    return [linear(row, weights) for row in rows]
+
+
+random.seed(0)
+torch.manual_seed(0)
+print(f"{'X @ W.T':&lt;20}{'mul-adds':&gt;10}{'Value':&gt;12}{'floats':&gt;12}"
+      f"{'torch':&gt;11}{'floats/torch':&gt;14}")
+
+for tokens, width in [(1, 16), (16, 16), (64, 64), (256, 256)]:
+    X = torch.randn(tokens, width)
+    W = torch.randn(width, width)
+    X_list, W_list = X.tolist(), W.tolist()
+
+    t_torch = bench(lambda: X @ W.T, warmup=10, repeats=200)
+    repeats = 7 if width &lt; 256 else 3
+    t_float = bench(lambda: float_linear(X_list, W_list), repeats=repeats)
+    if width &lt;= 64:
+        X_val = [[Value(v) for v in row] for row in X_list]
+        W_val = [[Value(v) for v in row] for row in W_list]
+        t_value = bench(lambda: value_linear(X_val, W_val), repeats=repeats)
+        value_str = f"{t_value * 1e3:.3f} ms"
+    else:
+        value_str = "skipped"
+
+    shape = f"({tokens},{width})@({width},{width})"
+    print(f"{shape:&lt;20}{tokens * width * width:&gt;10,}{value_str:&gt;12}"
+          f"{t_float * 1e3:&gt;9.3f} ms{t_torch * 1e6:&gt;8.1f} us"
+          f"{t_float / t_torch:&gt;13,.0f}x")</code></pre>
+</div>
+
+<p>Three timing rules are built in: <code>time.perf_counter()</code> (Python's highest-resolution clock), <strong>warm-up</strong> runs that are thrown away (first calls pay one-off costs such as allocating memory), and many <strong>repeats</strong> summarised by the median. Measured on an Apple Silicon laptop CPU (M4 Pro, PyTorch 2.8, default threads). Your numbers will differ; the shape of the result will not:</p>
+
+<div class="code" data-lang="text">
+<pre><code>X @ W.T               mul-adds       Value      floats      torch  floats/torch
+(1,16)@(16,16)             256    0.201 ms    0.009 ms     0.8 us           11x
+(16,16)@(16,16)          4,096    3.756 ms    0.156 ms     1.4 us          110x
+(64,64)@(64,64)        262,144  596.438 ms    7.537 ms     2.0 us        3,849x
+(256,256)@(256,256) 16,777,216     skipped  433.416 ms    26.6 us       16,279x</code></pre>
+</div>
+
+<ul>
+  <li><strong>At microgpt's size, PyTorch is mostly overhead.</strong> One 16→16 layer on one token takes 0.8 µs, yet 256 multiply-adds need only nanoseconds. The rest is the fixed cost of a call: Python-to-C++ dispatch, shape and dtype checks, allocating the output.</li>
+  <li><strong>Bigger tensors spread that fixed cost.</strong> From <code>(1,16)</code> to <code>(64,64)</code> the work grows 1,024× and the PyTorch time goes from 0.8 to 2.0 µs. The Python loop scales with the work, so the ratio climbs from 11× to over 16,000×.</li>
+  <li><strong>The <code>Value</code> graph costs far more than the loop.</strong> At 64×64 it is about 80× slower than plain floats: over half a million objects per call. At 256×256 it would be tens of millions, so it is skipped.</li>
+</ul>
+
+<p>This explains two things in your <code>microgpt.py</code>. The README says the PyTorch engine runs "hundreds of times faster" than the scalar one. And <code>run_fast_training()</code> starts with:</p>
+
+<div class="code" data-lang="python">
+<div class="code-hdr"><span class="lang">python</span><span class="title">microgpt.py</span></div>
+<pre><code>    # This model is too small to benefit from GPU kernel launches. One CPU
+    # thread is considerably faster for its many tiny tensor operations.
+    torch.set_num_threads(1)</code></pre>
+</div>
+
+<p>With 16×16 matrices per-call overhead dominates, and threads or a GPU add overhead without useful parallel work. The same fact, "small ops are overhead-bound", is why inference engines care about fusing operations and CUDA graphs (Chapter 11).</p>
+
+<div class="callout pitfall">
+<div class="callout-title">Timing GPU code with this script gives wrong numbers</div>
+<p>On CPU, <code>X @ W.T</code> returns when the result is ready. On a CUDA or MPS device it returns once the work is <em>queued</em>, so <code>perf_counter</code> alone measures the queueing. Call <code>torch.cuda.synchronize()</code> (or <code>torch.mps.synchronize()</code>) before reading the clock. Chapter 11 covers this.</p>
+</div>
+
+<h2 id="four-pieces">The four pieces PyTorch gives you</h2>
+
+<p>PyTorch is four layers, each replacing something you wrote by hand in <code>microgpt_scalar.py</code>:</p>
+
+<table>
+  <tr><th>Piece</th><th>What it is</th><th>Replaces in microgpt_scalar.py</th><th>Chapter</th></tr>
+  <tr><td>Tensors + devices</td><td>n-d arrays with fast ops on CPU, CUDA or MPS</td><td>lists of <code>Value</code>, the loops in <code>linear</code>, <code>softmax</code>, <code>rms_norm</code></td><td>2, 3, 9</td></tr>
+  <tr><td>Autograd</td><td>records the graph of tensor ops, computes gradients</td><td><code>Value._children</code>, <code>_local_gradients</code>, <code>Value.backward()</code></td><td>4</td></tr>
+  <tr><td><code>torch.nn</code></td><td>modules that own parameters, plus layer functions</td><td><code>make_matrix</code>, the <code>parameters</code> list, <code>linear</code>, <code>softmax</code>, <code>rms_norm</code>, <code>negative_log_likelihood</code></td><td>5, 6, 7</td></tr>
+  <tr><td><code>torch.optim</code></td><td>update rules over a set of parameters</td><td><code>apply_adam</code>, the moment lists, zeroing <code>grad</code></td><td>7, 8</td></tr>
+</table>
+
+<p>Every one of them already appears in <code>run_fast_training()</code>. Here are the real lines.</p>
+
+<h4>1. Tensors and devices</h4>
+<div class="code" data-lang="python">
+<pre><code>    device = torch.device(device_name)
+    ...
+        input_ids = torch.tensor(
+            token_ids[:number_of_predictions],
+            dtype=torch.long,
+            device=device,
+        )
+    ...
+    model = FastMicroGPT().to(device)</code></pre>
+</div>
+<p>A name becomes a 1-D tensor of token ids (<code>torch.long</code> is another name for <code>torch.int64</code>), created directly on the chosen device. <code>.to(device)</code> moves every parameter of the model there.</p>
+
+<h4>2. Autograd</h4>
+<div class="code" data-lang="python">
+<pre><code>        logits = model(input_ids)
+        loss = F.cross_entropy(logits, target_ids)
+
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()</code></pre>
+</div>
+<p><code>loss.backward()</code> is your <code>Value.backward()</code>: PyTorch recorded the tensor operations of the forward pass and walks them in reverse, filling <code>.grad</code> on every parameter. Your graph had one node per scalar; PyTorch's has one per <em>tensor operation</em>. Counted with a hook, <code>FastMicroGPT</code>'s forward pass on <code>BOS e m m a</code> is 31 tensor function calls, against tens of thousands of <code>Value</code> nodes for the same name. <code>zero_grad</code> replaces your <code>for parameter in parameters: parameter.grad = 0.0</code>.</p>
+
+<h4>3. <code>torch.nn</code></h4>
+<div class="code" data-lang="python">
+<pre><code>    class FastMicroGPT(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            ...
+                return torch.nn.Parameter(
+                    torch.tensor(values, dtype=torch.float32)
+                )
+            ...
+            query = F.linear(normalized_inputs, self.query_weights)</code></pre>
+</div>
+<p><code>torch.nn.Module</code> is a base class that keeps track of every <code>Parameter</code> assigned to it, so <code>model.parameters()</code> finds all 4,192 numbers without the hand-built <code>parameter_matrices</code> list. <code>torch.nn.functional</code> (imported as <code>F</code>) holds the layer math: <code>F.linear</code> is your <code>linear</code>, <code>F.rms_norm</code> your <code>rms_norm</code>, <code>F.softmax</code> your <code>softmax</code>, and <code>F.cross_entropy</code> combines a log-softmax with the negative log-likelihood (your <code>softmax</code> followed by <code>negative_log_likelihood</code>).</p>
+
+<h4>4. <code>torch.optim</code></h4>
+<div class="code" data-lang="python">
+<pre><code>    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=0.01,
+        betas=(0.85, 0.99),
+        eps=1e-8,
+        foreach=False,
+    )
+    ...
+        optimizer.step()</code></pre>
+</div>
+<p><code>betas=(0.85, 0.99)</code> and <code>eps=1e-8</code> are your <code>adam_beta1</code>, <code>adam_beta2</code> and <code>adam_epsilon</code>. The optimizer owns the first and second moment buffers that you kept in <code>adam_first_moments</code> and <code>adam_second_moments</code>, and <code>optimizer.step()</code> is <code>apply_adam</code>.</p>
+
+<h4>And inference: <code>generate_name</code></h4>
+<div class="code" data-lang="python">
+<pre><code>    @torch.inference_mode()
+    def generate_name(model, prefix, temperature):
+        ...
+            next_token_logits = model(input_ids)[-1] / temperature
+            probabilities = F.softmax(next_token_logits, dim=-1)
+            next_token_id = torch.multinomial(
+                probabilities,
+                num_samples=1,
+            ).item()</code></pre>
+</div>
+<p><code>@torch.inference_mode()</code> tells autograd not to record anything, because no <code>backward()</code> will follow. <code>torch.multinomial</code> samples a token id from the probabilities, and <code>.item()</code> turns a one-element tensor back into a Python <code>int</code>. Chapter 10 builds on exactly this function.</p>
+
+<h4>All four in twenty lines</h4>
+
+<p>The whole pattern on the smallest problem, learning <code>y = 2x + 1</code> from four points. The loop has microgpt's five steps: forward, loss, zero the gradients, backward, step.</p>
+
+<div class="code" data-lang="python">
+<div class="code-hdr"><span class="lang">python</span><span class="title">four_pieces.py</span></div>
+<pre><code>import torch
+
+torch.manual_seed(0)
+
+# 1. tensors: four (input, target) pairs on the line y = 2x + 1
+x = torch.tensor([[-1.0], [0.0], [1.0], [2.0]])
+y = torch.tensor([[-1.0], [1.0], [3.0], [5.0]])
+
+# 3. torch.nn: a layer that owns a weight and a bias
+model = torch.nn.Linear(1, 1)
+
+# 4. torch.optim: the update rule
+optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+
+for step in range(200):
+    prediction = model(x)
+    loss = ((prediction - y) ** 2).mean()
+    optimizer.zero_grad()
+    loss.backward()          # 2. autograd fills model.weight.grad, model.bias.grad
+    optimizer.step()
+
+print(f"loss={loss.item():.6f} "
+      f"weight={model.weight.item():.4f} bias={model.bias.item():.4f}")</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>loss=0.000000 weight=2.0000 bias=1.0000</code></pre>
+</div>
+
+<h2 id="eager">Eager execution</h2>
+
+<p>PyTorch runs in <strong>eager mode</strong> by default: each operation executes the moment Python reaches it and returns a tensor with real numbers in it. There is no separate "build the program, then run it" step.</p>
+
+<div class="code" data-lang="python">
+<pre><code>import torch
+
+torch.manual_seed(0)
+x = torch.randn(3)
+print(x)
+# tensor([ 1.5410, -0.2934, -2.1788])
+
+# the exponentials are computed when this line runs, not later
+y = x.exp()
+print(y)
+# tensor([4.6692, 0.7457, 0.1132])
+
+# ordinary Python control flow on a value the GPU/CPU just computed
+if y.sum() &gt; 3:
+    print("big")
+else:
+    print("small")</code></pre>
+</div>
+
+<p>Because every intermediate is a real value, you can <code>print</code> inside a model's <code>forward</code>, stop in <code>pdb</code>, or branch with a plain <code>if</code> on a computed value. When a shape is wrong, the traceback points at the exact Python line. The model is just a Python program.</p>
+
+<p>The alternative is <strong>graph mode</strong>: describe the whole computation as a graph first, then a compiler optimises and runs it. TensorFlow 1.x worked this way; JAX's <code>jit</code> does today. Seeing the whole graph lets a compiler fuse operations (one kernel for <code>exp</code> then <code>sum</code>, instead of two passes over memory) and remove the per-op Python cost that dominated the small rows of the benchmark.</p>
+
+<p>In compiler terms: eager mode is an interpreter (easy to debug, overhead on every op), graph mode is ahead-of-time compilation. PyTorch 2 adds a JIT on top of eager: <code>torch.compile</code> captures the Python into a graph and generates fused kernels for it. Chapter 11 measures what it buys.</p>
+
+<div class="callout history">
+<div class="callout-title">Define-by-run</div>
+<p>Building the graph as a side effect of running ordinary code is called <em>define-by-run</em>. Chainer (2015) popularised it, and PyTorch (public release January 2017, growing out of the Lua-based Torch) made it mainstream. Researchers moved to PyTorch largely because models were plain Python. TensorFlow 2.0 (2019) switched its default to eager execution too.</p>
+</div>
+
+<h2 id="inference">Where PyTorch sits in inference</h2>
+
+<p>The open-source LLM serving engines you will meet are built on PyTorch:</p>
+
+<ul>
+  <li><strong>vLLM</strong> and <strong>SGLang</strong> are Python serving engines. Model architectures are written as <code>torch.nn.Module</code> classes (vLLM keeps them under <code>vllm/model_executor/models/</code>), weights and the KV cache are PyTorch tensors in GPU memory, and the engine adds scheduling, batching and memory management around them.</li>
+  <li>The performance-critical pieces (attention over a paged KV cache, fused matmuls for quantised weights, mixture-of-experts routing) are custom CUDA or Triton kernels that the engines call from PyTorch. To reduce the per-operation overhead you just measured, they use CUDA graphs and <code>torch.compile</code>.</li>
+  <li>NVIDIA's <strong>TensorRT-LLM</strong> describes itself as "architected on PyTorch", with model definitions in native PyTorch code.</li>
+  <li>Model checkpoints are usually published in the Hugging Face format, whose reference implementations are PyTorch modules.</li>
+</ul>
+
+<p>So the practical skill is reading and writing PyTorch model code fluently: shapes, dtypes, devices, where memory goes, and what each operation costs. That is what the rest of this tutorial builds. The serving system itself (request scheduling, continuous batching, paged memory) sits on top and is not covered here.</p>
+
+<h2 id="install">Install and sanity check</h2>
+
+<p>Inside a virtual environment:</p>
+
+<div class="code terminal" data-lang="sh">
+<pre><code>$ python3 -m venv .venv &amp;&amp; source .venv/bin/activate
+$ pip install torch numpy
+$ python -c "import torch; print(torch.__version__)"
+2.8.0
+$ python -c "import torch; print(torch.backends.mps.is_available(), torch.cuda.is_available())"
+True False</code></pre>
+</div>
+
+<p>That output is from an Apple Silicon Mac: the Apple GPU (<code>mps</code>) is available, CUDA is not. On a Linux machine with an NVIDIA GPU and a CUDA build of PyTorch you would see <code>False True</code>. On Linux, the default <code>pip install torch</code> pulls a CUDA-enabled build; for a CPU-only machine, the install selector on pytorch.org gives a smaller CPU-only command.</p>
+
+<p>A slightly fuller check that picks the best device and runs a matmul on it:</p>
+
+<div class="code" data-lang="python">
+<div class="code-hdr"><span class="lang">python</span><span class="title">check_torch.py</span></div>
+<pre><code>import torch
+
+print("torch", torch.__version__)
+# torch 2.8.0
+print("CUDA available:", torch.cuda.is_available())
+# CUDA available: False
+print("MPS available: ", torch.backends.mps.is_available())
+# MPS available:  True
+
+if torch.cuda.is_available():
+    device = torch.device("cuda")
+elif torch.backends.mps.is_available():
+    device = torch.device("mps")
+else:
+    device = torch.device("cpu")
+
+a = torch.ones(2, 3, device=device)
+b = torch.ones(3, 2, device=device)
+print(a @ b)
+# tensor([[3., 3.],
+#         [3., 3.]], device='mps:0')</code></pre>
+</div>
+
+<p><code>device='mps:0'</code> means the result lives on the first (only) Apple GPU. On an NVIDIA machine it prints <code>device='cuda:0'</code>; on a CPU-only machine there is no <code>device=</code> part at all, because <code>cpu</code> is the default and is not printed.</p>
+
+<div class="hands-on">
+<div class="hands-on-hdr">Hands-on · do this now</div>
+<div class="hands-on-body">
+<p>1. Make <code>~/learning-pytorch/ch01</code>, save <code>check_torch.py</code> there and run it. Note which device it picked.</p>
+<p>2. Create <code>scalar.py</code> by copying the <code>Value</code> class, <code>linear</code>, <code>softmax</code> and <code>rms_norm</code> out of <code>microgpt_scalar.py</code>, with <code>import math</code> at the top. Check it imports cleanly:</p>
+<div class="code terminal" data-lang="sh">
+<pre><code>$ python -c "from scalar import Value, linear; print(linear([Value(2.0), Value(3.0)], [[Value(1.0), Value(-1.0)], [Value(0.5), Value(2.0)]]))"
+[Value(data=-1.0, grad=0.0), Value(data=7.0, grad=0.0)]</code></pre>
+</div>
+<p>3. Run <code>bench_linear.py</code>. Before it finishes, predict: will your PyTorch time for <code>(64,64)@(64,64)</code> be closer to the <code>(1,16)</code> row, or 1,000 times it? Compare your table with the one above.</p>
+<p>4. Report <code>min(times)</code> instead of the median and run again. The minimum is "best case, nothing interfered"; the median is "typical".</p>
+</div>
+</div>
+
+<h2 id="exercises">Exercises</h2>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 1.1</span>
+  <span class="exercise-diff easy">easy</span>
+  <span class="exercise-title">Read your install</span>
+</div>
+<div class="exercise-body">
+<p>Without running anything, predict what these print on your machine, then run them: <code>torch.version.cuda</code>, and the <code>dtype</code> and <code>device</code> of <code>torch.ones(2, 3)</code>.</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<div class="code" data-lang="python">
+<pre><code>import torch
+
+print(torch.version.cuda)  # None
+t = torch.ones(2, 3)
+print(t.dtype, t.device)  # torch.float32 cpu</code></pre>
+</div>
+<p>On a Mac, <code>torch.version.cuda</code> is <code>None</code>: it is the CUDA version this <em>build</em> of PyTorch was compiled against, not a property of your hardware. On a CUDA build it is a string such as <code>'12.8'</code>, even when no GPU is present, so use <code>torch.cuda.is_available()</code> to ask whether a GPU is usable. New tensors default to <code>float32</code> on <code>cpu</code> unless you pass <code>dtype=</code> or <code>device=</code>.</p>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 1.2</span>
+  <span class="exercise-diff easy">easy</span>
+  <span class="exercise-title">Count one scalar <code>linear</code></span>
+</div>
+<div class="exercise-body">
+<p>For a 16→16 <code>linear</code> on one token: how many multiplies, how many additions, and how many <code>Value</code> objects does one call create? Predict, then check by counting calls to <code>Value.__init__</code>. Hint: the answer is not 512. Look at what Python's built-in <code>sum()</code> starts from.</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<div class="code" data-lang="python">
+<pre><code>import random
+from scalar import Value, linear
+
+created = 0
+original_init = Value.__init__
+
+
+def counting_init(self, *args, **kwargs):
+    global created
+    created += 1
+    original_init(self, *args, **kwargs)
+
+
+Value.__init__ = counting_init
+
+random.seed(0)
+x = [Value(random.gauss(0, 1)) for _ in range(16)]
+W = [[Value(random.gauss(0, 0.08)) for _ in range(16)] for _ in range(16)]
+
+created = 0
+y = linear(x, W)
+print(len(y), created)  # 16 528</code></pre>
+</div>
+<p>256 multiplies (256 objects) and 256 additions (256 objects), plus 16 more. <code>sum()</code> starts from the integer <code>0</code>, so the first addition per output is <code>0 + Value</code>. That calls <code>Value.__radd__</code>, which calls <code>__add__</code>, which wraps the <code>0</code> in a fresh <code>Value(0)</code>. One extra object per output row: 256 + 256 + 16 = 528. Each multiply and add node also stores two children, so the graph gains 1,024 edges.</p>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 1.3</span>
+  <span class="exercise-diff medium">medium</span>
+  <span class="exercise-title">Time a loop against a tensor op</span>
+</div>
+<div class="exercise-body">
+<p>Compute the sum of squares of one million random numbers twice: with a Python generator over a list, and with a tensor expression. Time both with warm-up and repeats. Then explain why the two results differ in the last digits.</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<div class="code" data-lang="python">
+<pre><code>import statistics
+import time
+
+import torch
+
+
+def bench(fn, warmup=3, repeats=20):
+    for _ in range(warmup):
+        fn()
+    times = []
+    for _ in range(repeats):
+        start = time.perf_counter()
+        fn()
+        times.append(time.perf_counter() - start)
+    return statistics.median(times)
+
+
+torch.manual_seed(0)
+t = torch.randn(1_000_000)
+xs = t.tolist()                      # the same numbers as a Python list
+
+loop_result = sum(v * v for v in xs)
+tensor_result = (t * t).sum().item()
+print(f"loop:   {loop_result:.4f}")
+print(f"tensor: {tensor_result:.4f}")
+
+t_loop = bench(lambda: sum(v * v for v in xs))
+t_tensor = bench(lambda: (t * t).sum())
+print(f"loop:   {t_loop * 1e3:7.2f} ms")
+print(f"tensor: {t_tensor * 1e3:7.2f} ms   ({t_loop / t_tensor:.0f}x faster)")</code></pre>
+</div>
+<p>Measured on an Apple Silicon laptop CPU (yours will differ):</p>
+<div class="code" data-lang="text">
+<pre><code>loop:   999781.2120
+tensor: 999781.1875
+loop:     22.20 ms
+tensor:    0.15 ms   (148x faster)</code></pre>
+</div>
+<p>The results differ because of precision. <code>t.tolist()</code> turns each <code>float32</code> into a 64-bit Python <code>float</code>, so the loop accumulates in double precision; <code>(t * t).sum()</code> stays in <code>float32</code> (about 7 significant digits) and adds in a different order, and floating-point addition is not associative. When comparing a reference implementation with an optimised kernel, use a tolerance (<code>torch.allclose</code>), never <code>==</code>.</p>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 1.4</span>
+  <span class="exercise-diff medium">medium</span>
+  <span class="exercise-title">Rewrite <code>linear</code> with tensors</span>
+</div>
+<div class="exercise-body">
+<p>Generate random inputs (16 numbers) and random weights with microgpt's MLP-expand shape (64 outputs × 16 inputs) as Python lists. Run them through the scalar <code>linear</code> (wrapping each number in a <code>Value</code>) and through a tensor expression. Show the results match.</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<div class="code" data-lang="python">
+<pre><code>import random
+
+import torch
+from scalar import Value, linear
+
+random.seed(0)
+inputs = [random.gauss(0.0, 1.0) for _ in range(16)]
+weights = [[random.gauss(0.0, 0.08) for _ in range(16)] for _ in range(64)]
+
+# scalar version: wrap every number in a Value
+scalar_out = linear(
+    [Value(v) for v in inputs],
+    [[Value(w) for w in row] for row in weights],
+)
+scalar_out = torch.tensor([v.data for v in scalar_out])
+
+# tensor version
+x = torch.tensor(inputs)          # (16,)
+W = torch.tensor(weights)         # (64, 16): [out][in], like mlp_expand_weights
+tensor_out = x @ W.T              # (64,)
+
+print(tensor_out.shape)
+# torch.Size([64])
+print(torch.allclose(tensor_out, scalar_out, atol=1e-6))
+# True
+print((tensor_out - scalar_out).abs().max())
+# tensor(5.9605e-08)</code></pre>
+</div>
+<p><code>W</code> has shape <code>(64, 16)</code> because the weights are stored <code>[out][in]</code>, the same layout as <code>mlp_expand_weights</code>, so the expression is <code>x @ W.T</code>. The largest difference is about 6e-8: both sides compute in different precisions and orders, so <code>torch.allclose</code> with a small tolerance is the right check.</p>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 1.5</span>
+  <span class="exercise-diff medium">medium</span>
+  <span class="exercise-title">Rewrite <code>softmax</code> with tensors</span>
+</div>
+<div class="exercise-body">
+<p>Write <code>softmax_t(logits)</code> for a 1-D tensor, following microgpt's <code>softmax</code> step by step (subtract the max, exponentiate, divide by the total). Check it against the scalar version on <code>[1, 2, 3]</code> and against <code>torch.softmax</code>.</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<div class="code" data-lang="python">
+<pre><code>import torch
+from scalar import Value, softmax
+
+
+def softmax_t(logits):
+    shifted = logits - logits.max()
+    exps = shifted.exp()
+    return exps / exps.sum()
+
+
+scalar_probs = [p.data for p in softmax([Value(1.0), Value(2.0), Value(3.0)])]
+tensor_probs = softmax_t(torch.tensor([1.0, 2.0, 3.0]))
+
+print([round(p, 4) for p in scalar_probs])
+# [0.09, 0.2447, 0.6652]
+print(tensor_probs)
+# tensor([0.0900, 0.2447, 0.6652])
+print(torch.allclose(tensor_probs, torch.tensor(scalar_probs)))
+# True
+print(torch.softmax(torch.tensor([1.0, 2.0, 3.0]), dim=-1))
+# tensor([0.0900, 0.2447, 0.6652])</code></pre>
+</div>
+<p>Each line of the scalar version became one tensor operation over all elements: <code>logits.max()</code>, a subtraction, <code>.exp()</code>, <code>.sum()</code>, a division. Subtracting the max does not change the result (it cancels between numerator and denominator) but keeps <code>exp</code> from overflowing; Chapter 3 shows the overflow. <code>dim=-1</code> says "normalise along the last dimension", which matters once there is more than one row.</p>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 1.6</span>
+  <span class="exercise-diff hard">hard</span>
+  <span class="exercise-title">Count the scalar forward pass</span>
+</div>
+<div class="exercise-body">
+<p>Copy <code>microgpt_scalar.py</code> to <code>count_values.py</code>. At the bottom, patch <code>Value.__init__</code> to count objects, then count how many <code>Value</code> objects (a) one <code>gpt_step</code> creates at positions 0, 1 and 2, and (b) <code>calculate_document_loss("emma")</code> creates. Explain the difference between consecutive positions exactly.</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<div class="code" data-lang="python">
+<div class="code-hdr"><span class="lang">python</span><span class="title">appended to count_values.py</span></div>
+<pre><code># ---- appended: count Value objects ----
+created = 0
+original_init = Value.__init__
+
+
+def counting_init(self, *args, **kwargs):
+    global created
+    created += 1
+    original_init(self, *args, **kwargs)
+
+
+Value.__init__ = counting_init
+
+key_cache, value_cache = [], []
+for position_id, token_id in enumerate(encode("emma")[:3]):
+    created = 0
+    gpt_step(token_id, position_id, key_cache, value_cache)
+    print(f"gpt_step at position {position_id}: {created:,} Value objects")
+
+created = 0
+loss, token_losses = calculate_document_loss("emma")
+print(f"calculate_document_loss('emma'): {created:,} Value objects")</code></pre>
+</div>
+<div class="code terminal" data-lang="sh">
+<pre><code>$ TRAINING_STEPS=0 EVALUATION_LIMIT=1 python count_values.py
+...
+gpt_step at position 0: 7,682 Value objects
+gpt_step at position 1: 7,782 Value objects
+gpt_step at position 2: 7,882 Value objects
+calculate_document_loss('emma'): 39,433 Value objects</code></pre>
+</div>
+<p>The environment variables skip training and evaluate one test name, so the appended code runs within seconds. Each extra cached position costs exactly 100 objects: 25 per head × 4 heads. Per head, one more key adds an attention logit (4 multiplies + <code>Value(0)</code> from <code>sum</code> + 4 additions = 9, then <code>/ head_size**0.5</code> is a multiply by a wrapped constant = 2, total 11); one more softmax element (subtract the max = 2, <code>exp</code> = 1, one more addition into the total = 1, and <code>exponential / total</code> computes <code>total**-1</code> again plus a multiply = 2, total 6); and one more term in each of the 4 output dimensions (multiply + add = 8). 11 + 6 + 8 = 25. The five predictions for <code>"emma"</code> sum to 39,410; the remaining 23 come from the five losses and their average. Compare: PyTorch's forward pass for the whole name is 31 tensor operations, and that count does not grow with the length.</p>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 1.7</span>
+  <span class="exercise-diff hard">hard</span>
+  <span class="exercise-title">Tensorize <code>attention_head</code></span>
+</div>
+<div class="exercise-body">
+<p>Write <code>attention_head_t(query, keys, values, head_index)</code> where <code>query</code> is a <code>(16,)</code> tensor and <code>keys</code>, <code>values</code> are <code>(T, 16)</code> tensors (one row per cached position). It must return the same head output and attention weights as microgpt's <code>attention_head</code>. Check all four heads with <code>T = 5</code>. (Add <code>head_size = 4</code> and <code>attention_head</code> to your <code>scalar.py</code>.) You need one thing from Chapter 2: <code>keys[:, 0:4]</code> means "all rows, columns 0 to 3".</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<div class="code" data-lang="python">
+<pre><code>import random
+
+import torch
+from scalar import Value, attention_head
+
+head_size = 4
+
+
+def attention_head_t(query, keys, values, head_index):
+    s = slice(head_index * head_size, (head_index + 1) * head_size)
+    q, K, V = query[s], keys[:, s], values[:, s]   # (4,), (T, 4), (T, 4)
+    logits = (K @ q) / head_size**0.5              # (T,)
+    weights = torch.softmax(logits, dim=-1)        # (T,)
+    return weights @ V, weights                    # (4,), (T,)
+
+
+random.seed(0)
+T = 5
+q = [random.gauss(0, 1) for _ in range(16)]
+k = [[random.gauss(0, 1) for _ in range(16)] for _ in range(T)]
+v = [[random.gauss(0, 1) for _ in range(16)] for _ in range(T)]
+
+for h in range(4):
+    out_s, w_s = attention_head([Value(x) for x in q],
+                                [[Value(x) for x in row] for row in k],
+                                [[Value(x) for x in row] for row in v], h)
+    out_t, w_t = attention_head_t(torch.tensor(q), torch.tensor(k),
+                                  torch.tensor(v), h)
+    print(h, torch.allclose(out_t, torch.tensor([x.data for x in out_s])),
+          torch.allclose(w_t, torch.tensor([x.data for x in w_s])))</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>0 True True
+1 True True
+2 True True
+3 True True</code></pre>
+</div>
+<p>The three list comprehensions in the scalar version become three operations. <code>K @ q</code> is <code>(T, 4) @ (4,)</code>, giving one dot product per cached position: the attention logits. <code>softmax</code> turns them into weights. <code>weights @ V</code> is <code>(T,) @ (T, 4)</code>, a weighted sum of value rows. <code>slice(0, 4)</code> is the object Python builds for <code>0:4</code>, so one variable can slice all three tensors. Chapter 6 removes the remaining Python loop over heads by reshaping <code>(T, 16)</code> into <code>(4, T, 4)</code>.</p>
+</div>
+</details>
+</div>
+</div>
+
+<h2 id="recap">Recap</h2>
+<ul>
+  <li>microgpt's scalar engine creates a Python object for every intermediate number; one 16→16 <code>linear</code> is 256 multiplies and over 500 objects.</li>
+  <li>A tensor is an n-dimensional grid of numbers with one <strong>shape</strong>, one <strong>dtype</strong> and one <strong>device</strong>, stored as one flat buffer. Python is involved once per operation, not once per number.</li>
+  <li>Your <code>linear</code> is <code>x @ W.T</code>, because weights are stored <code>[out, in]</code>. With a <code>(T, in)</code> input it processes every token in one call.</li>
+  <li>Measured: PyTorch's advantage grows with size (11× at one microgpt token, over 16,000× at 256×256 against a float loop). At tiny sizes per-call overhead dominates, which is why microgpt runs on one CPU thread.</li>
+  <li>PyTorch = tensors + devices, autograd (<code>loss.backward()</code>), <code>torch.nn</code> (<code>Module</code>, <code>Parameter</code>, <code>F.*</code>) and <code>torch.optim</code> (<code>Adam</code>, <code>step</code>, <code>zero_grad</code>). All four are in <code>run_fast_training()</code>.</li>
+  <li>Eager execution runs each op as Python reaches it: easy to debug, overhead per op. <code>torch.compile</code> (Chapter 11) adds graph capture and fusion.</li>
+  <li>vLLM, SGLang and TensorRT-LLM define models in PyTorch; fluent PyTorch is the entry ticket to reading inference engines.</li>
+</ul>
+
+<div class="page-nav">
+  <a href="../index.html"><span class="lbl">← Prev</span><span class="ttl">Introduction</span></a>
+  <a href="02-tensors.html" class="next"><span class="lbl">Next →</span><span class="ttl">Tensors</span></a>
+</div>
+
+</main>
+</div>
+<script src="../assets/site.js"></script>
+</body>
+</html>

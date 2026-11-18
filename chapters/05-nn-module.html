@@ -1,0 +1,993 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>5 · nn.Module — PyTorch</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<button class="sidebar-toggle" aria-label="Toggle navigation">☰ Menu</button>
+<div class="layout">
+<aside class="sidebar">
+  <a href="../index.html" class="brand">PyTorch</a>
+  <span class="brand-sub">a deep dive — 2026</span>
+  <nav>
+    <ol>
+      <li><a href="01-why-pytorch.html">Why PyTorch</a></li>
+      <li><a href="02-tensors.html">Tensors</a></li>
+      <li><a href="03-tensor-math.html">Tensor Math &amp; Broadcasting</a></li>
+      <li><a href="04-autograd.html">Autograd</a></li>
+      <li><a href="05-nn-module.html">nn.Module</a></li>
+      <li><a href="06-transformer-blocks.html">Building a Transformer</a></li>
+      <li><a href="07-losses-optimizers.html">Losses &amp; Optimizers</a></li>
+      <li><a href="08-training-loop.html">The Training Loop</a></li>
+      <li><a href="09-devices-precision.html">Devices &amp; Precision</a></li>
+      <li><a href="10-inference.html">Inference &amp; Sampling</a></li>
+      <li><a href="11-performance.html">Performance &amp; Profiling</a></li>
+      <li><a href="12-debugging.html">Debugging PyTorch</a></li>
+      <li><a href="13-50-questions.html">The 50 Questions</a></li>
+      <li><a href="14-capstone.html">Capstone Project</a></li>
+    </ol>
+    <div class="extras">
+      <a href="../exercises.html">All Exercises</a>
+      <a href="../index.html">← Home</a>
+    </div>
+  </nav>
+  <div class="progress"></div>
+</aside>
+
+<main class="content">
+
+<h1>
+  <span class="chap-num">Chapter 05</span>
+  nn.Module
+</h1>
+<p class="lede">
+  <code>nn.Module</code> is the class every PyTorch model inherits from. Strip
+  away the features and it is a registry: it knows which tensors are
+  trainable parameters, which are fixed buffers, and which other modules it
+  contains, so that optimizers, <code>.to(device)</code> and checkpoints can
+  find all of them. This chapter builds that picture from microgpt's
+  hand-made parameter list up to <code>state_dict</code> and train/eval mode.
+</p>
+
+<h2 id="why-modules">Why modules exist</h2>
+
+<p>In <code>microgpt_scalar.py</code> you kept track of your weights by hand. Every matrix had to be listed once more at the bottom, then flattened, so Adam could loop over them:</p>
+
+<div class="code" data-lang="python">
+<div class="code-hdr"><span class="lang">python</span><span class="title">microgpt_scalar.py (excerpt)</span></div>
+<pre><code>parameter_matrices = [
+    token_embedding_table,
+    position_embedding_table,
+    query_weights,
+    ...
+    language_model_head_weights,
+]
+
+parameters = [
+    parameter
+    for matrix in parameter_matrices
+    for row in matrix
+    for parameter in row
+]
+
+assert len(parameters) == 4192</code></pre>
+</div>
+
+<p>Forget one matrix in that list and it silently never trains. <code>nn.Module</code> removes the list: any <code>nn.Parameter</code> you assign as an attribute in <code>__init__</code> is recorded automatically, and <code>model.parameters()</code> yields all of them. That's why <code>microgpt.py</code> can write <code>torch.optim.Adam(model.parameters(), ...)</code>.</p>
+
+<p>An <strong><code>nn.Parameter</code></strong> is a tensor subclass with two differences: it has <code>requires_grad=True</code> by default, and assigning it to a module attribute registers it. A plain tensor, even one with <code>requires_grad=True</code>, is just an attribute:</p>
+
+<div class="code" data-lang="python">
+<pre><code>import torch
+from torch import nn
+
+class Demo(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.w = nn.Parameter(torch.zeros(2, 3))              # registered
+        self.t = torch.zeros(2, 3, requires_grad=True)        # just an attribute
+
+m = Demo()
+print([name for name, _ in m.named_parameters()])
+print(type(m.w).__name__, m.w.requires_grad, m.w.is_leaf)
+print(list(m._parameters.keys()), "t" in m.__dict__)</code></pre>
+</div>
+
+<div class="code" data-lang="text">
+<pre><code>['w']
+Parameter True True
+['w'] True</code></pre>
+</div>
+
+<p>The optimizer would never see <code>t</code>. It wouldn't be saved in a checkpoint or moved to the GPU either.</p>
+
+<div class="callout hood">
+<div class="callout-title">Under the hood: <code>__setattr__</code></div>
+<p><code>nn.Module</code> overrides <code>__setattr__</code>. When you write <code>self.w = value</code>, it checks the type of <code>value</code>: an <code>nn.Parameter</code> goes into the dict <code>self._parameters</code>, an <code>nn.Module</code> into <code>self._modules</code>, and anything else into the ordinary instance <code>__dict__</code>. <code>parameters()</code> walks <code>_parameters</code> and then recurses into <code>_modules</code>. That is also why <code>super().__init__()</code> must come first: it creates those dicts. Assign a parameter before calling it and you get <code>AttributeError: cannot assign parameters before Module.__init__() call</code>.</p>
+</div>
+
+<h2 id="forward">__init__ and forward</h2>
+
+<p>A module has two parts. <code>__init__</code> creates the state (parameters, buffers, submodules). <code>forward</code> says what to compute from an input. You never write a backward: autograd records whatever <code>forward</code> does.</p>
+
+<div class="code" data-lang="python">
+<pre><code>class Scale(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.g = nn.Parameter(torch.tensor(2.0))
+
+    def forward(self, x):
+        return x * self.g
+
+s = Scale()
+s.register_forward_hook(lambda module, inputs, output: print("hook saw", tuple(output.shape)))
+
+x = torch.ones(3)
+y1 = s(x)            # nn.Module.__call__: pre-hooks, forward, hooks
+y2 = s.forward(x)    # forward only: the hook is skipped
+print(y1, torch.equal(y1, y2))</code></pre>
+</div>
+
+<div class="code" data-lang="text">
+<pre><code>hook saw (3,)
+tensor([2., 2., 2.], grad_fn=&lt;MulBackward0&gt;) True</code></pre>
+</div>
+
+<p>Always call the module, <code>model(x)</code>, never <code>model.forward(x)</code>. Calling goes through <code>nn.Module.__call__</code>, which runs any registered <strong>hooks</strong> (functions that observe or modify a module's inputs and outputs) around <code>forward</code>. Profilers, activation-capture tools, quantization and some distributed wrappers rely on hooks; calling <code>forward</code> directly bypasses all of them, as the single "hook saw" line shows. microgpt does it right: <code>logits = model(input_ids)</code>.</p>
+
+<h2 id="counting">Counting parameters: 4,192 again</h2>
+
+<p><code>FastMicroGPT</code> in <code>microgpt.py</code> creates nine matrices with a helper <code>make_parameter(rows, cols)</code>, which builds the values and wraps them in <code>nn.Parameter</code>. Here is a module with exactly the same names and shapes (and <code>torch.randn * 0.08</code> instead of <code>random.gauss</code>, for brevity):</p>
+
+<div class="code" data-lang="python">
+<div class="code-hdr"><span class="lang">python</span><span class="title">count_params.py</span></div>
+<pre><code>import torch
+from torch import nn
+
+class MicroGPTParams(nn.Module):
+    """Same parameter shapes as FastMicroGPT in microgpt.py."""
+    def __init__(self, vocab_size=27, n_embd=16, block_size=16):
+        super().__init__()
+
+        def make_parameter(rows, cols):
+            return nn.Parameter(torch.randn(rows, cols) * 0.08)
+
+        C = n_embd
+        self.token_embedding_table = make_parameter(vocab_size, C)
+        self.position_embedding_table = make_parameter(block_size, C)
+        self.query_weights = make_parameter(C, C)
+        self.key_weights = make_parameter(C, C)
+        self.value_weights = make_parameter(C, C)
+        self.attention_output_weights = make_parameter(C, C)
+        self.mlp_expand_weights = make_parameter(4 * C, C)
+        self.mlp_contract_weights = make_parameter(C, 4 * C)
+        self.language_model_head_weights = make_parameter(vocab_size, C)
+
+torch.manual_seed(0)
+model = MicroGPTParams()
+for name, p in model.named_parameters():
+    print(f"{name:28s} {str(tuple(p.shape)):9s} {p.numel():5d}")
+print("total:", sum(p.numel() for p in model.parameters()))</code></pre>
+</div>
+
+<div class="code" data-lang="text">
+<pre><code>token_embedding_table        (27, 16)    432
+position_embedding_table     (16, 16)    256
+query_weights                (16, 16)    256
+key_weights                  (16, 16)    256
+value_weights                (16, 16)    256
+attention_output_weights     (16, 16)    256
+mlp_expand_weights           (64, 16)   1024
+mlp_contract_weights         (16, 64)   1024
+language_model_head_weights  (27, 16)    432
+total: 4192</code></pre>
+</div>
+
+<p><code>named_parameters()</code> yields <code>(name, tensor)</code> pairs; <code>parameters()</code> yields just the tensors; <code>p.numel()</code> is the number of elements. <code>sum(p.numel() for p in model.parameters())</code> is the one-liner every codebase uses, and the exact assert in <code>microgpt.py</code>.</p>
+
+<div class="callout tip">
+<div class="callout-title">Note the leaf</div>
+<p><code>nn.Parameter(torch.randn(r, c) * 0.08)</code> is safe: the multiply happens on a tensor that doesn't require grad, then <code>Parameter</code> wraps the result as a fresh leaf. Compare EX 4.4, where <code>torch.randn(..., requires_grad=True) * 0.08</code> produced a non-leaf and lost its gradient.</p>
+</div>
+
+<h2 id="buffers">Buffers: state that isn't trained</h2>
+
+<p>Some tensors belong to the model but must not be trained: a causal mask, BatchNorm's running averages, a RoPE frequency table. Register them as <strong>buffers</strong> with <code>register_buffer(name, tensor)</code>. <code>FastMicroGPT</code> does this for its mask:</p>
+
+<div class="code" data-lang="python">
+<pre><code>class MaskDemo(nn.Module):
+    def __init__(self, block_size=4):
+        super().__init__()
+        self.w = nn.Parameter(torch.randn(3, 3))
+        causal_mask = torch.triu(torch.ones(block_size, block_size, dtype=torch.bool), diagonal=1)
+        self.register_buffer("causal_mask", causal_mask, persistent=False)
+        self.register_buffer("step_count", torch.zeros((), dtype=torch.long))  # persistent
+
+m = MaskDemo()
+print([n for n, _ in m.named_parameters()])
+print([n for n, _ in m.named_buffers()])
+print(list(m.state_dict().keys()))
+print(m.causal_mask)</code></pre>
+</div>
+
+<div class="code" data-lang="text">
+<pre><code>['w']
+['causal_mask', 'step_count']
+['w', 'step_count']
+tensor([[False,  True,  True,  True],
+        [False, False,  True,  True],
+        [False, False, False,  True],
+        [False, False, False, False]])</code></pre>
+</div>
+
+<p>A buffer is not in <code>parameters()</code>, so the optimizer never updates it. By default it is saved in <code>state_dict</code> (the checkpoint dictionary covered below). <code>persistent=False</code> leaves it out, which is right for the causal mask: it is cheap to rebuild from <code>block_size</code>, so storing it in every checkpoint is waste.</p>
+
+<p>Buffers do follow the module through <code>.to()</code>. That's the reason to register a mask instead of keeping a plain attribute: the forward pass needs the mask on the same device as the activations.</p>
+
+<div class="code" data-lang="python">
+<pre><code>class MaskDemo(nn.Module):
+    def __init__(self, block_size=4):
+        super().__init__()
+        self.w = nn.Parameter(torch.randn(3, 3))
+        causal_mask = torch.triu(torch.ones(block_size, block_size, dtype=torch.bool), diagonal=1)
+        self.register_buffer("causal_mask", causal_mask, persistent=False)
+        self.plain = torch.ones(2)          # not registered
+
+m = MaskDemo()
+m = m.to(torch.float64)
+print(m.w.dtype, m.causal_mask.dtype, m.plain.dtype)
+
+device = "mps" if torch.backends.mps.is_available() else "cpu"
+m = m.to(torch.float32).to(device)
+print(m.w.device, m.causal_mask.device, m.plain.device)</code></pre>
+</div>
+
+<div class="code" data-lang="text">
+<pre><code>torch.float64 torch.bool torch.float32
+mps:0 mps:0 cpu</code></pre>
+</div>
+
+<p>Two details. A dtype cast like <code>.to(torch.float64)</code> only converts floating-point tensors, so the boolean mask stays boolean. And the unregistered <code>plain</code> tensor stayed behind on the CPU. (This ran on an Apple Silicon Mac, so the device is <code>mps:0</code>; on an NVIDIA machine use <code>"cuda"</code> and you'd see <code>cuda:0</code>. MPS has no float64, hence the cast back to float32 first.)</p>
+
+<table>
+  <tr><th></th><th>In <code>parameters()</code></th><th>Gets <code>.grad</code></th><th>Moves with <code>.to()</code></th><th>In <code>state_dict</code></th></tr>
+  <tr><td><code>nn.Parameter</code></td><td>yes</td><td>yes</td><td>yes</td><td>yes</td></tr>
+  <tr><td>buffer</td><td>no</td><td>no</td><td>yes</td><td>yes, unless <code>persistent=False</code></td></tr>
+  <tr><td>plain tensor attribute</td><td>no</td><td>only if you set it up</td><td>no</td><td>no</td></tr>
+</table>
+
+<h2 id="submodules">Submodules and containers</h2>
+
+<p>Assign a module as an attribute of another module and it becomes a <strong>submodule</strong>. Parameters are then found recursively, with dotted names:</p>
+
+<div class="code" data-lang="python">
+<pre><code>class MLP(nn.Module):
+    def __init__(self, C=16):
+        super().__init__()
+        self.expand = nn.Linear(C, 4 * C, bias=False)
+        self.contract = nn.Linear(4 * C, C, bias=False)
+
+    def forward(self, x):
+        return self.contract(torch.relu(self.expand(x)))
+
+class TwoBlocks(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.first = MLP()
+        self.second = MLP()
+
+    def forward(self, x):
+        return self.second(self.first(x))
+
+net = TwoBlocks()
+for name, p in net.named_parameters():
+    print(name, tuple(p.shape))
+print([name for name, _ in net.named_children()])
+print(sum(1 for _ in net.modules()))</code></pre>
+</div>
+
+<div class="code" data-lang="text">
+<pre><code>first.expand.weight (64, 16)
+first.contract.weight (16, 64)
+second.expand.weight (64, 16)
+second.contract.weight (16, 64)
+['first', 'second']
+7</code></pre>
+</div>
+
+<p><code>named_children()</code> gives direct submodules only; <code>modules()</code> walks the whole tree including the root (here 1 + 2 + 4 = 7). The <code>MLP</code> class is microgpt's <code>mlp()</code> without the norm: <code>linear</code>, <code>relu</code>, <code>linear</code>.</p>
+
+<h4>The three containers</h4>
+
+<div class="code" data-lang="python">
+<pre><code>torch.manual_seed(0)
+seq = nn.Sequential(
+    nn.Linear(16, 64, bias=False),
+    nn.ReLU(),
+    nn.Linear(64, 16, bias=False),
+)
+print(seq)
+print([n for n, _ in seq.named_parameters()])
+x = torch.randn(5, 16)
+print(seq(x).shape)
+
+blocks = nn.ModuleList([nn.Linear(16, 16) for _ in range(3)])
+print([n for n, _ in blocks.named_parameters()][:2], len(blocks))
+
+heads = nn.ModuleDict({"lm": nn.Linear(16, 27, bias=False), "value": nn.Linear(16, 1)})
+print([n for n, _ in heads.named_parameters()])</code></pre>
+</div>
+
+<div class="code" data-lang="text">
+<pre><code>Sequential(
+  (0): Linear(in_features=16, out_features=64, bias=False)
+  (1): ReLU()
+  (2): Linear(in_features=64, out_features=16, bias=False)
+)
+['0.weight', '2.weight']
+torch.Size([5, 16])
+['0.weight', '0.bias'] 3
+['lm.weight', 'value.weight', 'value.bias']</code></pre>
+</div>
+
+<ul>
+  <li><strong><code>nn.Sequential</code></strong> has a <code>forward</code>: it feeds each module's output to the next. Use it for straight pipelines. <code>nn.ReLU()</code> is a module with no parameters, which is why the names jump from <code>0</code> to <code>2</code>.</li>
+  <li><strong><code>nn.ModuleList</code></strong> has no <code>forward</code>. It is a list that registers its contents. Use it for "N transformer blocks" where you write the loop yourself.</li>
+  <li><strong><code>nn.ModuleDict</code></strong> is the same, keyed by string. Use it when modules are chosen by name.</li>
+</ul>
+
+<div class="callout pitfall">
+<div class="callout-title">The plain-list bug: parameters disappear</div>
+<p>A Python <code>list</code> is not a module, so <code>__setattr__</code> files it under ordinary attributes and never looks inside:</p>
+<div class="code" data-lang="python">
+<pre><code>class Broken(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.layers = [nn.Linear(16, 16) for _ in range(3)]    # plain Python list
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
+class Fixed(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.layers = nn.ModuleList([nn.Linear(16, 16) for _ in range(3)])
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
+for cls in (Broken, Fixed):
+    m = cls()
+    n = sum(p.numel() for p in m.parameters())
+    print(f"{cls.__name__:6s} params={n:4d} state_dict keys={len(m.state_dict())}")
+
+torch.optim.Adam(Broken().parameters(), lr=0.01)</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>Broken params=   0 state_dict keys=0
+Fixed  params= 816 state_dict keys=6
+ValueError: optimizer got an empty parameter list</code></pre>
+</div>
+<p><code>Broken</code> still runs forward perfectly. If it has <em>some</em> registered parameters elsewhere, the optimizer error never fires and the layers in the list just never train, never get saved, and stay on the CPU when you call <code>.to("cuda")</code>. Same trap with a plain <code>dict</code>: use <code>nn.ModuleDict</code>.</p>
+</div>
+
+<h2 id="linear-embedding">nn.Linear and nn.Embedding from the inside</h2>
+
+<h4>nn.Linear</h4>
+
+<p><code>nn.Linear(in_features, out_features)</code> holds a <code>weight</code> of shape <strong><code>[out, in]</code></strong> and a <code>bias</code> of shape <code>[out]</code>, and computes <code>y = x @ weight.T + bias</code>. That is the same <code>[out][in]</code> layout as your <code>make_matrix</code> weights, and the same math as your <code>linear()</code>: one dot product per output row, but for a whole batch of input vectors at once.</p>
+
+<div class="code" data-lang="python">
+<pre><code>import math
+import torch.nn.functional as F
+
+torch.manual_seed(0)
+lin = nn.Linear(16, 64)                 # in_features=16, out_features=64
+print(lin.weight.shape, lin.bias.shape)
+
+x = torch.randn(5, 16)                  # 5 vectors of size 16
+y = lin(x)
+print(y.shape)
+print(torch.allclose(y, x @ lin.weight.T + lin.bias))
+print(torch.allclose(y, F.linear(x, lin.weight, lin.bias)))
+
+bound = 1 / math.sqrt(16)
+print(round(bound, 4), lin.weight.abs().max().item() &lt;= bound, lin.bias.abs().max().item() &lt;= bound)</code></pre>
+</div>
+
+<div class="code" data-lang="text">
+<pre><code>torch.Size([64, 16]) torch.Size([64])
+torch.Size([5, 64])
+True
+True
+0.25 True True</code></pre>
+</div>
+
+<p><code>F.linear(x, W, b)</code> is the stateless function underneath; <code>FastMicroGPT</code> calls it directly with its own <code>nn.Parameter</code> matrices (<code>F.linear(normalized_inputs, self.query_weights)</code>). The default initialisation is uniform in <code>[-1/&radic;in, 1/&radic;in]</code> for both weight and bias (implemented as <code>kaiming_uniform_(a=&radic;5)</code> in <code>reset_parameters()</code>). With <code>in = 16</code> the bound is 0.25. Transformers usually disable the bias (<code>bias=False</code>), as microgpt does.</p>
+
+<h4>nn.Embedding</h4>
+
+<p><code>nn.Embedding(num_embeddings, embedding_dim)</code> is a lookup table: one <code>Parameter</code> of shape <code>[num, dim]</code>, and the forward pass is row indexing. Nothing more.</p>
+
+<div class="code" data-lang="python">
+<pre><code>torch.manual_seed(0)
+emb = nn.Embedding(27, 16)              # 27 tokens, 16 numbers each
+print(emb.weight.shape, type(emb.weight).__name__)
+
+ids = torch.tensor([26, 0, 13])         # BOS, 'a', 'n'
+out = emb(ids)
+print(out.shape, torch.equal(out, emb.weight[ids]))
+print(round(emb.weight.std().item(), 3))</code></pre>
+</div>
+
+<div class="code" data-lang="text">
+<pre><code>torch.Size([27, 16]) Parameter
+torch.Size([3, 16]) True
+0.994</code></pre>
+</div>
+
+<p>So <code>FastMicroGPT</code>'s <code>self.token_embedding_table[token_ids]</code> is exactly <code>nn.Embedding</code>'s forward. The gradient of a lookup only touches the rows that were used. Default init is a standard normal (std 1), much larger than microgpt's 0.08.</p>
+
+<h4>Custom initialisation with <code>apply</code></h4>
+
+<p><code>torch.nn.init</code> has in-place initialisers (<code>normal_</code>, <code>zeros_</code>, <code>uniform_</code>, <code>xavier_uniform_</code>, ...). They run under <code>no_grad</code> internally, so they are safe on parameters. <code>model.apply(fn)</code> calls <code>fn</code> on every submodule (children first, then the module itself), which is the usual way to re-initialise a whole model:</p>
+
+<div class="code" data-lang="python">
+<pre><code>def init_like_microgpt(module):
+    if isinstance(module, (nn.Linear, nn.Embedding)):
+        nn.init.normal_(module.weight, mean=0.0, std=0.08)
+    if isinstance(module, nn.Linear) and module.bias is not None:
+        nn.init.zeros_(module.bias)
+
+torch.manual_seed(0)
+net = nn.Sequential(nn.Embedding(27, 16), nn.Linear(16, 64), nn.ReLU(), nn.Linear(64, 16))
+net.apply(init_like_microgpt)
+
+for name, p in net.named_parameters():
+    print(f"{name:9s} std={p.std().item():.4f} max|p|={p.abs().max().item():.4f}")</code></pre>
+</div>
+
+<div class="code" data-lang="text">
+<pre><code>0.weight  std=0.0782 max|p|=0.3275
+1.weight  std=0.0772 max|p|=0.2707
+1.bias    std=0.0000 max|p|=0.0000
+3.weight  std=0.0785 max|p|=0.2992
+3.bias    std=0.0000 max|p|=0.0000</code></pre>
+</div>
+
+<div class="hands-on">
+<div class="hands-on-hdr">Hands-on · do this now</div>
+<div class="hands-on-body">
+<p>1. Save <code>count_params.py</code> and run it. You should see <code>total: 4192</code>.</p>
+<p>2. Change one line to <code>self.query_weights = torch.randn(16, 16) * 0.08</code> (no <code>nn.Parameter</code>). Run again and predict the new total before you look. (It should be <code>3936</code>: 4192 &minus; 256.)</p>
+<p>3. Add <code>print(model)</code>. A module with only raw parameters prints as <code>MicroGPTParams()</code>, with no detail. Now build the <code>Sequential</code> above and print it: submodules print as a tree. This is one practical reason to prefer <code>nn.Linear</code> and <code>nn.Embedding</code> over raw matrices.</p>
+<p>4. Check the lookup claim yourself: <code>emb(ids)</code> versus <code>emb.weight[ids]</code>, then try <code>F.embedding(ids, emb.weight)</code>.</p>
+</div>
+</div>
+
+<h2 id="state-dict">state_dict and load_state_dict</h2>
+
+<p><code>model.state_dict()</code> returns an ordered dictionary from dotted name to tensor, for every parameter and persistent buffer. It is what you save. <code>model.load_state_dict(sd)</code> copies those values into an existing model with the same structure.</p>
+
+<div class="code" data-lang="python">
+<pre><code>class Tiny(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.embed = nn.Embedding(27, 16)
+        self.head = nn.Linear(16, 27, bias=False)
+        self.register_buffer("causal_mask", torch.ones(4, 4, dtype=torch.bool), persistent=False)
+
+torch.manual_seed(0)
+a = Tiny()
+sd = a.state_dict()
+for k, v in sd.items():
+    print(k, tuple(v.shape), v.requires_grad)
+
+b = Tiny()                                  # different random weights
+print(torch.equal(a.head.weight, b.head.weight))
+result = b.load_state_dict(sd)              # copies values in place
+print(result)
+print(torch.equal(a.head.weight, b.head.weight))
+print(sd["head.weight"].data_ptr() == a.head.weight.data_ptr())</code></pre>
+</div>
+
+<div class="code" data-lang="text">
+<pre><code>embed.weight (27, 16) False
+head.weight (27, 16) False
+False
+&lt;All keys matched successfully&gt;
+True
+True</code></pre>
+</div>
+
+<p>The values in a <code>state_dict</code> are detached (<code>requires_grad=False</code>) but <strong>share memory</strong> with the live parameters (the last line). Saving to disk is fine, but if you keep a <code>state_dict</code> in memory as a "best model" snapshot, training will keep changing it. Use <code>copy.deepcopy(model.state_dict())</code> for a real snapshot.</p>
+
+<h4>strict loading, missing and unexpected keys</h4>
+
+<p>By default <code>load_state_dict</code> is <code>strict=True</code>: the key sets must match exactly. Rename an attribute and old checkpoints stop loading:</p>
+
+<div class="code" data-lang="python">
+<pre><code>class Old(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.query_weights = nn.Parameter(torch.zeros(16, 16))
+        self.lm_head = nn.Linear(16, 27, bias=False)
+
+class New(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.q = nn.Linear(16, 16, bias=False)
+        self.lm_head = nn.Linear(16, 27, bias=False)
+
+sd = Old().state_dict()
+new = New()
+new.load_state_dict(sd)</code></pre>
+</div>
+
+<div class="code" data-lang="text">
+<pre><code>RuntimeError: Error(s) in loading state_dict for New:
+	Missing key(s) in state_dict: "q.weight".
+	Unexpected key(s) in state_dict: "query_weights". </code></pre>
+</div>
+
+<p><strong>Missing</strong> keys are in the model but not the file; <strong>unexpected</strong> keys are in the file but not the model. <code>load_state_dict(sd, strict=False)</code> loads whatever matches and returns the lists instead of raising: <code>_IncompatibleKeys(missing_keys=['q.weight'], unexpected_keys=['query_weights'])</code>. Always print and check that result; a silent <code>strict=False</code> is how a model ends up running with half its weights at random init. Shapes are checked even with <code>strict=False</code>: a mismatch raises <code>size mismatch for weight: copying a param with shape torch.Size([27, 16]) from checkpoint, the shape in current model is torch.Size([28, 16])</code>.</p>
+
+<h4>What microgpt_checkpoint.pt contains</h4>
+
+<p>At the end of training, <code>microgpt.py</code> saves one dictionary with <code>torch.save</code> (which pickles it):</p>
+
+<div class="code" data-lang="python">
+<div class="code-hdr"><span class="lang">python</span><span class="title">microgpt.py (excerpt)</span></div>
+<pre><code>torch.save(
+    {
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "training_steps": number_of_training_steps,
+        "character_to_id": character_to_id,
+        "id_to_character": id_to_character,
+        "config": {
+            "vocabulary_size": vocabulary_size,
+            "embedding_size": fast_embedding_size,
+            "block_size": fast_block_size,
+            "number_of_attention_heads": fast_number_of_heads,
+        },
+    },
+    checkpoint_path,
+)</code></pre>
+</div>
+
+<p>Save the same structure from <code>MicroGPTParams</code>, with the causal-mask buffer added and one Adam step taken so the optimizer has state:</p>
+
+<div class="code" data-lang="python">
+<pre><code>torch.manual_seed(0)
+model = MicroGPTParams()
+model.register_buffer("causal_mask",
+                      torch.triu(torch.ones(16, 16, dtype=torch.bool), diagonal=1),
+                      persistent=False)
+optimizer = torch.optim.Adam(model.parameters(), lr=0.01, betas=(0.85, 0.99), eps=1e-8)
+sum((p ** 2).sum() for p in model.parameters()).backward()     # a fake loss
+optimizer.step()
+
+character_to_id = {c: i for i, c in enumerate("abcdefghijklmnopqrstuvwxyz")}
+torch.save(
+    {
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "training_steps": 1,
+        "character_to_id": character_to_id,
+        "id_to_character": {i: c for c, i in character_to_id.items()},
+        "config": {"vocabulary_size": 27, "embedding_size": 16,
+                   "block_size": 16, "number_of_attention_heads": 4},
+    },
+    "checkpoint_demo.pt",
+)</code></pre>
+</div>
+
+<p>Then load it back and look inside:</p>
+
+<div class="code" data-lang="python">
+<pre><code>ckpt = torch.load("checkpoint_demo.pt", map_location="cpu")   # weights_only=True by default
+print(list(ckpt.keys()))
+print(list(ckpt["model_state_dict"].keys())[:3], "...", len(ckpt["model_state_dict"]))
+opt_sd = ckpt["optimizer_state_dict"]
+print(list(opt_sd.keys()), list(opt_sd["state"][0].keys()))
+print(opt_sd["param_groups"][0]["betas"], opt_sd["param_groups"][0]["params"][:3])
+
+fresh = MicroGPTParams()
+print(fresh.load_state_dict(ckpt["model_state_dict"]))</code></pre>
+</div>
+
+<div class="code" data-lang="text">
+<pre><code>['model_state_dict', 'optimizer_state_dict', 'training_steps', 'character_to_id', 'id_to_character', 'config']
+['token_embedding_table', 'position_embedding_table', 'query_weights'] ... 9
+['state', 'param_groups'] ['step', 'exp_avg', 'exp_avg_sq']
+(0.85, 0.99) [0, 1, 2]
+&lt;All keys matched successfully&gt;</code></pre>
+</div>
+
+<ul>
+  <li><code>model_state_dict</code> has 9 entries: the nine matrices. No <code>causal_mask</code>, because it is <code>persistent=False</code>.</li>
+  <li><code>optimizer_state_dict</code> has Adam's per-parameter state: <code>exp_avg</code> and <code>exp_avg_sq</code> are your <code>adam_first_moments</code> and <code>adam_second_moments</code>, and <code>step</code> is your <code>step_number</code>. Parameters are referred to by index (0, 1, 2, ...) in <code>parameters()</code> order, not by name, so the order must be the same when you reload.</li>
+  <li>The vocabulary and config ride along so <code>MODE=generate</code> can rebuild everything from the file alone.</li>
+</ul>
+
+<div class="callout pitfall">
+<div class="callout-title"><code>torch.load</code> and <code>weights_only</code></div>
+<p>Since PyTorch 2.6, <code>torch.load</code> defaults to <code>weights_only=True</code>: it only unpickles tensors and plain containers (dicts, lists, tuples, strings, numbers), because unpickling arbitrary objects can run arbitrary code. microgpt passes <code>weights_only=False</code>, but its checkpoint only contains allowed types and loads fine with the safe default. Only pass <code>False</code> for files you trust.</p>
+</div>
+
+<h2 id="train-eval">train() and eval()</h2>
+
+<p>Every module has a boolean <code>training</code> attribute. <code>model.train()</code> sets it to <code>True</code> on the module and every submodule; <code>model.eval()</code> sets it to <code>False</code>. A few layers read that flag and behave differently:</p>
+
+<ul>
+  <li><strong>Dropout</strong> zeroes a random fraction <code>p</code> of values in training (and scales the rest by <code>1/(1-p)</code> so the expected value is unchanged). In eval it does nothing.</li>
+  <li><strong>BatchNorm</strong> normalises with the current batch's statistics and updates its running-average buffers in training. In eval it uses the stored running averages and leaves them alone.</li>
+</ul>
+
+<div class="code" data-lang="python">
+<pre><code>torch.manual_seed(0)
+net = nn.Sequential(nn.Linear(4, 4), nn.Dropout(p=0.5))
+x = torch.ones(1, 4)
+
+print(net.training, net[1].training)        # modules start in training mode
+print(net(x))
+print(net(x))                               # different: dropout is random
+
+net.eval()                                  # sets .training = False on every submodule
+print(net.training, net[1].training)
+print(net(x))
+print(net(x))                               # identical: dropout is a no-op now
+
+y = net(x)
+print(y.requires_grad, y.grad_fn is not None)   # eval() did NOT turn off autograd</code></pre>
+</div>
+
+<div class="code" data-lang="text">
+<pre><code>True True
+tensor([[-0.6347,  1.2561, -1.0009, -0.0000]], grad_fn=&lt;MulBackward0&gt;)
+tensor([[-0.6347,  1.2561, -1.0009, -2.4283]], grad_fn=&lt;MulBackward0&gt;)
+False False
+tensor([[-0.3173,  0.6281, -0.5004, -1.2141]], grad_fn=&lt;AddmmBackward0&gt;)
+tensor([[-0.3173,  0.6281, -0.5004, -1.2141]], grad_fn=&lt;AddmmBackward0&gt;)
+True True</code></pre>
+</div>
+
+<p>The training-mode values are the eval values times 2 (that's the <code>1/(1-p)</code>), with random entries zeroed. The last line is the point most people get wrong: <strong><code>eval()</code> does not turn off gradients</strong>. It changes layer behaviour; autograd still records everything. For inference you need both, which is exactly what <code>microgpt.py</code> does: <code>evaluate_model</code> is decorated with <code>@torch.inference_mode()</code> and starts with <code>model.eval()</code>. The training loop calls <code>model.train()</code> before it starts.</p>
+
+<p>microgpt has no dropout or BatchNorm, so its outputs don't change between modes. The calls are still correct habit: the day you add a dropout layer, the code is already right.</p>
+
+<h2 id="exercises">Exercises</h2>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 5.1</span>
+  <span class="exercise-diff easy">easy</span>
+  <span class="exercise-title">Count parameters in your head</span>
+</div>
+<div class="exercise-body">
+<p>Predict <code>sum(p.numel() for p in m.parameters())</code> for each, then check: <code>nn.Linear(16, 64)</code>, <code>nn.Linear(16, 64, bias=False)</code>, <code>nn.Embedding(27, 16)</code>, <code>nn.RMSNorm(16)</code>, <code>nn.RMSNorm(16, elementwise_affine=False)</code>, <code>nn.LayerNorm(16)</code>.</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<div class="code" data-lang="python">
+<pre><code>from torch import nn
+
+def count(m):
+    return sum(p.numel() for p in m.parameters())
+
+print(count(nn.Linear(16, 64)))                            # 1088 = 64*16 + 64
+print(count(nn.Linear(16, 64, bias=False)))                # 1024
+print(count(nn.Embedding(27, 16)))                         # 432
+print(count(nn.RMSNorm(16)))                               # 16: one gain per feature
+print(count(nn.RMSNorm(16, elementwise_affine=False)))     # 0
+print(count(nn.LayerNorm(16)))                             # 32: gain + bias</code></pre>
+</div>
+<p>microgpt's <code>rms_norm</code> has no learnable gain, so it matches <code>elementwise_affine=False</code>. That is one reason its total is exactly 4,192.</p>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 5.2</span>
+  <span class="exercise-diff easy">easy</span>
+  <span class="exercise-title">Parameter, buffer, or neither?</span>
+</div>
+<div class="exercise-body">
+<p>Classify each, and say whether a buffer should be persistent: (a) the causal mask; (b) the position embedding table; (c) BatchNorm's running mean; (d) a precomputed RoPE cos/sin table; (e) a KV cache filled during generation; (f) RMSNorm's gain.</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<ul>
+  <li>(a) Buffer, <code>persistent=False</code>: fixed, derivable from <code>block_size</code>, must move with the model.</li>
+  <li>(b) Parameter: it is learned. (In microgpt it is <code>position_embedding_table</code>.)</li>
+  <li>(c) Buffer, persistent: not trained by gradients, but it is learned state you need at eval time. <code>nn.BatchNorm1d(2)</code> has parameters <code>['weight', 'bias']</code> and buffers <code>['running_mean', 'running_var', 'num_batches_tracked']</code>.</li>
+  <li>(d) Buffer, <code>persistent=False</code>: a pure function of the config, like the mask.</li>
+  <li>(e) Usually neither: per-request state that belongs to the generation loop, not the model. Some implementations do register it as a non-persistent buffer so it follows <code>.to()</code>; it must never be in a checkpoint.</li>
+  <li>(f) Parameter (when <code>elementwise_affine=True</code>).</li>
+</ul>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 5.3</span>
+  <span class="exercise-diff medium">medium</span>
+  <span class="exercise-title">Find and fix the plain-list bug</span>
+</div>
+<div class="exercise-body">
+<p>A colleague's model trains but the loss plateaus early. Its <code>__init__</code> contains <code>self.blocks = [Block() for _ in range(4)]</code> next to a properly registered embedding and head. List three symptoms you could check for in one minute, then fix it. Bonus: show what <code>.to(device)</code> does to the listed layers.</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<p>Symptoms: (1) the parameter count is far lower than expected; (2) <code>state_dict()</code> has no <code>blocks.*</code> keys; (3) after <code>optimizer.step()</code>, the block weights are unchanged (or their <code>.grad</code> is non-<code>None</code> but they still never move, since the optimizer doesn't hold them). The forward pass works, which is why it went unnoticed. Fix: <code>self.blocks = nn.ModuleList([Block() for _ in range(4)])</code>.</p>
+<div class="code" data-lang="python">
+<pre><code>class Broken(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.layers = [nn.Linear(16, 16) for _ in range(3)]
+
+device = "mps" if torch.backends.mps.is_available() else "cpu"
+m = Broken().to(device)
+print(m.layers[0].weight.device)          # cpu: .to() never saw it</code></pre>
+</div>
+<p>If the registered embedding feeds those layers, the first forward pass on the accelerator fails with a device-mismatch error, which is more helpful than a silent plateau. On this Mac it read <code>RuntimeError: Tensor for argument weight is on cpu but expected on mps</code>; on a CUDA GPU the message starts with <code>Expected all tensors to be on the same device</code>.</p>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 5.4</span>
+  <span class="exercise-diff medium">medium</span>
+  <span class="exercise-title">Load a checkpoint after renaming</span>
+</div>
+<div class="exercise-body">
+<p>You refactored a flat model (keys <code>query_weights</code>, <code>key_weights</code>, like FastMicroGPT) into one with an <code>attn</code> submodule holding <code>q</code> and <code>k</code> as <code>nn.Linear(16, 16, bias=False)</code>. Load the old weights into the new model with <code>strict=True</code> and prove the values arrived.</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<p>Because microgpt stores weights as <code>[out][in]</code>, the same layout as <code>nn.Linear.weight</code>, only the names change. No transpose needed.</p>
+<div class="code" data-lang="python">
+<pre><code>class Attention(nn.Module):
+    def __init__(self, C=16):
+        super().__init__()
+        self.q = nn.Linear(C, C, bias=False)
+        self.k = nn.Linear(C, C, bias=False)
+
+class Model(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.attn = Attention()
+
+torch.manual_seed(0)
+old_sd = {"query_weights": torch.randn(16, 16), "key_weights": torch.randn(16, 16)}
+
+rename = {"query_weights": "attn.q.weight", "key_weights": "attn.k.weight"}
+new_sd = {rename.get(k, k): v for k, v in old_sd.items()}
+
+model = Model()
+print(model.load_state_dict(new_sd))                               # &lt;All keys matched successfully&gt;
+print(torch.equal(model.attn.q.weight, old_sd["query_weights"]))   # True</code></pre>
+</div>
+<p>Keep <code>strict=True</code> and remap the keys. It guarantees every weight landed somewhere. This is exactly what Hugging Face conversion scripts do when they port a checkpoint between codebases.</p>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 5.5</span>
+  <span class="exercise-diff medium">medium</span>
+  <span class="exercise-title">Freeze the embeddings</span>
+</div>
+<div class="exercise-body">
+<p>Build a model with token embedding <code>(27, 16)</code>, position embedding <code>(16, 16)</code>, an MLP <code>16 → 64 → 16</code> without biases and a head <code>16 → 27</code> without bias. Freeze both embeddings. Print the total and trainable parameter counts, and build an Adam optimizer that only receives trainable parameters.</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<div class="code" data-lang="python">
+<pre><code>class Tiny(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.tok = nn.Embedding(27, 16)
+        self.pos = nn.Embedding(16, 16)
+        self.mlp = nn.Sequential(nn.Linear(16, 64, bias=False), nn.ReLU(), nn.Linear(64, 16, bias=False))
+        self.head = nn.Linear(16, 27, bias=False)
+
+model = Tiny()
+for p in list(model.tok.parameters()) + list(model.pos.parameters()):
+    p.requires_grad_(False)
+
+total = sum(p.numel() for p in model.parameters())
+trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+print(total, trainable)                                   # 3168 2480
+
+opt = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=0.01)
+print(sum(p.numel() for g in opt.param_groups for p in g["params"]))   # 2480</code></pre>
+</div>
+<p>Frozen parameters still appear in <code>parameters()</code> and <code>state_dict()</code>; only <code>requires_grad</code> changed. Passing them to the optimizer anyway is harmless here (their <code>.grad</code> stays <code>None</code>, so Adam skips them), but filtering makes the intent explicit and avoids allocating optimizer state for them.</p>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 5.6</span>
+  <span class="exercise-diff hard">hard</span>
+  <span class="exercise-title">Write your own module registry</span>
+</div>
+<div class="exercise-body">
+<p>Without inheriting from <code>nn.Module</code>, write a <code>TinyModule</code> base class whose <code>__setattr__</code> registers <code>nn.Parameter</code>s and child <code>TinyModule</code>s, with <code>named_parameters()</code> producing dotted names recursively and <code>__call__</code> calling <code>forward</code>. Build <code>TinyLinear</code> and a <code>TinyMLP</code> (16 → 64 → 16) on it and check that a plain tensor attribute is not registered.</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<div class="code" data-lang="python">
+<pre><code>import torch
+from torch import nn
+
+class TinyModule:
+    def __init__(self):
+        object.__setattr__(self, "_params", {})
+        object.__setattr__(self, "_modules", {})
+
+    def __setattr__(self, name, value):
+        if isinstance(value, nn.Parameter):
+            self._params[name] = value
+        elif isinstance(value, TinyModule):
+            self._modules[name] = value
+        object.__setattr__(self, name, value)
+
+    def named_parameters(self, prefix=""):
+        for name, p in self._params.items():
+            yield prefix + name, p
+        for name, child in self._modules.items():
+            yield from child.named_parameters(prefix + name + ".")
+
+    def parameters(self):
+        for _, p in self.named_parameters():
+            yield p
+
+    def __call__(self, *args):
+        return self.forward(*args)
+
+class TinyLinear(TinyModule):
+    def __init__(self, n_in, n_out):
+        super().__init__()
+        self.weight = nn.Parameter(torch.randn(n_out, n_in) * 0.08)
+
+    def forward(self, x):
+        return x @ self.weight.T
+
+class TinyMLP(TinyModule):
+    def __init__(self, C):
+        super().__init__()
+        self.expand = TinyLinear(C, 4 * C)
+        self.contract = TinyLinear(4 * C, C)
+        self.scratch = torch.zeros(C)          # plain tensor: not registered
+
+    def forward(self, x):
+        return self.contract(torch.relu(self.expand(x)))
+
+torch.manual_seed(0)
+mlp = TinyMLP(16)
+print([(n, tuple(p.shape)) for n, p in mlp.named_parameters()])
+print(sum(p.numel() for p in mlp.parameters()))
+print(mlp(torch.randn(3, 16)).shape)</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>[('expand.weight', (64, 16)), ('contract.weight', (16, 64))]
+2048
+torch.Size([3, 16])</code></pre>
+</div>
+<p><code>object.__setattr__</code> in <code>__init__</code> avoids recursion: our own <code>__setattr__</code> needs <code>_params</code> to exist already. The real <code>nn.Module</code> does the same thing, plus buffers, hooks, <code>state_dict</code>, <code>.to()</code> (a recursive <code>_apply</code> over parameters and buffers) and <code>train()</code>/<code>eval()</code> (a recursive walk setting <code>training</code>).</p>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 5.7</span>
+  <span class="exercise-diff hard">hard</span>
+  <span class="exercise-title">Resume training exactly</span>
+</div>
+<div class="exercise-body">
+<p>Prove that a checkpoint with both <code>model_state_dict</code> and <code>optimizer_state_dict</code> (microgpt's layout) resumes training bit-for-bit: run 3 Adam steps, save, run a 4th step; then load the checkpoint into fresh objects and run the same 4th step. Compare the parameters. Then repeat the resume without loading the optimizer state and measure the difference.</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<div class="code" data-lang="python">
+<pre><code>import torch
+from torch import nn
+
+def make_model():
+    return nn.Sequential(nn.Linear(16, 64), nn.ReLU(), nn.Linear(64, 16))
+
+def make_optimizer(model):
+    return torch.optim.Adam(model.parameters(), lr=0.01, betas=(0.85, 0.99), eps=1e-8)
+
+def train_step(model, optimizer, x):
+    loss = model(x).pow(2).mean()
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+
+torch.manual_seed(0)
+data = [torch.randn(8, 16) for _ in range(4)]
+
+# Run A: 3 steps, checkpoint, 1 more step
+model = make_model()
+optimizer = make_optimizer(model)
+for x in data[:3]:
+    train_step(model, optimizer, x)
+torch.save({"model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "training_steps": 3}, "resume.pt")
+train_step(model, optimizer, data[3])
+
+# Run B: fresh objects, load the checkpoint, the same 1 step
+model_b = make_model()
+optimizer_b = make_optimizer(model_b)
+ckpt = torch.load("resume.pt")
+model_b.load_state_dict(ckpt["model_state_dict"])
+optimizer_b.load_state_dict(ckpt["optimizer_state_dict"])
+train_step(model_b, optimizer_b, data[3])
+
+same = all(torch.equal(p, q) for p, q in zip(model.parameters(), model_b.parameters()))
+print("resumed run identical:", same)
+
+# Run C: forget the optimizer state
+model_c = make_model()
+optimizer_c = make_optimizer(model_c)
+model_c.load_state_dict(ckpt["model_state_dict"])
+train_step(model_c, optimizer_c, data[3])
+diff = max((p - q).abs().max().item() for p, q in zip(model.parameters(), model_c.parameters()))
+print(f"without optimizer state, max difference: {diff:.4f}")</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>resumed run identical: True
+without optimizer state, max difference: 0.0175</code></pre>
+</div>
+<p>Without the optimizer state, Adam restarts with zero moments and <code>step = 1</code>, so bias correction makes the first update roughly <code>lr</code> in size for every parameter: a visible jolt. Two more things must be restored for a truly identical long run: the learning-rate schedule position (microgpt recomputes it from <code>training_iteration</code>) and the random number generator state (<code>torch.get_rng_state()</code>), covered in Chapter 8.</p>
+</div>
+</details>
+</div>
+</div>
+
+<h2 id="recap">Recap</h2>
+<ul>
+  <li><code>nn.Module</code> is a registry. Assigning an <code>nn.Parameter</code> or a submodule as an attribute registers it; plain tensors and plain lists are invisible.</li>
+  <li>Write <code>__init__</code> (state) and <code>forward</code> (computation); call <code>model(x)</code> so hooks run.</li>
+  <li><code>sum(p.numel() for p in model.parameters())</code> counts parameters; microgpt's nine matrices give 4,192.</li>
+  <li>Buffers (<code>register_buffer</code>) move with <code>.to()</code> and are saved unless <code>persistent=False</code>, but are never trained. The causal mask is the textbook non-persistent buffer.</li>
+  <li><code>nn.Sequential</code> chains, <code>nn.ModuleList</code> and <code>nn.ModuleDict</code> register collections. Never store modules in a Python list or dict.</li>
+  <li><code>nn.Linear</code>: weight <code>[out, in]</code>, <code>y = x @ W.T + b</code>, init uniform &plusmn;1/&radic;in. <code>nn.Embedding</code>: <code>weight[ids]</code>. Re-initialise with <code>torch.nn.init</code> + <code>model.apply</code>.</li>
+  <li><code>state_dict</code> maps names to tensors (sharing memory); <code>load_state_dict</code> is strict by default and reports missing and unexpected keys. Save the optimizer state too if you want to resume.</li>
+  <li><code>train()</code>/<code>eval()</code> flip the <code>training</code> flag that dropout and BatchNorm read. They do not touch autograd: pair <code>eval()</code> with <code>inference_mode()</code>.</li>
+</ul>
+
+<div class="page-nav">
+  <a href="04-autograd.html"><span class="lbl">← Prev</span><span class="ttl">Autograd</span></a>
+  <a href="06-transformer-blocks.html" class="next"><span class="lbl">Next →</span><span class="ttl">Building a Transformer</span></a>
+</div>
+
+</main>
+</div>
+<script src="../assets/site.js"></script>
+</body>
+</html>

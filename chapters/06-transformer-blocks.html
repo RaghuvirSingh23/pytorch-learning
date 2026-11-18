@@ -1,0 +1,964 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>6 · Building a Transformer — PyTorch</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<button class="sidebar-toggle" aria-label="Toggle navigation">☰ Menu</button>
+<div class="layout">
+<aside class="sidebar">
+  <a href="../index.html" class="brand">PyTorch</a>
+  <span class="brand-sub">a deep dive — 2026</span>
+  <nav>
+    <ol>
+      <li><a href="01-why-pytorch.html">Why PyTorch</a></li>
+      <li><a href="02-tensors.html">Tensors</a></li>
+      <li><a href="03-tensor-math.html">Tensor Math &amp; Broadcasting</a></li>
+      <li><a href="04-autograd.html">Autograd</a></li>
+      <li><a href="05-nn-module.html">nn.Module</a></li>
+      <li><a href="06-transformer-blocks.html">Building a Transformer</a></li>
+      <li><a href="07-losses-optimizers.html">Losses &amp; Optimizers</a></li>
+      <li><a href="08-training-loop.html">The Training Loop</a></li>
+      <li><a href="09-devices-precision.html">Devices &amp; Precision</a></li>
+      <li><a href="10-inference.html">Inference &amp; Sampling</a></li>
+      <li><a href="11-performance.html">Performance &amp; Profiling</a></li>
+      <li><a href="12-debugging.html">Debugging PyTorch</a></li>
+      <li><a href="13-50-questions.html">The 50 Questions</a></li>
+      <li><a href="14-capstone.html">Capstone Project</a></li>
+    </ol>
+    <div class="extras">
+      <a href="../exercises.html">All Exercises</a>
+      <a href="../index.html">← Home</a>
+    </div>
+  </nav>
+  <div class="progress"></div>
+</aside>
+
+<main class="content">
+
+<h1>
+  <span class="chap-num">Chapter 06</span>
+  Building a Transformer
+</h1>
+<p class="lede">
+  <code>FastMicroGPT.forward</code> runs one name at a time: a <code>(T, C)</code>
+  grid of activations. Real models run a batch of sequences, <code>(B, T, C)</code>,
+  so one kernel launch does B times the work. This chapter rebuilds microgpt as
+  PyTorch modules that take batches, checking every piece against a reference as
+  it goes, then assembles a <code>GPT</code> with microgpt's exact
+  hyperparameters and 4,192 parameters.
+</p>
+
+<h2 id="from-microgpt">From one sequence to a batch</h2>
+
+<p>Here is the core of <code>FastMicroGPT.forward</code> from <code>microgpt.py</code>, with shapes added. <code>T</code> is the sequence length, <code>C = 16</code> the embedding size, <code>H = 4</code> heads of <code>D = 4</code> dimensions each.</p>
+
+<div class="code" data-lang="python">
+<div class="code-hdr"><span class="lang">python</span><span class="title">microgpt.py (excerpt, shapes added)</span></div>
+<pre><code>def forward(self, token_ids):                                   # (T,)
+    sequence_length = token_ids.shape[0]
+    inputs = (self.token_embedding_table[token_ids]
+              + self.position_embedding_table[:sequence_length])  # (T, C)
+    normalized_inputs = F.rms_norm(inputs, (fast_embedding_size,), eps=1e-5)
+    query = F.linear(normalized_inputs, self.query_weights)       # (T, C)
+    ...
+    query = query.view(sequence_length, fast_number_of_heads,
+                       fast_head_size).transpose(0, 1)            # (H, T, D)
+    ...
+    attention_logits = query @ key.transpose(-2, -1)              # (H, T, T)
+    attention_logits = attention_logits / fast_head_size**0.5
+    attention_logits = attention_logits.masked_fill(
+        self.causal_mask[:sequence_length, :sequence_length], float("-inf"))
+    attention_weights = F.softmax(attention_logits, dim=-1)
+    concatenated_heads = attention_weights @ value                # (H, T, D)
+    concatenated_heads = concatenated_heads.transpose(0, 1).reshape(
+        sequence_length, fast_embedding_size)                     # (T, C)
+    ...</code></pre>
+</div>
+
+<p>Adding a leading batch dimension <code>B</code> changes surprisingly little, because most operations only touch the <strong>last</strong> dimension and treat everything in front of it as "a pile of vectors":</p>
+
+<ul>
+  <li><code>F.linear</code> / <code>nn.Linear</code>, RMSNorm and <code>softmax(dim=-1)</code> work on any number of leading dimensions. <code>(T, C)</code> or <code>(B, T, C)</code>, same code.</li>
+  <li><code>@</code> on tensors with more than two dimensions is a <strong>batched matmul</strong>: the last two dims are multiplied, the leading ones are batch dims.</li>
+  <li>Only the code that names dimensions by position must change: <code>view(T, H, D).transpose(0, 1)</code> becomes <code>view(B, T, H, D).transpose(1, 2)</code>.</li>
+</ul>
+
+<p>One idea is genuinely new compared with <code>microgpt_scalar.py</code>. Your <code>gpt_step</code> processed one token at a time and appended to a growing KV cache, so attention could never see the future: future keys didn't exist yet. Here all <code>T</code> positions are computed at once, and the <strong>causal mask</strong> is the only thing that stops position 2 from looking at position 3.</p>
+
+<table>
+  <tr><th><code>microgpt_scalar.py</code></th><th>Batched PyTorch</th><th>Module below</th></tr>
+  <tr><td><code>embed(token_id, position_id)</code></td><td><code>tok_emb(idx) + pos_emb(arange(T))</code></td><td><code>nn.Embedding</code> x2</td></tr>
+  <tr><td><code>rms_norm(inputs)</code></td><td><code>nn.RMSNorm(C, eps=1e-5, elementwise_affine=False)</code></td><td><code>Block.norm1</code>, <code>norm2</code></td></tr>
+  <tr><td><code>project_query_key_value</code></td><td>one <code>Linear(C, 3C)</code> + <code>split</code></td><td><code>attn.qkv</code></td></tr>
+  <tr><td><code>query[head_start:head_end]</code></td><td><code>view(B, T, H, D).transpose(1, 2)</code></td><td>inside <code>attn</code></td></tr>
+  <tr><td><code>attention_head</code> + growing cache</td><td>scores, causal mask, softmax, <code>@ v</code></td><td>inside <code>attn</code></td></tr>
+  <tr><td><code>multi_head_attention</code> concat + <code>linear</code></td><td><code>transpose(1, 2).contiguous().view(B, T, C)</code> + Linear</td><td><code>attn.proj</code></td></tr>
+  <tr><td><code>add_residual</code></td><td><code>x = x + ...</code></td><td><code>Block.forward</code></td></tr>
+  <tr><td><code>mlp</code></td><td>Linear, ReLU, Linear</td><td><code>MLP</code></td></tr>
+  <tr><td><code>predict_next_token</code></td><td>Linear to <code>vocab_size</code> (softmax moves into the loss)</td><td><code>lm_head</code></td></tr>
+</table>
+
+<h2 id="embeddings">Token and position embeddings</h2>
+
+<p>The input is a <code>(B, T)</code> tensor of token ids. Two names from microgpt's vocabulary (a&ndash;z are 0&ndash;25, BOS is 26):</p>
+
+<div class="code" data-lang="python">
+<pre><code>import torch
+from torch import nn
+
+torch.manual_seed(0)
+tok_emb = nn.Embedding(27, 16)
+pos_emb = nn.Embedding(16, 16)
+
+idx = torch.tensor([[26, 4, 12, 12, 0],      # BOS e m m a
+                    [26, 0, 21, 0, 26]])     # BOS a v a BOS
+B, T = idx.shape
+tok = tok_emb(idx)                           # (B, T, C)
+pos = pos_emb(torch.arange(T))               # (T, C)
+x = tok + pos                                # (T, C) broadcasts over B
+print(tok.shape, pos.shape, x.shape)
+print(torch.equal(x[1, 2], tok_emb.weight[21] + pos_emb.weight[2]))</code></pre>
+</div>
+
+<div class="code" data-lang="text">
+<pre><code>torch.Size([2, 5, 16]) torch.Size([5, 16]) torch.Size([2, 5, 16])
+True</code></pre>
+</div>
+
+<p>Broadcasting (Chapter 3) does the work: <code>pos</code> has no batch dimension, so the same position vectors are added to every sequence. Element <code>x[1, 2]</code> is exactly your <code>embed(21, 2)</code>: token 'v' at position 2.</p>
+
+<h2 id="rmsnorm">RMSNorm by hand vs nn.RMSNorm</h2>
+
+<p>Your <code>rms_norm</code> divides a vector by the square root of its mean square (plus a small <code>eps</code> so you never divide by zero). As a module, with the learnable per-feature <strong>gain</strong> most models add:</p>
+
+<div class="code" data-lang="python">
+<pre><code>from torch.testing import assert_close
+
+class RMSNorm(nn.Module):
+    def __init__(self, dim, eps=1e-5):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))   # learnable gain, starts at 1
+
+    def forward(self, x):
+        mean_square = x.pow(2).mean(dim=-1, keepdim=True)     # (B, T, 1)
+        return x * torch.rsqrt(mean_square + self.eps) * self.weight
+
+torch.manual_seed(0)
+x = torch.randn(2, 5, 16)
+mine = RMSNorm(16, eps=1e-5)
+theirs = nn.RMSNorm(16, eps=1e-5)
+assert_close(mine(x), theirs(x))
+print("match with eps=1e-5")
+
+default = nn.RMSNorm(16)                       # eps=None: uses torch.finfo(x.dtype).eps
+print(default.eps, torch.finfo(torch.float32).eps)
+print((mine(x) - default(x)).abs().max().item())
+
+y = mine(x)
+print(y.pow(2).mean(dim=-1)[0])                # each vector now has mean square ~1</code></pre>
+</div>
+
+<div class="code" data-lang="text">
+<pre><code>match with eps=1e-5
+None 1.1920928955078125e-07
+3.361701965332031e-05
+tensor([1.0000, 1.0000, 1.0000, 1.0000, 1.0000], grad_fn=&lt;SelectBackward0&gt;)</code></pre>
+</div>
+
+<ul>
+  <li><code>keepdim=True</code> keeps the reduced dimension as size 1, so <code>(B, T, 1)</code> broadcasts back against <code>(B, T, C)</code>. Without it you'd get <code>(B, T)</code> and a shape error (or worse, a wrong broadcast).</li>
+  <li><code>torch.rsqrt</code> is <code>1 / sqrt</code> in one op; your <code>(mean_square + 1e-5) ** -0.5</code>.</li>
+  <li><code>nn.RMSNorm</code> (added in PyTorch 2.4) defaults to <code>eps=None</code>, meaning machine epsilon for the dtype (about 1.2e-7 in float32), not microgpt's <code>1e-5</code>. The outputs then differ by about 3e-5: small, but enough to fail <code>assert_close</code> and to make "my port doesn't match the reference" bugs. Always pass <code>eps</code> explicitly.</li>
+  <li>microgpt's norm has no gain, so use <code>nn.RMSNorm(16, eps=1e-5, elementwise_affine=False)</code>: zero parameters, same as <code>F.rms_norm(x, (16,), eps=1e-5)</code>. Your scalar test case gives the same numbers: <code>nn.RMSNorm(2, eps=1e-5)(torch.tensor([[3.0, 4.0]]))</code> prints <code>tensor([[0.8485, 1.1314]], grad_fn=&lt;MulBackward0&gt;)</code>.</li>
+</ul>
+
+<h2 id="qkv">Q, K, V: three projections or one</h2>
+
+<p>Query, key and value are three <code>Linear(C, C)</code> layers applied to the same input. Three small matmuls are slower than one big one, so real implementations stack the three weight matrices into a single <code>Linear(C, 3C)</code> and split the output:</p>
+
+<div class="code" data-lang="python">
+<pre><code>torch.manual_seed(0)
+C = 16
+x = torch.randn(2, 5, C)                     # (B, T, C), already normalised
+
+q_proj = nn.Linear(C, C, bias=False)
+k_proj = nn.Linear(C, C, bias=False)
+v_proj = nn.Linear(C, C, bias=False)
+
+qkv_proj = nn.Linear(C, 3 * C, bias=False)   # one matmul instead of three
+with torch.no_grad():
+    qkv_proj.weight.copy_(torch.cat([q_proj.weight, k_proj.weight, v_proj.weight], dim=0))
+
+q, k, v = qkv_proj(x).split(C, dim=-1)       # three (B, T, C) views
+print(qkv_proj.weight.shape, q.shape)
+print(torch.allclose(q, q_proj(x)), torch.allclose(k, k_proj(x)), torch.allclose(v, v_proj(x)))</code></pre>
+</div>
+
+<div class="code" data-lang="text">
+<pre><code>torch.Size([48, 16]) torch.Size([2, 5, 16])
+True True True</code></pre>
+</div>
+
+<p>Since <code>weight</code> is <code>[out, in]</code>, stacking along <code>dim=0</code> stacks output rows: rows 0&ndash;15 produce q, 16&ndash;31 produce k, 32&ndash;47 produce v. <code>split(C, dim=-1)</code> cuts the 48 outputs back into three chunks of 16. They are views, so the split itself copies nothing. The parameter count is identical (3 &times; 256 = 768).</p>
+
+<h2 id="heads">Splitting heads</h2>
+
+<p>Your <code>attention_head</code> took head <code>i</code> as the slice <code>query[i*D : (i+1)*D]</code>. The tensor version reshapes the last dimension <code>C</code> into <code>(H, D)</code> and moves <code>H</code> in front of <code>T</code>, so heads become one more batch dimension:</p>
+
+<div class="code" data-lang="python">
+<pre><code>B, T, H, D = 2, 5, 4, 4
+C = H * D
+q = torch.arange(B * T * C, dtype=torch.float32).view(B, T, C)
+
+qh = q.view(B, T, H, D)          # split the last dim: C = H * D
+print(qh.shape)
+qh = qh.transpose(1, 2)          # (B, H, T, D): heads become a batch dim
+print(qh.shape, qh.is_contiguous(), qh.stride())
+
+print(q[0, 2, 4:8])              # token 2, dims 4..7 ...
+print(qh[0, 1, 2])               # ... is head 1's vector for token 2</code></pre>
+</div>
+
+<div class="code" data-lang="text">
+<pre><code>torch.Size([2, 5, 4, 4])
+torch.Size([2, 4, 5, 4]) False (80, 4, 16, 1)
+tensor([36., 37., 38., 39.])
+tensor([36., 37., 38., 39.])</code></pre>
+</div>
+
+<p>Neither step moves data. <code>view</code> reinterprets the same memory with a new shape; <code>transpose</code> swaps two strides (Chapter 2). The result is <strong>not contiguous</strong>: walking along T now jumps 16 elements. That's fine for matmul, and it matters again when we merge the heads back.</p>
+
+<h2 id="attention">Scores, causal mask, softmax, weighted sum</h2>
+
+<p>With <code>q</code>, <code>k</code>, <code>v</code> all <code>(B, H, T, D)</code>, attention is four lines:</p>
+
+<div class="code" data-lang="python">
+<pre><code>import math
+import torch.nn.functional as F
+
+torch.manual_seed(0)
+B, H, T, D = 2, 4, 5, 4
+q = torch.randn(B, H, T, D)
+k = torch.randn(B, H, T, D)
+v = torch.randn(B, H, T, D)
+
+scores = q @ k.transpose(-2, -1) / math.sqrt(D)     # (B, H, T, T)
+print(scores.shape)
+
+mask = torch.triu(torch.ones(T, T, dtype=torch.bool), diagonal=1)
+print(mask)
+scores = scores.masked_fill(mask, float("-inf"))   # (T, T) mask broadcasts over B, H
+print(scores[0, 0])
+
+weights = F.softmax(scores, dim=-1)                 # each row sums to 1
+print(weights[0, 0])
+print(weights.sum(dim=-1)[0, 0])
+
+out = weights @ v                                   # (B, H, T, D)
+print(out.shape)</code></pre>
+</div>
+
+<div class="code" data-lang="text">
+<pre><code>torch.Size([2, 4, 5, 5])
+tensor([[False,  True,  True,  True,  True],
+        [False, False,  True,  True,  True],
+        [False, False, False,  True,  True],
+        [False, False, False, False,  True],
+        [False, False, False, False, False]])
+tensor([[ 0.0121,    -inf,    -inf,    -inf,    -inf],
+        [ 0.1333, -0.5230,    -inf,    -inf,    -inf],
+        [ 0.8181,  0.7044, -0.0496,    -inf,    -inf],
+        [-0.3737,  0.0998,  0.0392, -0.3793,    -inf],
+        [ 0.2292,  0.2086, -0.2843,  0.6414, -0.2345]])
+tensor([[1.0000, 0.0000, 0.0000, 0.0000, 0.0000],
+        [0.6584, 0.3416, 0.0000, 0.0000, 0.0000],
+        [0.4325, 0.3860, 0.1816, 0.0000, 0.0000],
+        [0.1957, 0.3141, 0.2957, 0.1946, 0.0000],
+        [0.2120, 0.2077, 0.1269, 0.3201, 0.1333]])
+tensor([1., 1., 1., 1., 1.])
+torch.Size([2, 4, 5, 4])</code></pre>
+</div>
+
+<ol>
+  <li><strong>Scores.</strong> <code>k.transpose(-2, -1)</code> is <code>(B, H, D, T)</code>, so <code>q @ k^T</code> is <code>(B, H, T, T)</code>: row <code>i</code>, column <code>j</code> is the dot product of query <code>i</code> with key <code>j</code>. It is your <code>attention_logits</code> list, for every query at once. Dividing by <code>&radic;D</code> keeps the scores' scale independent of head size, same as your <code>/ head_size**0.5</code>.</li>
+  <li><strong>Mask.</strong> <code>torch.triu(..., diagonal=1)</code> is <code>True</code> strictly above the diagonal: column <code>j &gt; i</code>, the future. <code>masked_fill</code> writes <code>-inf</code> wherever the mask is <code>True</code>.</li>
+  <li><strong>Softmax over the last dim.</strong> Each row (one query) becomes a probability distribution over keys. <code>exp(-inf) = 0</code>, so future positions get exactly zero weight. Row 0 can only see itself, so its weight is 1.</li>
+  <li><strong>Weighted sum.</strong> <code>weights @ v</code>: each query's output is the weighted average of value vectors, your <code>head_output</code>.</li>
+</ol>
+
+<div class="callout pitfall">
+<div class="callout-title">Softmax over the wrong dim, mask with the wrong diagonal</div>
+<p><code>softmax(dim=-2)</code> runs and gives the right shape, but normalises over queries instead of keys: columns sum to 1, rows don't. <code>triu(diagonal=0)</code> also masks the diagonal, so token 0 has nothing to attend to, its row is all <code>-inf</code>, and softmax returns <code>nan</code>. Check <code>weights.sum(-1)</code> is all ones and <code>weights[0, 0, 0, 0] == 1</code> whenever you touch attention code.</p>
+</div>
+
+<h2 id="merge">Merging heads and the output projection</h2>
+
+<p>The per-head outputs <code>(B, H, T, D)</code> go back to <code>(B, T, C)</code>: move <code>H</code> back next to <code>D</code>, then fuse them. This is your <code>concatenated_head_outputs.extend(head_output)</code>.</p>
+
+<div class="code" data-lang="python">
+<pre><code>out = out.transpose(1, 2)               # (B, T, H, D), not contiguous
+out = out.contiguous().view(B, T, C)    # copy into row-major order, then fuse H*D = C
+out = proj(out)                         # nn.Linear(C, C, bias=False): attention_output_weights</code></pre>
+</div>
+
+<p><code>view</code> only works when the requested shape can be expressed with strides over the existing memory. After the transpose, the four D-vectors of one token are 20 elements apart, so they can't be fused into one dimension of 16 without moving data. <code>.contiguous()</code> makes a row-major copy first. <code>FastMicroGPT</code> uses <code>.reshape(...)</code>, which does the same thing: a view if possible, a copy if not. EX 6.3 shows the error you get if you forget.</p>
+
+<h2 id="sdpa">F.scaled_dot_product_attention</h2>
+
+<p>Scores, mask, softmax and weighted sum are so common that PyTorch has one function for them. Check it against the manual version before trusting it:</p>
+
+<div class="code" data-lang="python">
+<pre><code>from torch.testing import assert_close
+
+def manual_attention(q, k, v):
+    T, D = q.shape[-2], q.shape[-1]
+    scores = q @ k.transpose(-2, -1) / math.sqrt(D)
+    mask = torch.triu(torch.ones(T, T, dtype=torch.bool, device=q.device), diagonal=1)
+    scores = scores.masked_fill(mask, float("-inf"))
+    return F.softmax(scores, dim=-1) @ v
+
+torch.manual_seed(0)
+q, k, v = (torch.randn(2, 4, 5, 4) for _ in range(3))     # (B, H, T, D)
+
+ref = manual_attention(q, k, v)
+fast = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+assert_close(fast, ref)
+print(fast.shape, torch.allclose(fast, ref, atol=1e-6), (fast - ref).abs().max().item())</code></pre>
+</div>
+
+<div class="code" data-lang="text">
+<pre><code>torch.Size([2, 4, 5, 4]) True 2.384185791015625e-07</code></pre>
+</div>
+
+<p><code>torch.testing.assert_close</code> raises with a detailed report if the tensors differ beyond dtype-appropriate tolerances (for float32: <code>rtol=1.3e-6</code>, <code>atol=1e-5</code>); <code>torch.allclose</code> returns a bool. Prefer <code>assert_close</code> in tests. A difference of 2e-7 is float32 rounding from a different order of operations, not a bug.</p>
+
+<p>Why use it: on a CUDA GPU, SDPA can dispatch to fused kernels (FlashAttention-2, memory-efficient attention) that compute attention in tiles and never write the full <code>(B, H, T, T)</code> score matrix to GPU memory. At <code>T = 16</code> that doesn't matter; at <code>T = 32,768</code> the score matrix alone would be gigabytes. Which kernel runs depends on the GPU, dtype and arguments, and those fused backends need a CUDA GPU. The context manager <code>torch.nn.attention.sdpa_kernel(SDPBackend.MATH)</code> (or <code>FLASH_ATTENTION</code>, <code>EFFICIENT_ATTENTION</code>, <code>CUDNN_ATTENTION</code>) restricts which backends may be used, which is how you check a result against the plain math version on a GPU.</p>
+
+<div class="callout pitfall">
+<div class="callout-title"><code>is_causal=True</code> with a KV cache</div>
+<p><code>is_causal=True</code> builds the mask as if query <code>i</code> and key <code>i</code> are the same position (top-left aligned). During generation with a KV cache you have 1 new query and many cached keys; with <code>is_causal=True</code> that one query may only see key 0. On a test with 6 cached keys, the "causal" output equalled <code>v[0]</code> exactly. For a single decoding step, leave <code>is_causal</code> off: the new token may see every cached key. Chapter 10 builds this properly.</p>
+</div>
+
+<h2 id="mlp-residual">MLP, residuals, and the modern variants</h2>
+
+<p>The rest of the block is your <code>mlp</code> and <code>add_residual</code>. As modules:</p>
+
+<div class="code" data-lang="python">
+<pre><code>class MLP(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.up = nn.Linear(cfg.n_embd, cfg.mlp_hidden, bias=False)     # 16 -&gt; 64
+        self.down = nn.Linear(cfg.mlp_hidden, cfg.n_embd, bias=False)   # 64 -&gt; 16
+
+    def forward(self, x):
+        return self.down(F.relu(self.up(x)))
+
+# in Block.forward: pre-norm residual blocks, exactly microgpt's order
+x = x + self.attn(self.norm1(x))
+x = x + self.mlp(self.norm2(x))</code></pre>
+</div>
+
+<p>The <strong>residual</strong> add means each sub-layer only learns a correction to <code>x</code>, and gradient flows straight through the <code>+</code> to earlier layers (the local gradient of addition is 1, as in your <code>__add__</code>). "Pre-norm" means the norm is applied to the sub-layer's input, not to the sum.</p>
+
+<p>microgpt uses ReLU. GPT-2 used <strong>GELU</strong> (<code>F.gelu</code>), a smooth ReLU. Llama, Mistral and most current open models use <strong>SwiGLU</strong>: two up-projections, one passed through SiLU (<code>x * sigmoid(x)</code>) and multiplied elementwise with the other, then a down-projection. It has three weight matrices instead of two; EX 6.5 counts what that costs.</p>
+
+<h2 id="assemble">Assembling Block and GPT</h2>
+
+<p>Everything together, with microgpt's hyperparameters as defaults. <code>bias=False</code> everywhere and RMSNorm without a gain, so the parameter count matches.</p>
+
+<div class="code" data-lang="python">
+<div class="code-hdr"><span class="lang">python</span><span class="title">gpt.py</span></div>
+<pre><code>import math
+from dataclasses import dataclass
+
+import torch
+from torch import nn
+import torch.nn.functional as F
+
+
+@dataclass
+class GPTConfig:
+    vocab_size: int = 27      # a-z plus BOS
+    block_size: int = 16      # maximum sequence length T
+    n_embd: int = 16          # C
+    n_head: int = 4           # H, so head_dim D = 16 // 4 = 4
+    n_layer: int = 1          # microgpt has one block
+    mlp_hidden: int = 64      # 4 * C
+    final_norm: bool = False  # microgpt has none; GPT-2 and Llama do
+    tie_weights: bool = False
+
+
+class CausalSelfAttention(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        assert cfg.n_embd % cfg.n_head == 0
+        self.n_head = cfg.n_head
+        self.head_dim = cfg.n_embd // cfg.n_head
+        self.qkv = nn.Linear(cfg.n_embd, 3 * cfg.n_embd, bias=False)
+        self.proj = nn.Linear(cfg.n_embd, cfg.n_embd, bias=False)
+        mask = torch.triu(torch.ones(cfg.block_size, cfg.block_size, dtype=torch.bool), diagonal=1)
+        self.register_buffer("causal_mask", mask, persistent=False)
+
+    def forward(self, x):
+        B, T, C = x.shape
+        H, D = self.n_head, self.head_dim
+        q, k, v = self.qkv(x).split(C, dim=-1)                  # 3 x (B, T, C)
+        q = q.view(B, T, H, D).transpose(1, 2)                  # (B, H, T, D)
+        k = k.view(B, T, H, D).transpose(1, 2)
+        v = v.view(B, T, H, D).transpose(1, 2)
+        scores = q @ k.transpose(-2, -1) / math.sqrt(D)         # (B, H, T, T)
+        scores = scores.masked_fill(self.causal_mask[:T, :T], float("-inf"))
+        weights = F.softmax(scores, dim=-1)
+        out = weights @ v                                       # (B, H, T, D)
+        out = out.transpose(1, 2).contiguous().view(B, T, C)    # merge heads
+        return self.proj(out)
+
+
+class MLP(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.up = nn.Linear(cfg.n_embd, cfg.mlp_hidden, bias=False)
+        self.down = nn.Linear(cfg.mlp_hidden, cfg.n_embd, bias=False)
+
+    def forward(self, x):
+        return self.down(F.relu(self.up(x)))
+
+
+class Block(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.norm1 = nn.RMSNorm(cfg.n_embd, eps=1e-5, elementwise_affine=False)
+        self.attn = CausalSelfAttention(cfg)
+        self.norm2 = nn.RMSNorm(cfg.n_embd, eps=1e-5, elementwise_affine=False)
+        self.mlp = MLP(cfg)
+
+    def forward(self, x):
+        x = x + self.attn(self.norm1(x))     # residual add around attention
+        x = x + self.mlp(self.norm2(x))      # residual add around the MLP
+        return x
+
+
+class GPT(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg = cfg
+        self.tok_emb = nn.Embedding(cfg.vocab_size, cfg.n_embd)
+        self.pos_emb = nn.Embedding(cfg.block_size, cfg.n_embd)
+        self.blocks = nn.ModuleList([Block(cfg) for _ in range(cfg.n_layer)])
+        if cfg.final_norm:
+            self.norm_f = nn.RMSNorm(cfg.n_embd, eps=1e-5, elementwise_affine=False)
+        else:
+            self.norm_f = nn.Identity()
+        self.lm_head = nn.Linear(cfg.n_embd, cfg.vocab_size, bias=False)
+        if cfg.tie_weights:
+            self.lm_head.weight = self.tok_emb.weight   # one Parameter, two uses
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, (nn.Linear, nn.Embedding)):
+            nn.init.normal_(module.weight, mean=0.0, std=0.08)   # microgpt's init
+
+    def forward(self, idx):
+        B, T = idx.shape
+        assert T &lt;= self.cfg.block_size, "sequence longer than block_size"
+        pos = torch.arange(T, device=idx.device)
+        x = self.tok_emb(idx) + self.pos_emb(pos)    # (B, T, C)
+        for block in self.blocks:
+            x = block(x)
+        x = self.norm_f(x)
+        return self.lm_head(x)                       # (B, T, vocab_size)</code></pre>
+</div>
+
+<p>A few choices worth naming. The <strong>final norm</strong> (<code>norm_f</code>) normalises the last block's output before the LM head; GPT-2 and Llama have one, microgpt doesn't, so it's a flag and <code>nn.Identity()</code> (a module that returns its input) stands in when it's off. <code>torch.arange(T, device=idx.device)</code> creates positions on whatever device the input is on. The mask is a non-persistent buffer, as in <code>FastMicroGPT</code>.</p>
+
+<div class="code" data-lang="python">
+<pre><code>from gpt import GPT, GPTConfig
+
+torch.manual_seed(0)
+model = GPT(GPTConfig())
+idx = torch.tensor([[26, 4, 12, 12, 0],      # BOS e m m a
+                    [26, 0, 21, 0, 26]])     # BOS a v a BOS
+logits = model(idx)
+print(logits.shape)
+print(sum(p.numel() for p in model.parameters()))
+for name, p in model.named_parameters():
+    print(f"{name:26s} {str(tuple(p.shape)):9s} {p.numel():5d}")</code></pre>
+</div>
+
+<div class="code" data-lang="text">
+<pre><code>torch.Size([2, 5, 27])
+4192
+tok_emb.weight             (27, 16)    432
+pos_emb.weight             (16, 16)    256
+blocks.0.attn.qkv.weight   (48, 16)    768
+blocks.0.attn.proj.weight  (16, 16)    256
+blocks.0.mlp.up.weight     (64, 16)   1024
+blocks.0.mlp.down.weight   (16, 64)   1024
+lm_head.weight             (27, 16)    432</code></pre>
+</div>
+
+<p>4,192, the same as microgpt: the three 256-element Q, K, V matrices are now one 768-element <code>qkv</code>. <code>logits[b, t]</code> holds 27 scores for the token after position <code>t</code> of sequence <code>b</code>; Chapter 7 turns them into a loss. EX 6.7 loads <code>FastMicroGPT</code>'s weights into this module and gets bit-identical logits.</p>
+
+<h2 id="shapes">Every intermediate shape</h2>
+
+<p>Run the forward pass by hand, one line at a time, using the model's own submodules (same <code>model</code> and <code>idx</code> as above, so <code>B = 2</code>, <code>T = 5</code>):</p>
+
+<div class="code" data-lang="python">
+<pre><code>cfg = model.cfg
+B, T = idx.shape
+C, H = cfg.n_embd, cfg.n_head
+D = C // H
+blk = model.blocks[0]
+
+def show(step, t):
+    print(f"{step:34s} {tuple(t.shape)}")
+
+show("idx", idx)
+tok = model.tok_emb(idx);                         show("tok = tok_emb(idx)", tok)
+pos = model.pos_emb(torch.arange(T));             show("pos = pos_emb(arange(T))", pos)
+x = tok + pos;                                    show("x = tok + pos", x)
+h = blk.norm1(x);                                 show("h = norm1(x)", h)
+qkv = blk.attn.qkv(h);                            show("qkv = attn.qkv(h)", qkv)
+q, k, v = qkv.split(C, dim=-1);                   show("q, k, v = qkv.split(C, -1)", q)
+q = q.view(B, T, H, D);                           show("q.view(B, T, H, D)", q)
+q = q.transpose(1, 2);                            show("q.transpose(1, 2)", q)
+k = k.view(B, T, H, D).transpose(1, 2)
+v = v.view(B, T, H, D).transpose(1, 2)
+kt = k.transpose(-2, -1);                         show("k.transpose(-2, -1)", kt)
+scores = q @ kt / math.sqrt(D);                   show("scores = q @ kT / sqrt(D)", scores)
+scores = scores.masked_fill(blk.attn.causal_mask[:T, :T], float("-inf"))
+weights = F.softmax(scores, dim=-1);              show("weights = softmax(masked)", weights)
+out = weights @ v;                                show("out = weights @ v", out)
+out = out.transpose(1, 2);                        show("out.transpose(1, 2)", out)
+out = out.contiguous().view(B, T, C);             show(".contiguous().view(B, T, C)", out)
+att = blk.attn.proj(out);                         show("attn.proj(out)", att)
+x = x + att;                                      show("x = x + attn", x)
+up = blk.mlp.up(blk.norm2(x));                    show("mlp.up(norm2(x))", up)
+mlp = blk.mlp.down(F.relu(up));                   show("mlp.down(relu(.))", mlp)
+x = x + mlp;                                      show("x = x + mlp", x)
+logits = model.lm_head(model.norm_f(x));          show("logits = lm_head(norm_f(x))", logits)
+
+print(torch.equal(logits, model(idx)))            # True: the hand-run matches model(idx)</code></pre>
+</div>
+
+<p>It prints <code>True</code> on the last line, and these shapes (with a symbolic column added, because with microgpt's sizes <code>H = D = 4</code> and <code>(2, 4, 5, 4)</code> is otherwise ambiguous):</p>
+
+<table>
+  <tr><th>Step</th><th>Symbolic</th><th>Printed</th></tr>
+  <tr><td><code>idx</code></td><td>(B, T)</td><td>(2, 5)</td></tr>
+  <tr><td><code>tok_emb(idx)</code></td><td>(B, T, C)</td><td>(2, 5, 16)</td></tr>
+  <tr><td><code>pos_emb(arange(T))</code></td><td>(T, C)</td><td>(5, 16)</td></tr>
+  <tr><td><code>x = tok + pos</code></td><td>(B, T, C)</td><td>(2, 5, 16)</td></tr>
+  <tr><td><code>norm1(x)</code></td><td>(B, T, C)</td><td>(2, 5, 16)</td></tr>
+  <tr><td><code>attn.qkv(h)</code></td><td>(B, T, 3C)</td><td>(2, 5, 48)</td></tr>
+  <tr><td><code>qkv.split(C, -1)</code>, each</td><td>(B, T, C)</td><td>(2, 5, 16)</td></tr>
+  <tr><td><code>q.view(B, T, H, D)</code></td><td>(B, T, H, D)</td><td>(2, 5, 4, 4)</td></tr>
+  <tr><td><code>q.transpose(1, 2)</code></td><td>(B, H, T, D)</td><td>(2, 4, 5, 4)</td></tr>
+  <tr><td><code>k.transpose(-2, -1)</code></td><td>(B, H, D, T)</td><td>(2, 4, 4, 5)</td></tr>
+  <tr><td><code>q @ kT / sqrt(D)</code></td><td>(B, H, T, T)</td><td>(2, 4, 5, 5)</td></tr>
+  <tr><td><code>softmax(masked, -1)</code></td><td>(B, H, T, T)</td><td>(2, 4, 5, 5)</td></tr>
+  <tr><td><code>weights @ v</code></td><td>(B, H, T, D)</td><td>(2, 4, 5, 4)</td></tr>
+  <tr><td><code>out.transpose(1, 2)</code></td><td>(B, T, H, D)</td><td>(2, 5, 4, 4)</td></tr>
+  <tr><td><code>.contiguous().view(B, T, C)</code></td><td>(B, T, C)</td><td>(2, 5, 16)</td></tr>
+  <tr><td><code>attn.proj(out)</code></td><td>(B, T, C)</td><td>(2, 5, 16)</td></tr>
+  <tr><td><code>x = x + attn</code></td><td>(B, T, C)</td><td>(2, 5, 16)</td></tr>
+  <tr><td><code>mlp.up(norm2(x))</code></td><td>(B, T, 4C)</td><td>(2, 5, 64)</td></tr>
+  <tr><td><code>mlp.down(relu(.))</code></td><td>(B, T, C)</td><td>(2, 5, 16)</td></tr>
+  <tr><td><code>x = x + mlp</code></td><td>(B, T, C)</td><td>(2, 5, 16)</td></tr>
+  <tr><td><code>lm_head(norm_f(x))</code></td><td>(B, T, V)</td><td>(2, 5, 27)</td></tr>
+</table>
+
+<p>EX 6.1 repeats this with distinct sizes. The same flow as a picture:</p>
+
+<div class="code" data-lang="text">
+<pre><code>idx (B, T) ──► tok_emb + pos_emb ──► x (B, T, C)
+                                     │
+   ┌─────────────────────────────────┤  residual
+   │                                 ▼
+   │   norm1                         (B, T, C)
+   │   qkv: Linear C -&gt; 3C           (B, T, 3C)
+   │   split, view, transpose(1, 2)  3 x (B, H, T, D)
+   │   q @ k^T / sqrt(D)             (B, H, T, T)
+   │   mask (triu, -inf), softmax    (B, H, T, T)   rows sum to 1
+   │   @ v                           (B, H, T, D)
+   │   transpose(1, 2), view         (B, T, C)      heads merged
+   │   proj: Linear C -&gt; C           (B, T, C)
+   │                                 │
+   └──────────────────────────────► (+) x (B, T, C)
+                                     │
+   ┌─────────────────────────────────┤  residual
+   │   norm2                         (B, T, C)
+   │   up: Linear C -&gt; 4C, ReLU      (B, T, 4C)
+   │   down: Linear 4C -&gt; C          (B, T, C)
+   └──────────────────────────────► (+) x (B, T, C)
+                                     │
+                       norm_f, lm_head: Linear C -&gt; V
+                                     ▼
+                              logits (B, T, V)</code></pre>
+</div>
+
+<h2 id="weight-tying">Weight tying</h2>
+
+<p>The token embedding maps token id to vector, <code>[V, C]</code>. The LM head maps vector to a score per token, and its weight is also <code>[V, C]</code> (out = V, in = C). <strong>Weight tying</strong> uses one matrix for both. GPT-2 does it; it saves <code>V &times; C</code> parameters, which is a lot when <code>V = 50,257</code>. It's one assignment: make both modules hold the same <code>Parameter</code> object.</p>
+
+<div class="code" data-lang="python">
+<pre><code>torch.manual_seed(0)
+tied = GPT(GPTConfig(tie_weights=True))
+print(tied.lm_head.weight is tied.tok_emb.weight)
+print(sum(p.numel() for p in tied.parameters()))          # shared tensor counted once
+print([k for k in tied.state_dict() if "weight" in k and ("tok" in k or "lm" in k)])</code></pre>
+</div>
+
+<div class="code" data-lang="text">
+<pre><code>True
+3760
+['tok_emb.weight', 'lm_head.weight']</code></pre>
+</div>
+
+<p><code>parameters()</code> skips duplicates, so the count drops by 432 to 3,760, and the optimizer updates the shared matrix once, with gradient from both uses summed (your <code>+=</code> again). <code>state_dict()</code> still lists both names, pointing at the same tensor. Tie after creating both modules. If you initialise after tying, <code>apply</code> visits the shared tensor twice (as the embedding and as the head) and the last init wins; here both use the same normal init, so it doesn't matter, but with different schemes it would.</p>
+
+<div class="hands-on">
+<div class="hands-on-hdr">Hands-on · do this now</div>
+<div class="hands-on-body">
+<p>1. Save <code>gpt.py</code> in <code>~/learning-pytorch/ch06</code>. In a second file, build <code>GPT(GPTConfig())</code>, run it on the two-name batch, and check you get <code>torch.Size([2, 5, 27])</code> and <code>4192</code>.</p>
+<p>2. Replace the four attention lines in <code>CausalSelfAttention.forward</code> (from <code>scores = ...</code> to <code>out = weights @ v</code>) with <code>out = F.scaled_dot_product_attention(q, k, v, is_causal=True)</code>. Compare logits before and after with <code>torch.testing.assert_close</code> on the same seed.</p>
+<p>3. Set <code>n_layer=4</code>. Predict the new parameter count before printing it. (Each block adds 768 + 256 + 2048 = 3,072, so 13,408.)</p>
+<p>4. Feed a <code>(2, 17)</code> input. You get <code>AssertionError: sequence longer than block_size</code>. Without the assert, <code>pos_emb(torch.arange(17))</code> would fail with the less helpful <code>IndexError: index out of range in self</code>.</p>
+</div>
+</div>
+
+<h2 id="exercises">Exercises</h2>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 6.1</span>
+  <span class="exercise-diff easy">easy</span>
+  <span class="exercise-title">Shape tracing with distinct sizes</span>
+</div>
+<div class="exercise-body">
+<p>For <code>GPTConfig(block_size=32, n_embd=64, n_head=8, mlp_hidden=256)</code> and an input of shape <code>(8, 32)</code>, write down the shapes of: the token embedding output, the <code>qkv</code> output, <code>q</code> after splitting heads, the scores, the attention module output, the MLP hidden layer, and the logits. Then the parameter count. Check with forward hooks.</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<p>B = 8, T = 32, C = 64, H = 8, D = 8, V = 27: embedding <code>(8, 32, 64)</code>; qkv <code>(8, 32, 192)</code>; q heads <code>(8, 8, 32, 8)</code>; scores <code>(8, 8, 32, 32)</code>; attention output <code>(8, 32, 64)</code>; MLP hidden <code>(8, 32, 256)</code>; logits <code>(8, 32, 27)</code>. Parameters: 27&middot;64 + 32&middot;64 + 64&middot;192 + 64&middot;64 + 2&middot;64&middot;256 + 27&middot;64 = 1728 + 2048 + 12288 + 4096 + 32768 + 1728 = 54,656.</p>
+<div class="code" data-lang="python">
+<pre><code>cfg = GPTConfig(block_size=32, n_embd=64, n_head=8, mlp_hidden=256)
+model = GPT(cfg)
+idx = torch.randint(0, cfg.vocab_size, (8, 32))
+
+shapes = {}
+def grab(name):
+    def hook(module, inputs, output):
+        shapes[name] = tuple(output.shape)
+    return hook
+for name in ["tok_emb", "blocks.0.attn.qkv", "blocks.0.attn", "blocks.0.mlp.up", "lm_head"]:
+    model.get_submodule(name).register_forward_hook(grab(name))
+
+logits = model(idx)
+for k, v in shapes.items():
+    print(f"{k:18s} {v}")
+print(sum(p.numel() for p in model.parameters()))</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>tok_emb            (8, 32, 64)
+blocks.0.attn.qkv  (8, 32, 192)
+blocks.0.attn      (8, 32, 64)
+blocks.0.mlp.up    (8, 32, 256)
+lm_head            (8, 32, 27)
+54656</code></pre>
+</div>
+<p>Hooks only see module outputs. The q-head and score shapes live inside <code>forward</code>; repeating those lines by hand on an <code>(8, 32, 64)</code> input prints <code>(8, 8, 32, 8)</code> and <code>(8, 8, 32, 32)</code>.</p>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 6.2</span>
+  <span class="exercise-diff medium">medium</span>
+  <span class="exercise-title">Prove the model is causal</span>
+</div>
+<div class="exercise-body">
+<p>Changing a token at position <code>p</code> must not change the logits at any position before <code>p</code>. Prove it in code for <code>p = 3</code> on <code>BOS e m m a BOS</code>. Then disable the mask and show that the test catches it.</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<div class="code" data-lang="python">
+<pre><code>torch.manual_seed(0)
+model = GPT(GPTConfig()).eval()
+idx = torch.tensor([[26, 4, 12, 12, 0, 26]])     # BOS e m m a BOS
+changed = idx.clone()
+changed[0, 3] = 25                                # position 3: 'm' -&gt; 'z'
+
+with torch.inference_mode():
+    a = model(idx)
+    b = model(changed)
+
+print((a - b).abs().amax(dim=-1)[0])              # max difference per position
+print(torch.equal(a[:, :3], b[:, :3]))            # positions 0, 1, 2 untouched
+
+model.blocks[0].attn.causal_mask.zero_()          # mask nothing
+with torch.inference_mode():
+    a = model(idx)
+    b = model(changed)
+print(torch.equal(a[:, :3], b[:, :3]))</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>tensor([0.0000, 0.0000, 0.0000, 0.1337, 0.0237, 0.0059])
+True
+False</code></pre>
+</div>
+<p>Positions 0&ndash;2 are bit-identical; 3 onward change. <code>torch.equal</code> (exact) is the right check here, not <code>allclose</code>: masked positions get exactly zero weight, so there is no rounding excuse. This is why a single forward pass over <code>T</code> positions can train on <code>T</code> next-token predictions at once.</p>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 6.3</span>
+  <span class="exercise-diff medium">medium</span>
+  <span class="exercise-title">Forget contiguous()</span>
+</div>
+<div class="exercise-body">
+<p>Remove <code>.contiguous()</code> from the head-merge line. What error do you get, and why? Give two correct fixes and check they agree.</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<div class="code" data-lang="python">
+<pre><code>B, H, T, D = 2, 4, 5, 4
+out = torch.randn(B, H, T, D).transpose(1, 2)    # (B, T, H, D), not contiguous
+try:
+    out.view(B, T, H * D)
+except RuntimeError as e:
+    print("RuntimeError:", e)
+
+a = out.reshape(B, T, H * D)                     # copies when it has to
+b = out.contiguous().view(B, T, H * D)
+print(torch.equal(a, b), a.is_contiguous())</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>RuntimeError: view size is not compatible with input tensor's size and stride (at least one dimension spans across two contiguous subspaces). Use .reshape(...) instead.
+True True</code></pre>
+</div>
+<p>Fusing H and D into one dimension needs element <code>(h, d+1)</code> to sit right after <code>(h, d)</code>, and <code>(h+1, 0)</code> right after <code>(h, D-1)</code>. After the transpose, consecutive heads of one token are <code>T &middot; D</code> elements apart, so no single stride describes the fused dim. <code>view</code> never copies, so it refuses; <code>.contiguous().view</code> and <code>.reshape</code> both copy into a fresh row-major buffer.</p>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 6.4</span>
+  <span class="exercise-diff easy">easy</span>
+  <span class="exercise-title">Tying at GPT-2 scale</span>
+</div>
+<div class="exercise-body">
+<p>GPT-2 small has <code>V = 50,257</code> and <code>C = 768</code>. How many parameters does weight tying save? What fraction of its roughly 124M parameters is that? And for microgpt?</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<p>50,257 &times; 768 = 38,597,376, about 31% of 124M. For microgpt, 27 &times; 16 = 432 of 4,192, about 10% (3,760 tied, as printed above). Small models with big vocabularies spend a large share of their parameters on the embedding, which is why tying was popular; very large models often untie them because the share becomes small and the separate head helps quality.</p>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 6.5</span>
+  <span class="exercise-diff medium">medium</span>
+  <span class="exercise-title">Swap ReLU for SwiGLU</span>
+</div>
+<div class="exercise-body">
+<p>Write a <code>SwiGLU</code> module (<code>down(silu(gate(x)) * up(x))</code>, no biases) and swap it into every block of a microgpt-sized <code>GPT</code> by assigning to <code>block.mlp</code>. Count parameters with hidden size 64, then with hidden size 43, and explain why Llama shrinks the hidden size.</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<div class="code" data-lang="python">
+<pre><code>class SwiGLU(nn.Module):
+    def __init__(self, n_embd, hidden):
+        super().__init__()
+        self.gate = nn.Linear(n_embd, hidden, bias=False)
+        self.up = nn.Linear(n_embd, hidden, bias=False)
+        self.down = nn.Linear(hidden, n_embd, bias=False)
+
+    def forward(self, x):
+        return self.down(F.silu(self.gate(x)) * self.up(x))
+
+def count(m):
+    return sum(p.numel() for p in m.parameters())
+
+model = GPT(GPTConfig())
+print(count(model), count(model.blocks[0].mlp))
+
+for block in model.blocks:
+    block.mlp = SwiGLU(16, 64)          # assigning a Module re-registers it
+print(count(model), count(model.blocks[0].mlp))
+
+for block in model.blocks:
+    block.mlp = SwiGLU(16, 43)          # ~ 2/3 * 64: Llama's trick to keep the count
+print(count(model), count(model.blocks[0].mlp))
+
+idx = torch.randint(0, 27, (2, 5))
+print(model(idx).shape)</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>4192 2048
+5216 3072
+4208 2064
+torch.Size([2, 5, 27])</code></pre>
+</div>
+<p>Three <code>C &times; hidden</code> matrices instead of two is 1.5&times; the MLP parameters. Llama sets the hidden size to about <code>2/3 &middot; 4C</code> (then rounds to a hardware-friendly multiple), so the SwiGLU MLP costs about the same as the ReLU one. Note that assigning a new module to <code>block.mlp</code> replaced the old one in <code>_modules</code>: module surgery like this is how people swap layers in pretrained models.</p>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 6.6</span>
+  <span class="exercise-diff hard">hard</span>
+  <span class="exercise-title">Multi-query attention</span>
+</div>
+<div class="exercise-body">
+<p>In <strong>multi-query attention</strong> (MQA) all H query heads share a single key head and a single value head. Write <code>MultiQueryAttention</code> with <code>q: Linear(C, C)</code> and <code>kv: Linear(C, 2D)</code>, using broadcasting rather than copying K and V H times. Count its parameters against <code>CausalSelfAttention</code>, check it against <code>F.scaled_dot_product_attention</code> (with <code>expand</code>, and with <code>enable_gqa=True</code>), and say what it saves at inference time.</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<div class="code" data-lang="python">
+<pre><code>class MultiQueryAttention(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.n_head = cfg.n_head
+        self.head_dim = cfg.n_embd // cfg.n_head
+        self.q = nn.Linear(cfg.n_embd, cfg.n_embd, bias=False)          # H query heads
+        self.kv = nn.Linear(cfg.n_embd, 2 * self.head_dim, bias=False)  # ONE key head, ONE value head
+        self.proj = nn.Linear(cfg.n_embd, cfg.n_embd, bias=False)
+        mask = torch.triu(torch.ones(cfg.block_size, cfg.block_size, dtype=torch.bool), diagonal=1)
+        self.register_buffer("causal_mask", mask, persistent=False)
+
+    def forward(self, x):
+        B, T, C = x.shape
+        H, D = self.n_head, self.head_dim
+        q = self.q(x).view(B, T, H, D).transpose(1, 2)     # (B, H, T, D)
+        k, v = self.kv(x).split(D, dim=-1)                  # (B, T, D) each
+        k = k.unsqueeze(1)                                  # (B, 1, T, D): broadcasts over H
+        v = v.unsqueeze(1)
+        scores = q @ k.transpose(-2, -1) / math.sqrt(D)     # (B, H, T, T)
+        scores = scores.masked_fill(self.causal_mask[:T, :T], float("-inf"))
+        out = F.softmax(scores, dim=-1) @ v                 # (B, H, T, D)
+        out = out.transpose(1, 2).contiguous().view(B, T, C)
+        return self.proj(out)
+
+torch.manual_seed(0)
+cfg = GPTConfig()
+mqa = MultiQueryAttention(cfg)
+x = torch.randn(2, 5, 16)
+y = mqa(x)
+print(y.shape, sum(p.numel() for p in mqa.parameters()))
+
+# Reference: the same projections, attention done by SDPA
+B, T, C = x.shape
+H, D = cfg.n_head, C // cfg.n_head
+q = mqa.q(x).view(B, T, H, D).transpose(1, 2)
+k, v = mqa.kv(x).split(D, dim=-1)
+k, v = k.unsqueeze(1), v.unsqueeze(1)                   # (B, 1, T, D)
+ref1 = F.scaled_dot_product_attention(q, k.expand(B, H, T, D), v.expand(B, H, T, D), is_causal=True)
+ref2 = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)
+for out in (ref1, ref2):
+    assert_close(y, mqa.proj(out.transpose(1, 2).reshape(B, T, C)))
+print("matches SDPA with expand() and with enable_gqa=True")</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>torch.Size([2, 5, 16]) 640
+matches SDPA with expand() and with enable_gqa=True</code></pre>
+</div>
+<p>640 parameters instead of 1,024 (q 256 + kv 128 + proj 256). The real win is at inference: the KV cache stores one key and one value vector of size D per token instead of H of them, so it is H times smaller (4&times; here, 32&times; or more in big models), and every decoding step reads H times less cache from memory. <code>expand</code> makes a broadcast view with stride 0 along H, so no copy happens either. <strong>Grouped-query attention</strong> (GQA, used by Llama 2 70B and Llama 3) sits in between: G key/value heads, each shared by H/G query heads; <code>enable_gqa=True</code> (PyTorch 2.5+) handles that case too.</p>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 6.7</span>
+  <span class="exercise-diff hard">hard</span>
+  <span class="exercise-title">Load FastMicroGPT's weights into GPT</span>
+</div>
+<div class="exercise-body">
+<p>Copy the <code>FastMicroGPT</code> class out of <code>run_fast_training()</code> into <code>fastmicrogpt.py</code> (add <code>import random</code>, <code>import torch</code>, <code>import torch.nn.functional as F</code>, <code>vocabulary_size = 27</code> and the four <code>fast_*</code> constants at the top). Build one with <code>random.seed(42)</code>, convert its <code>state_dict</code> into your <code>GPT</code>'s key names, load it with <code>strict=True</code>, and show that both models produce the same logits for <code>BOS e m m a</code>.</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<div class="code" data-lang="python">
+<pre><code>import random
+import torch
+from fastmicrogpt import FastMicroGPT        # the class copied out of run_fast_training()
+from gpt import GPT, GPTConfig
+
+random.seed(42)
+fast = FastMicroGPT()
+
+rename = {
+    "token_embedding_table": "tok_emb.weight",
+    "position_embedding_table": "pos_emb.weight",
+    "attention_output_weights": "blocks.0.attn.proj.weight",
+    "mlp_expand_weights": "blocks.0.mlp.up.weight",
+    "mlp_contract_weights": "blocks.0.mlp.down.weight",
+    "language_model_head_weights": "lm_head.weight",
+}
+old = fast.state_dict()
+new = {rename[k]: v for k, v in old.items() if k in rename}
+new["blocks.0.attn.qkv.weight"] = torch.cat(
+    [old["query_weights"], old["key_weights"], old["value_weights"]], dim=0
+)                                            # (48, 16): q rows, then k rows, then v rows
+
+model = GPT(GPTConfig())
+print(model.load_state_dict(new))
+
+token_ids = torch.tensor([26, 4, 12, 12, 0])            # one sequence, shape (T,)
+with torch.inference_mode():
+    a = fast(token_ids)                                 # (T, vocab)
+    b = model(token_ids.unsqueeze(0))[0]                # add B=1, then drop it
+print(a.shape, b.shape)
+print(torch.allclose(a, b, atol=1e-6), (a - b).abs().max().item())</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>&lt;All keys matched successfully&gt;
+torch.Size([5, 27]) torch.Size([5, 27])
+True 0.0</code></pre>
+</div>
+<p>A max difference of exactly 0.0: the batched model does the same float operations in the same order. Three things made the port this easy: microgpt stores weights <code>[out][in]</code> like <code>nn.Linear</code> (no transposes); the fused <code>qkv</code> weight is just the three matrices stacked along the output dimension; and <code>nn.RMSNorm(..., eps=1e-5, elementwise_affine=False)</code> is exactly <code>F.rms_norm(..., eps=1e-5)</code>. Had you left <code>eps</code> at its default, this test is where you would have found out.</p>
+</div>
+</details>
+</div>
+</div>
+
+<h2 id="recap">Recap</h2>
+<ul>
+  <li>Going from <code>(T, C)</code> to <code>(B, T, C)</code> only changes code that names dimensions by position; Linear, norms and <code>softmax(dim=-1)</code> are batch-agnostic, and <code>@</code> batches over leading dims.</li>
+  <li>Heads: <code>view(B, T, H, D).transpose(1, 2)</code> to split, <code>transpose(1, 2).contiguous().view(B, T, C)</code> (or <code>reshape</code>) to merge.</li>
+  <li>Attention: <code>q @ k.transpose(-2, -1) / sqrt(D)</code>, <code>masked_fill(triu(diagonal=1), -inf)</code>, <code>softmax(dim=-1)</code>, <code>@ v</code>. With all positions computed at once, the mask is what makes the model causal.</li>
+  <li><code>F.scaled_dot_product_attention(q, k, v, is_causal=True)</code> matches the manual version and can use fused kernels on CUDA. Don't use <code>is_causal=True</code> for a single decode step against a KV cache.</li>
+  <li><code>nn.RMSNorm</code> needs an explicit <code>eps</code> to match microgpt; <code>elementwise_affine=False</code> removes the gain.</li>
+  <li>A pre-norm block is <code>x + attn(norm(x))</code> then <code>x + mlp(norm(x))</code>. ReLU in microgpt, GELU in GPT-2, SwiGLU in Llama.</li>
+  <li>The assembled <code>GPT</code> has 4,192 parameters, matches <code>FastMicroGPT</code> bit for bit, and drops to 3,760 with weight tying.</li>
+</ul>
+
+<div class="page-nav">
+  <a href="05-nn-module.html"><span class="lbl">← Prev</span><span class="ttl">nn.Module</span></a>
+  <a href="07-losses-optimizers.html" class="next"><span class="lbl">Next →</span><span class="ttl">Losses &amp; Optimizers</span></a>
+</div>
+
+</main>
+</div>
+<script src="../assets/site.js"></script>
+</body>
+</html>

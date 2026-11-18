@@ -1,0 +1,1147 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>8 · The Training Loop — PyTorch</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<button class="sidebar-toggle" aria-label="Toggle navigation">☰ Menu</button>
+<div class="layout">
+<aside class="sidebar">
+  <a href="../index.html" class="brand">PyTorch</a>
+  <span class="brand-sub">a deep dive — 2026</span>
+  <nav>
+    <ol>
+      <li><a href="01-why-pytorch.html">Why PyTorch</a></li>
+      <li><a href="02-tensors.html">Tensors</a></li>
+      <li><a href="03-tensor-math.html">Tensor Math &amp; Broadcasting</a></li>
+      <li><a href="04-autograd.html">Autograd</a></li>
+      <li><a href="05-nn-module.html">nn.Module</a></li>
+      <li><a href="06-transformer-blocks.html">Building a Transformer</a></li>
+      <li><a href="07-losses-optimizers.html">Losses &amp; Optimizers</a></li>
+      <li><a href="08-training-loop.html">The Training Loop</a></li>
+      <li><a href="09-devices-precision.html">Devices &amp; Precision</a></li>
+      <li><a href="10-inference.html">Inference &amp; Sampling</a></li>
+      <li><a href="11-performance.html">Performance &amp; Profiling</a></li>
+      <li><a href="12-debugging.html">Debugging PyTorch</a></li>
+      <li><a href="13-50-questions.html">The 50 Questions</a></li>
+      <li><a href="14-capstone.html">Capstone Project</a></li>
+    </ol>
+    <div class="extras">
+      <a href="../exercises.html">All Exercises</a>
+      <a href="../index.html">← Home</a>
+    </div>
+  </nav>
+  <div class="progress"></div>
+</aside>
+
+<main class="content">
+
+<h1>
+  <span class="chap-num">Chapter 08</span>
+  The Training Loop
+</h1>
+<p class="lede">
+  microgpt trains on one name per step. Real training feeds the model a
+  <strong>batch</strong> of sequences at once, which means padding, masking,
+  and a data pipeline. This chapter builds that pipeline with
+  <code>Dataset</code> and <code>DataLoader</code>, writes the canonical train
+  and eval loops line by line, and adds the habits that keep long runs honest:
+  sanity checks, checkpoints you can resume bit-for-bit, reproducibility, and
+  gradient accumulation. It ends with a complete script that trains a batched
+  microgpt on CPU in under a second.
+</p>
+
+<h2 id="one-to-batch">From one name per step to a batch</h2>
+
+<p>microgpt's PyTorch loop does this every step: take the next name, build <code>input_ids</code> and <code>target_ids</code> of length <code>T</code> (<code>make_training_pair</code>), run the model to get <code>(T, 27)</code> logits, compute <code>F.cross_entropy</code>, step. The gradient comes from one name, so it is noisy, and each step is a handful of tiny matrix multiplies that leave most of the hardware idle.</p>
+
+<p>A <strong>mini-batch</strong> (usually just "batch") is <code>B</code> examples processed together. The model sees a <code>(B, T)</code> tensor of token ids and returns <code>(B, T, 27)</code> logits. The loss averages over all <code>B × T</code> predictions, so the gradient is an average over <code>B</code> names: less noise per step, and one big matmul instead of <code>B</code> small ones. An <strong>epoch</strong> is one full pass over the training set.</p>
+
+<p>The catch: names have different lengths, and a tensor must be rectangular.</p>
+
+<h2 id="padding">Padding a batch of names</h2>
+
+<p>Encode each name exactly as microgpt does: <code>BOS</code> (id 26), the letters, then <code>BOS</code> again to mark the end. Inputs are all tokens but the last, targets are all tokens but the first. Then <strong>pad</strong> every row to the longest one: fill the extra input slots with any valid token id (we use <code>BOS</code>) and the extra target slots with <code>-100</code>, the value <code>F.cross_entropy</code> ignores (Chapter 7).</p>
+
+<div class="code" data-lang="python">
+<div class="code-hdr"><span class="lang">python</span><span class="title">batch.py</span></div>
+<pre><code>import torch
+
+BOS, BLOCK, IGNORE = 26, 16, -100
+
+def encode(name):
+    return [BOS] + [ord(ch) - ord("a") for ch in name] + [BOS]
+
+def make_pair(name):                       # microgpt's make_training_pair
+    ids = encode(name)[: BLOCK + 1]
+    return torch.tensor(ids[:-1]), torch.tensor(ids[1:])
+
+def collate(batch):
+    """Pad a list of (input, target) pairs to the longest one in the batch."""
+    T = max(len(x) for x, _ in batch)
+    inputs = torch.full((len(batch), T), BOS, dtype=torch.long)
+    targets = torch.full((len(batch), T), IGNORE, dtype=torch.long)
+    for row, (x, y) in enumerate(batch):
+        inputs[row, : len(x)] = x
+        targets[row, : len(y)] = y
+    return inputs, targets
+
+pairs = [make_pair(n) for n in ["emma", "ava", "isabella"]]
+print(pairs[1])
+inputs, targets = collate(pairs)
+print(inputs.shape, targets.shape)
+print(inputs)
+print(targets)
+print((targets != IGNORE).sum().item(), "real targets out of", targets.numel())</code></pre>
+</div>
+
+<div class="code" data-lang="text">
+<pre><code>(tensor([26,  0, 21,  0]), tensor([ 0, 21,  0, 26]))
+torch.Size([3, 9]) torch.Size([3, 9])
+tensor([[26,  4, 12, 12,  0, 26, 26, 26, 26],
+        [26,  0, 21,  0, 26, 26, 26, 26, 26],
+        [26,  8, 18,  0,  1,  4, 11, 11,  0]])
+tensor([[   4,   12,   12,    0,   26, -100, -100, -100, -100],
+        [   0,   21,    0,   26, -100, -100, -100, -100, -100],
+        [   8,   18,    0,    1,    4,   11,   11,    0,   26]])
+18 real targets out of 27</code></pre>
+</div>
+
+<p>Read row 1 ("ava"): the input <code>[26, 0, 21, 0]</code> means "<code>&lt;BOS&gt;</code> a v a", the target <code>[0, 21, 0, 26]</code> means "a v a <code>&lt;end&gt;</code>", shifted by one. Then five pad slots. Only 18 of the 27 target slots are real; the loss must count those 18 and nothing else.</p>
+
+<h4>Why pads need no attention mask here</h4>
+
+<p>Pads go on the <strong>right</strong>, after the real tokens. With a causal mask, position <code>t</code> attends only to positions <code>0..t</code>, so every real position only ever sees real tokens before it. The pad positions do compute garbage, but their targets are <code>-100</code>, so the garbage is never scored and sends back no gradient. Right padding plus causal attention plus <code>ignore_index</code> is all a decoder-only model needs for training. (Exercise 8.2 proves it: scramble the pad inputs and the loss does not move.) Left padding, used in batched generation, does need an explicit mask; Chapter 10 covers it.</p>
+
+<div class="callout tip">
+<div class="callout-title">The loss is now token-weighted</div>
+<p><code>F.cross_entropy</code> with <code>reduction="mean"</code> divides by the number of real targets in the batch, so a 9-token name counts 9 times as much as a 1-token one. microgpt averages per name (<code>calculate_document_loss</code>) and then each step is one name, so every name counts equally per step. Neither is wrong, but they are different objectives. Token weighting is what every LLM trainer uses, and it matches how microgpt's <code>evaluate_model</code> already scores the test set.</p>
+</div>
+
+<h2 id="dataset"><code>Dataset</code> and <code>DataLoader</code></h2>
+
+<p>PyTorch splits the data pipeline into two objects:</p>
+<ul>
+  <li>A <strong><code>Dataset</code></strong> answers two questions: how many examples (<code>__len__</code>) and what is example <code>i</code> (<code>__getitem__</code>). It knows nothing about batches.</li>
+  <li>A <strong><code>DataLoader</code></strong> wraps a dataset and yields batches. It picks the indices (in order, or shuffled), calls <code>__getitem__</code> for each, and hands the list of examples to a <strong>collate function</strong> that stacks them into tensors.</li>
+</ul>
+
+<div class="code" data-lang="python">
+<pre><code># continues batch.py: torch, encode and BLOCK are defined there
+from torch.utils.data import DataLoader, Dataset
+
+class NamesDataset(Dataset):
+    def __init__(self, names):
+        self.names = names
+
+    def __len__(self):
+        return len(self.names)
+
+    def __getitem__(self, i):
+        ids = encode(self.names[i])[: BLOCK + 1]
+        return torch.tensor(ids[:-1]), torch.tensor(ids[1:])   # (input, target)
+
+ds = NamesDataset(["emma", "ava", "isabella"])
+print(len(ds), ds[1])
+# 3 (tensor([26,  0, 21,  0]), tensor([ 0, 21,  0, 26]))
+next(iter(DataLoader(ds, batch_size=3)))
+# RuntimeError: stack expects each tensor to be equal size, but got [5] at entry 0 and [4] at entry 1</code></pre>
+</div>
+
+<p>The default collate function calls <code>torch.stack</code>, which needs equal shapes. Variable-length sequences always need your own <code>collate_fn</code>: pass <code>collate_fn=collate</code> from the previous section.</p>
+
+<h4>The arguments you will use</h4>
+
+<table>
+  <tr><th>argument</th><th>what it does</th></tr>
+  <tr><td><code>batch_size=12</code></td><td>examples per batch</td></tr>
+  <tr><td><code>shuffle=True</code></td><td>a new random order every epoch (training only; keep eval in order)</td></tr>
+  <tr><td><code>collate_fn=collate</code></td><td>turns a list of examples into batch tensors</td></tr>
+  <tr><td><code>drop_last=True</code></td><td>drops the final short batch, so every batch has exactly <code>batch_size</code> examples</td></tr>
+  <tr><td><code>generator=g</code></td><td>a <code>torch.Generator</code> that drives the shuffle, for reproducible order</td></tr>
+  <tr><td><code>num_workers=0</code></td><td>how many background processes build batches (0 = in the main process)</td></tr>
+</table>
+
+<div class="code" data-lang="python">
+<pre><code>import torch
+from torch.utils.data import DataLoader
+
+# range(10) is a valid map-style dataset: it has __len__ and __getitem__
+g = torch.Generator().manual_seed(0)
+loader = DataLoader(range(10), batch_size=4, shuffle=True, generator=g)
+print([b.tolist() for b in loader])     # epoch 1
+print([b.tolist() for b in loader])     # epoch 2: new order, same generator
+
+g = torch.Generator().manual_seed(0)
+loader = DataLoader(range(10), batch_size=4, shuffle=True, generator=g)
+print([b.tolist() for b in loader])     # fresh generator, same seed: epoch 1 again
+
+loader = DataLoader(range(10), batch_size=4, drop_last=True)
+print(len(loader), [b.tolist() for b in loader])</code></pre>
+</div>
+
+<div class="code" data-lang="text">
+<pre><code>[[3, 7, 5, 2], [0, 8, 1, 6], [9, 4]]
+[[1, 3, 2, 7], [5, 9, 0, 6], [4, 8]]
+[[3, 7, 5, 2], [0, 8, 1, 6], [9, 4]]
+2 [[0, 1, 2, 3], [4, 5, 6, 7]]</code></pre>
+</div>
+
+<p>Each <code>for</code> over the loader is one epoch and draws a fresh permutation from the generator. Seeding the generator makes the whole sequence of epochs repeatable, independent of any other random numbers your program uses. <code>len(loader)</code> is the number of batches per epoch.</p>
+
+<h4><code>num_workers</code> and the macOS caveat</h4>
+
+<p>With <code>num_workers=N &gt; 0</code>, the DataLoader starts <code>N</code> worker processes that build batches in parallel while the main process trains. That matters when <code>__getitem__</code> is expensive (decoding images, reading files, tokenizing text on the fly). It needs two things your code must allow:</p>
+
+<ul>
+  <li><strong>The main-module guard.</strong> On macOS (and Windows) Python starts worker processes with <code>spawn</code>: a fresh interpreter that re-imports your script. Without <code>if __name__ == "__main__":</code> around the training code, each worker would start training too. Python stops this with an error:</li>
+</ul>
+
+<div class="code" data-lang="text">
+<pre><code>RuntimeError:
+        An attempt has been made to start a new process before the
+        current process has finished its bootstrapping phase.
+
+        This probably means that you are not using fork to start your
+        child processes and you have forgotten to use the proper idiom
+        in the main module:
+
+            if __name__ == '__main__':
+                freeze_support()
+                ...</code></pre>
+</div>
+
+<ul>
+  <li><strong>Picklable dataset and <code>collate_fn</code>.</strong> They are sent to the workers by pickling, so they must be defined at module top level. A lambda fails: <code>_pickle.PicklingError: Can't pickle &lt;function &lt;lambda&gt; at 0x10945d1f0&gt;: attribute lookup &lt;lambda&gt; on __main__ failed</code>.</li>
+</ul>
+
+<p>Linux (through Python 3.13) uses <code>fork</code> by default, which copies the parent process and hides both problems, so code written on Linux often breaks on a Mac. Workers also cost startup time: on the Apple Silicon laptop used for this tutorial, iterating the 95-name dataset once took 0.001 s with <code>num_workers=0</code> and about 12 s with <code>num_workers=2</code>, nearly all of it spent starting two Python processes that each import torch. Your numbers will differ; the lesson is that for small in-memory data, <code>num_workers=0</code> is right. When you do use workers, <code>persistent_workers=True</code> keeps them alive between epochs.</p>
+
+<h2 id="the-loop">The canonical training loop</h2>
+
+<p>Every PyTorch training loop has the same skeleton. Here it is as it appears in the full script later in this chapter:</p>
+
+<div class="code" data-lang="python">
+<pre><code>model.train()                                             # 1
+while step &lt; total_steps:
+    for inputs, targets in train_loader:                  # 2
+        logits = model(inputs)                            # 3  (B, T, 27)
+        loss = F.cross_entropy(logits.view(-1, VOCAB),    # 4
+                               targets.view(-1))
+        optimizer.zero_grad(set_to_none=True)             # 5
+        loss.backward()                                   # 6
+        grad_norm = torch.nn.utils.clip_grad_norm_(       # 7
+            model.parameters(), 1.0)
+        optimizer.step()                                  # 8
+        scheduler.step()                                  # 9
+        step += 1
+        if step % log_every == 0:                         # 10
+            val_loss, val_ppl = evaluate(model, val_loader)
+            print(step, loss.item(), val_loss, grad_norm.item())
+        if step == total_steps:
+            break</code></pre>
+</div>
+
+<table>
+  <tr><th>#</th><th>line</th><th>why it is there, and why there</th></tr>
+  <tr><td>1</td><td><code>model.train()</code></td><td>Puts every submodule in training mode. It changes behaviour only for layers like dropout and batch norm; microgpt has neither, so here it is a habit. Evaluation switches to eval mode, so something must switch back; our <code>evaluate()</code> does it on exit.</td></tr>
+  <tr><td>2</td><td><code>for ... in train_loader</code></td><td>One batch per iteration. The outer <code>while</code> counts optimizer steps rather than epochs, which is how LLM runs are specified.</td></tr>
+  <tr><td>3</td><td><code>model(inputs)</code></td><td>Forward pass. Autograd records the graph as it goes (Chapter 4).</td></tr>
+  <tr><td>4</td><td><code>F.cross_entropy</code></td><td>Flatten <code>(B, T, C)</code> to <code>(B*T, C)</code>; pads are ignored via <code>-100</code>.</td></tr>
+  <tr><td>5</td><td><code>zero_grad</code></td><td>Clears the previous step's gradients, which would otherwise be added to. Anywhere before <code>backward()</code> works; right before it is the clearest.</td></tr>
+  <tr><td>6</td><td><code>loss.backward()</code></td><td>Fills <code>p.grad</code> for every parameter and frees the graph.</td></tr>
+  <tr><td>7</td><td><code>clip_grad_norm_</code></td><td>Must come after <code>backward</code> (it needs the grads) and before <code>step</code> (it changes what the step uses).</td></tr>
+  <tr><td>8</td><td><code>optimizer.step()</code></td><td>Updates the weights in place from <code>.grad</code>.</td></tr>
+  <tr><td>9</td><td><code>scheduler.step()</code></td><td>After the optimizer, so step 0 used the schedule's first value (Chapter 7).</td></tr>
+  <tr><td>10</td><td>logging</td><td><code>loss.item()</code> copies one number to the CPU. On a GPU this forces the CPU to wait for the GPU (Chapter 11), so log every N steps, not every step.</td></tr>
+</table>
+
+<p>microgpt's loop has the same lines in a slightly different order: it sets the lr by hand between <code>backward()</code> and <code>step()</code> instead of using a scheduler, and it has no clipping.</p>
+
+<h2 id="eval-loop">The evaluation loop</h2>
+
+<p>Evaluation runs the model over held-out data without training it. Three differences from the training loop:</p>
+<ul>
+  <li><code>model.eval()</code> switches dropout and similar layers to inference behaviour. Switch back with <code>model.train()</code> afterwards.</li>
+  <li><code>torch.no_grad()</code> (or the stricter <code>torch.inference_mode()</code>, which microgpt's <code>evaluate_model</code> uses) stops autograd from recording a graph: less memory, less time. Chapter 10 covers the difference.</li>
+  <li>The average must be <strong>token-weighted</strong>: sum the losses with <code>reduction="sum"</code>, count the real targets, divide at the end. <strong>Perplexity</strong> is <code>exp(average loss)</code>: the effective number of tokens the model is choosing between. A uniform guess over 27 tokens has perplexity 27.</li>
+</ul>
+
+<div class="code" data-lang="python">
+<pre><code>@torch.no_grad()
+def evaluate(model, loader):
+    model.eval()
+    total_loss, total_tokens = 0.0, 0
+    for inputs, targets in loader:
+        logits = model(inputs)
+        total_loss += F.cross_entropy(
+            logits.view(-1, VOCAB), targets.view(-1), reduction="sum"
+        ).item()
+        total_tokens += (targets != IGNORE).sum().item()
+    model.train()
+    avg = total_loss / total_tokens
+    return avg, math.exp(avg)</code></pre>
+</div>
+
+<p>To check this is the same number microgpt computes, run the trained model from the full script through both: microgpt's one-name-at-a-time <code>evaluate_model</code>, and the batched version at two batch sizes.</p>
+
+<div class="code" data-lang="python">
+<div class="code-hdr"><span class="lang">python</span><span class="title">eval_match.py</span></div>
+<pre><code>import math
+import torch
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from train_names import NAMES, NamesDataset, collate, evaluate, train, VOCAB
+
+model = train(200, 3e-3, verbose=False)        # the trained model from the full script
+val = NamesDataset(NAMES[84:])
+
+# microgpt's evaluate_model: one document at a time, sum of losses / token count
+@torch.inference_mode()
+def evaluate_one_by_one(model, dataset):
+    model.eval()
+    total_loss, total_predictions = 0.0, 0
+    for i in range(len(dataset)):
+        input_ids, target_ids = dataset[i]
+        logits = model(input_ids[None])[0]            # add then drop a batch dim of 1
+        total_loss += F.cross_entropy(logits, target_ids, reduction="sum").item()
+        total_predictions += target_ids.numel()
+    average_loss = total_loss / total_predictions
+    return average_loss, math.exp(average_loss), total_predictions
+
+print(evaluate_one_by_one(model, val))
+print(evaluate(model, DataLoader(val, batch_size=4, collate_fn=collate)))
+print(evaluate(model, DataLoader(val, batch_size=11, collate_fn=collate)))
+
+# the WRONG way: average the per-batch means
+loader = DataLoader(val, batch_size=4, collate_fn=collate)
+with torch.no_grad():
+    means = [F.cross_entropy(model(x).view(-1, VOCAB), y.view(-1)).item() for x, y in loader]
+print(sum(means) / len(means))</code></pre>
+</div>
+
+<div class="code" data-lang="text">
+<pre><code>(2.260709726357762, 9.589892951862025, 79)
+(2.2607096901422814, 9.58989260455945)
+(2.2607097384295884, 9.58989306762955)
+2.307417154312134</code></pre>
+</div>
+
+<p>All three correct versions agree to 7 digits (the rest is float32 summation order). Averaging per-batch means gives 2.3074, because the last batch has 3 names and fewer tokens but counts as much as the full ones. The bug is invisible unless you compare.</p>
+
+<h2 id="full-script">The complete script</h2>
+
+<p>Everything so far, in one file you can paste and run. The model is microgpt's <code>FastMicroGPT</code> with a batch dimension: the same architecture as Chapter 6's <code>GPT</code>, written as one compact class so the file stands alone. Same 4,192 parameters, the same <code>N(0, 0.08)</code> initialisation, <code>F.rms_norm</code> with no gain, and <code>scaled_dot_product_attention(is_causal=True)</code> in place of the hand-written causal mask and softmax. The query, key and value weights are stacked into one <code>Linear(16, 48)</code>, which is the same 768 numbers. The names are inline, so there is no download. Like microgpt, it reads <code>STEPS</code> and <code>LR</code> from the environment.</p>
+
+<div class="code" data-lang="python">
+<div class="code-hdr"><span class="lang">python</span><span class="title">train_names.py</span></div>
+<pre><code>import math
+import os
+import time
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
+
+NAMES = """emma olivia ava isabella sophia mia charlotte amelia harper evelyn abigail
+emily elizabeth sofia avery ella scarlett grace chloe victoria riley aria lily aubrey
+zoey penelope lillian addison layla natalie camila hannah brooklyn zoe nora leah
+savannah audrey claire eleanor skylar ellie samantha stella paisley violet mila
+allison alexa anna hazel aaliyah ariana lucy caroline sarah genesis kennedy sadie
+gabriella madelyn adeline maya autumn aurora piper hailey arianna kaylee ruby serenity
+eva naomi nevaeh alice luna bella quinn lydia peyton melanie kylie aubree mackenzie
+kinsley cora julia taylor katherine madeline gianna eliana elena vivian willow""".split()
+
+BOS = 26             # a-z are 0..25; BOS marks both start and end, as in microgpt
+VOCAB = 27
+BLOCK = 16
+IGNORE = -100        # F.cross_entropy's default ignore_index
+
+
+def encode(name):
+    return [BOS] + [ord(ch) - ord("a") for ch in name] + [BOS]
+
+
+class NamesDataset(Dataset):
+    def __init__(self, names):
+        self.names = names
+
+    def __len__(self):
+        return len(self.names)
+
+    def __getitem__(self, i):
+        ids = encode(self.names[i])[: BLOCK + 1]
+        return torch.tensor(ids[:-1]), torch.tensor(ids[1:])   # (input, target)
+
+
+def collate(batch):
+    """Pad a list of (input, target) pairs to the longest one in the batch."""
+    T = max(len(x) for x, _ in batch)
+    inputs = torch.full((len(batch), T), BOS, dtype=torch.long)
+    targets = torch.full((len(batch), T), IGNORE, dtype=torch.long)
+    for row, (x, y) in enumerate(batch):
+        inputs[row, : len(x)] = x
+        targets[row, : len(y)] = y
+    return inputs, targets
+
+
+class MicroGPT(nn.Module):
+    """microgpt's FastMicroGPT, batched: (B, T) ids -&gt; (B, T, 27) logits."""
+
+    def __init__(self, d=16, heads=4):
+        super().__init__()
+        self.heads = heads
+        self.tok = nn.Embedding(VOCAB, d)
+        self.pos = nn.Embedding(BLOCK, d)
+        self.qkv = nn.Linear(d, 3 * d, bias=False)    # query, key, value weights stacked
+        self.proj = nn.Linear(d, d, bias=False)       # attention_output_weights
+        self.up = nn.Linear(d, 4 * d, bias=False)     # mlp_expand_weights
+        self.down = nn.Linear(4 * d, d, bias=False)   # mlp_contract_weights
+        self.head = nn.Linear(d, VOCAB, bias=False)   # language_model_head_weights
+        for p in self.parameters():
+            nn.init.normal_(p, mean=0.0, std=0.08)    # microgpt's random.gauss(0, 0.08)
+
+    def forward(self, idx):
+        B, T = idx.shape
+        d = self.tok.embedding_dim
+        x = self.tok(idx) + self.pos(torch.arange(T, device=idx.device))
+        h = F.rms_norm(x, (d,), eps=1e-5)
+        q, k, v = self.qkv(h).split(d, dim=-1)
+        q, k, v = (t.view(B, T, self.heads, -1).transpose(1, 2) for t in (q, k, v))
+        a = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        x = x + self.proj(a.transpose(1, 2).reshape(B, T, d))
+        h = F.rms_norm(x, (d,), eps=1e-5)
+        x = x + self.down(F.relu(self.up(h)))
+        return self.head(x)
+
+
+@torch.no_grad()
+def evaluate(model, loader):
+    model.eval()
+    total_loss, total_tokens = 0.0, 0
+    for inputs, targets in loader:
+        logits = model(inputs)
+        total_loss += F.cross_entropy(
+            logits.view(-1, VOCAB), targets.view(-1), reduction="sum"
+        ).item()
+        total_tokens += (targets != IGNORE).sum().item()
+    model.train()
+    avg = total_loss / total_tokens
+    return avg, math.exp(avg)
+
+
+@torch.no_grad()
+def sample(model, generator, max_len=BLOCK):
+    model.eval()
+    ids = [BOS]
+    while len(ids) &lt; max_len:
+        logits = model(torch.tensor([ids]))[0, -1]
+        nxt = torch.multinomial(F.softmax(logits, dim=-1), 1, generator=generator).item()
+        if nxt == BOS:
+            break
+        ids.append(nxt)
+    model.train()
+    return "".join(chr(ord("a") + i) for i in ids[1:])
+
+
+def train(total_steps=200, peak_lr=3e-3, verbose=True):
+    log = print if verbose else (lambda *args: None)
+    warmup, log_every = total_steps // 20, max(1, total_steps // 8)
+
+    torch.manual_seed(0)
+    train_names, val_names = NAMES[:84], NAMES[84:]
+    loader_gen = torch.Generator().manual_seed(0)
+    train_loader = DataLoader(NamesDataset(train_names), batch_size=12, shuffle=True,
+                              collate_fn=collate, drop_last=True, generator=loader_gen)
+    val_loader = DataLoader(NamesDataset(val_names), batch_size=12, collate_fn=collate)
+
+    model = MicroGPT()
+    log(f"parameters: {sum(p.numel() for p in model.parameters())}")
+    optimizer = torch.optim.AdamW(model.parameters(), lr=peak_lr, betas=(0.85, 0.99),
+                                  eps=1e-8, weight_decay=0.0)
+
+    def lr_factor(step):                       # warmup, then cosine down to 10%
+        if step &lt; warmup:
+            return (step + 1) / warmup
+        progress = (step - warmup) / (total_steps - warmup)
+        return 0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * progress))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_factor)
+    log(f"step    0  val {evaluate(model, val_loader)[0]:.4f}  (ln 27 = {math.log(27):.4f})")
+
+    step, t0 = 0, time.perf_counter()
+    model.train()
+    while step &lt; total_steps:
+        for inputs, targets in train_loader:              # one pass = one epoch
+            logits = model(inputs)                        # (B, T, 27)
+            loss = F.cross_entropy(logits.view(-1, VOCAB), targets.view(-1))
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            scheduler.step()
+            step += 1
+            if step % log_every == 0:
+                val_loss, val_ppl = evaluate(model, val_loader)
+                log(f"step {step:4d}  train {loss.item():.4f}  val {val_loss:.4f}"
+                    f"  ppl {val_ppl:5.2f}  grad_norm {grad_norm.item():.3f}")
+            if step == total_steps:
+                break
+    log(f"trained {total_steps} steps in {time.perf_counter() - t0:.1f}s")
+    return model
+
+
+def main():
+    model = train(int(os.environ.get("STEPS", "200")), float(os.environ.get("LR", "3e-3")))
+    g = torch.Generator().manual_seed(42)
+    print("samples:", " ".join(sample(model, g) for _ in range(8)))
+
+
+if __name__ == "__main__":
+    main()</code></pre>
+</div>
+
+<div class="code terminal" data-lang="sh">
+<pre><code>$ python train_names.py
+parameters: 4192
+step    0  val 3.3043  (ln 27 = 3.2958)
+step   25  train 2.6363  val 2.7095  ppl 15.02  grad_norm 0.768
+step   50  train 2.3929  val 2.4188  ppl 11.23  grad_norm 1.003
+step   75  train 2.1818  val 2.3359  ppl 10.34  grad_norm 0.993
+step  100  train 2.1732  val 2.3238  ppl 10.21  grad_norm 0.986
+step  125  train 1.9943  val 2.2930  ppl  9.90  grad_norm 1.204
+step  150  train 2.0503  val 2.2614  ppl  9.60  grad_norm 1.127
+step  175  train 1.8620  val 2.2628  ppl  9.61  grad_norm 1.107
+step  200  train 1.9573  val 2.2607  ppl  9.59  grad_norm 1.319
+trained 200 steps in 0.2s
+samples: auvie pnlatannn roley naroe tlia mema kelia arioa</code></pre>
+</div>
+
+<p>The 0.2 s was measured on an Apple Silicon laptop CPU; yours will differ, but the whole script including the torch import runs in a few seconds. Every random choice is seeded, so rerunning on the same machine prints exactly these numbers; on a different CPU or torch version the last digits may differ. Validation loss falls from 3.30 to 2.26 (perplexity 27 to 9.6) on 84 training names. The samples are name-shaped but not names: 84 names is very little data.</p>
+
+<h2 id="sanity">Sanity checks</h2>
+
+<p>Before trusting a long run, check three things. Each takes seconds and catches a whole class of bugs.</p>
+
+<h4>1. The first loss is about <code>ln(vocab)</code></h4>
+
+<p>Step 0 above prints val 3.3043 against <code>ln 27 = 3.2958</code>. If it were 8 or 20, the initial logits are far too large (Chapter 7, the <code>ln(C)</code> baseline). If it were 0.5 before any training, the model can see the answer: typically the causal mask is missing and position <code>t</code> attends to the token it is supposed to predict.</p>
+
+<h4>2. The model can overfit one batch</h4>
+
+<p>Train on one fixed batch over and over. A correct model and loop drive the loss as low as the data allows. If it plateaus high, something between the loss and the weights is broken: a missing <code>zero_grad</code>, a detached tensor, an optimizer built on the wrong parameters, or a target off by one position.</p>
+
+<div class="code" data-lang="python">
+<div class="code-hdr"><span class="lang">python</span><span class="title">overfit_one_batch.py</span></div>
+<pre><code>import math
+import torch
+import torch.nn.functional as F
+from train_names import NamesDataset, MicroGPT, collate, VOCAB
+
+batch_names = ["emma", "olivia", "ava", "isabella"]
+inputs, targets = collate([NamesDataset(batch_names)[i] for i in range(4)])
+n_targets = (targets != -100).sum().item()
+
+torch.manual_seed(0)
+model = MicroGPT()
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-2, weight_decay=0.0)
+for step in range(501):
+    loss = F.cross_entropy(model(inputs).view(-1, VOCAB), targets.view(-1))
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+    if step % 100 == 0:
+        print(f"step {step:3d}  loss {loss.item():.4f}")
+
+# position 0 always sees just BOS, so the first letter is a 1-in-4 guess at best
+floor = 4 * math.log(4) / n_targets
+print(f"{n_targets} targets, floor = 4*ln(4)/{n_targets} = {floor:.4f}")</code></pre>
+</div>
+
+<div class="code" data-lang="text">
+<pre><code>step   0  loss 3.2989
+step 100  loss 0.2222
+step 200  loss 0.2218
+step 300  loss 0.2219
+step 400  loss 0.2218
+step 500  loss 0.2218
+25 targets, floor = 4*ln(4)/25 = 0.2218</code></pre>
+</div>
+
+<p>"Overfit to about 0" has a catch for language models: the first prediction of every name is made from <code>BOS</code> alone, and the four names start with four different letters. No model can do better than probability 1/4 there, which costs <code>ln 4</code> on each of 4 of the 25 targets. The loss lands exactly on that floor of 0.2218, which is the strongest possible evidence that the loop works. With a single name, the loss really does go to about 0 (Exercise 8.3).</p>
+
+<h4>3. The loss curve has a sensible shape</h4>
+
+<p>Run the full script for 600 steps at a higher learning rate: <code>STEPS=600 LR=1e-2 python train_names.py</code>.</p>
+
+<div class="code" data-lang="text">
+<pre><code>step    0  val 3.3043  (ln 27 = 3.2958)
+step   75  train 2.0867  val 2.2177  ppl  9.19  grad_norm 1.322
+step  150  train 1.4117  val 2.7913  ppl 16.30  grad_norm 1.740
+step  225  train 1.0430  val 3.4498  ppl 31.50  grad_norm 1.753
+step  300  train 1.0404  val 4.1507  ppl 63.48  grad_norm 2.042
+step  375  train 1.0165  val 4.8018  ppl 121.73  grad_norm 2.876
+step  450  train 0.6820  val 5.2807  ppl 196.51  grad_norm 1.747
+step  525  train 0.7180  val 5.6487  ppl 283.93  grad_norm 1.908
+step  600  train 0.7495  val 5.7866  ppl 325.90  grad_norm 2.624
+trained 600 steps in 0.5s
+samples: autuv piper gbellann grace addison salen kennedy vikyin</code></pre>
+</div>
+
+<p>Train loss keeps falling while val loss turns around after step 75 and climbs to 5.79, far above the 3.30 of a model that knows nothing. That is <strong>overfitting</strong>: 4,192 parameters memorising 84 names. The samples confirm it: "piper", "grace", "addison" and "kennedy" are training names, copied. The usual curve shapes and what they mean:</p>
+
+<table>
+  <tr><th>what you see</th><th>likely cause</th></tr>
+  <tr><td>Flat at <code>ln(V)</code> from step 0</td><td>No learning: lr far too small, missing <code>optimizer.step()</code>, optimizer holds different tensors than the model, gradients not reaching the weights</td></tr>
+  <tr><td>Starts far above <code>ln(V)</code></td><td>Initialisation too large</td></tr>
+  <tr><td>Falls, then jumps up or becomes <code>nan</code></td><td>lr too high or no warmup; check grad norm spikes just before</td></tr>
+  <tr><td>Train falls, val rises</td><td>Overfitting: more data, fewer steps, weight decay, smaller model, or stop at the best val step (Exercise 8.4)</td></tr>
+  <tr><td>Train and val both stall high</td><td>Model too small, lr too small, or the schedule decayed too early</td></tr>
+  <tr><td>Very noisy train loss</td><td>Batch too small; average over more steps before judging, or use a bigger batch or accumulation</td></tr>
+  <tr><td>Val below train</td><td>Usually fine early (train loss is from a moving model, val from the end of the interval); persistently, check for train/val leakage</td></tr>
+</table>
+
+<h2 id="checkpoints">Checkpoints and resuming</h2>
+
+<p>A <strong>checkpoint</strong> is everything needed to continue training as if it had never stopped. That is more than the weights:</p>
+
+<ul>
+  <li><code>model.state_dict()</code>: the parameters and persistent buffers (Chapter 5).</li>
+  <li><code>optimizer.state_dict()</code>: Adam's <code>exp_avg</code>, <code>exp_avg_sq</code> and <code>step</code> for every parameter, plus the param groups with their current <code>lr</code>.</li>
+  <li><code>scheduler.state_dict()</code>: where the schedule is.</li>
+  <li>The step counter, and the <strong>random number generator states</strong>: the data-order generator, and <code>torch.get_rng_state()</code> for anything else random in the loop (dropout, sampling).</li>
+</ul>
+
+<p>The test of a checkpoint is simple: run 20 steps straight; separately run 10, save, throw every object away, rebuild from scratch, load, run 10 more. The losses must be <strong>identical</strong>, not close. To make the data resumable, this demo draws each batch with <code>torch.randint</code> from its own generator, whose state goes in the checkpoint.</p>
+
+<div class="code" data-lang="python">
+<div class="code-hdr"><span class="lang">python</span><span class="title">resume_check.py</span></div>
+<pre><code>import torch
+import torch.nn.functional as F
+from train_names import NAMES, NamesDataset, MicroGPT, collate, VOCAB
+
+dataset = NamesDataset(NAMES[:84])
+
+def get_batch(gen, batch_size=12):          # random batch, driven by its own generator
+    idx = torch.randint(len(dataset), (batch_size,), generator=gen)
+    return collate([dataset[i] for i in idx.tolist()])
+
+def make_run():
+    torch.manual_seed(0)
+    model = MicroGPT()
+    opt = torch.optim.AdamW(model.parameters(), lr=3e-3, betas=(0.85, 0.99), weight_decay=0.1)
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: 1.0 - s / 20)
+    gen = torch.Generator().manual_seed(1)
+    return model, opt, sched, gen
+
+def train_steps(model, opt, sched, gen, start, end):
+    losses = []
+    for step in range(start, end):
+        inputs, targets = get_batch(gen)
+        loss = F.cross_entropy(model(inputs).view(-1, VOCAB), targets.view(-1))
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        sched.step()
+        losses.append(round(loss.item(), 6))
+    return losses
+
+# Run A: 20 steps without stopping
+straight = train_steps(*make_run(), 0, 20)
+
+# Run B: 10 steps, save, throw everything away, rebuild, load, 10 more
+model, opt, sched, gen = make_run()
+resumed = train_steps(model, opt, sched, gen, 0, 10)
+torch.save({
+    "model": model.state_dict(),
+    "optimizer": opt.state_dict(),
+    "scheduler": sched.state_dict(),
+    "step": 10,
+    "data_rng": gen.get_state(),
+    "torch_rng": torch.get_rng_state(),
+}, "ckpt.pt")
+del model, opt, sched, gen
+
+model, opt, sched, gen = make_run()          # fresh objects in their step-0 state
+ckpt = torch.load("ckpt.pt", weights_only=True)
+model.load_state_dict(ckpt["model"])
+opt.load_state_dict(ckpt["optimizer"])
+sched.load_state_dict(ckpt["scheduler"])
+gen.set_state(ckpt["data_rng"])
+torch.set_rng_state(ckpt["torch_rng"])
+resumed += train_steps(model, opt, sched, gen, ckpt["step"], 20)
+
+print(straight[9:13])
+print(resumed[9:13])
+print("identical:", straight == resumed)
+
+# Run C: same, but "forget" the optimizer state
+model, opt, sched, gen = make_run()
+model.load_state_dict(ckpt["model"])
+sched.load_state_dict(ckpt["scheduler"])
+gen.set_state(ckpt["data_rng"])
+print(train_steps(model, opt, sched, gen, 10, 13))</code></pre>
+</div>
+
+<div class="code" data-lang="text">
+<pre><code>[3.130078, 3.147485, 3.135179, 3.101751]
+[3.130078, 3.147485, 3.135179, 3.101751]
+identical: True
+[3.147485, 3.117953, 3.079063]</code></pre>
+</div>
+
+<p>Run C loads the weights but builds a fresh optimizer: step 10's loss matches (it is computed before any update) and then the run diverges. A fresh Adam has zero moments, and its <code>param_groups</code> carry the initial lr instead of the decayed one. This is the bug you get from saving only <code>model.state_dict()</code>.</p>
+
+<p>Resuming a <code>DataLoader</code> mid-epoch takes one more idea: make each epoch's order depend only on the epoch number, then skip the batches already done. Exercise 8.5 does exactly that.</p>
+
+<h4><code>torch.load</code> and <code>weights_only</code></h4>
+
+<p><code>torch.save</code> uses Python's <strong>pickle</strong> format, and unpickling an arbitrary file can run arbitrary code. Since PyTorch 2.6, <code>torch.load</code> defaults to <code>weights_only=True</code>: it only rebuilds tensors, primitive types (int, float, str, bool, None), and dicts, lists and tuples of them. Everything a normal checkpoint holds fits, including microgpt's own checkpoint (its <code>character_to_id</code> and <code>config</code> are plain dicts), so microgpt's <code>weights_only=False</code> is not actually needed. Anything else fails with a long message whose start is:</p>
+
+<div class="code" data-lang="python">
+<pre><code>import random
+import numpy as np
+import torch
+
+# everything microgpt puts in its checkpoint: tensors, dicts, ints, strings
+torch.save({
+    "model_state_dict": {"w": torch.zeros(2, 2)},
+    "training_steps": 20,
+    "character_to_id": {"a": 0, "b": 1},
+    "config": {"vocabulary_size": 27, "embedding_size": 16},
+    "python_rng": random.getstate(),
+}, "plain.pt")
+print(sorted(torch.load("plain.pt").keys()))            # weights_only=True is the default
+# ['character_to_id', 'config', 'model_state_dict', 'python_rng', 'training_steps']
+
+torch.save({"numpy_rng": np.random.get_state()}, "numpy.pt")
+torch.load("numpy.pt")</code></pre>
+</div>
+
+<div class="code" data-lang="text">
+<pre><code>_pickle.UnpicklingError: Weights only load failed. This file can still be loaded, to do so you have two options, do those steps only if you trust the source of the checkpoint.
+	(1) In PyTorch 2.6, we changed the default value of the `weights_only` argument in `torch.load` from `False` to `True`. Re-running `torch.load` with `weights_only` set to `False` will likely succeed, but it can result in arbitrary code execution. Do it only if you got the file from a trusted source.
+	(2) Alternatively, to load with `weights_only=True` please check the recommended steps in the following error message.
+	WeightsUnpickler error: Unsupported global: GLOBAL numpy._core.multiarray._reconstruct was not an allowed global by default. ...</code></pre>
+</div>
+
+<p>Rules of thumb: keep checkpoints to tensors and plain Python types; load your own files with the default; pass <code>weights_only=False</code> only for files you made yourself; never for a downloaded one. Pass <code>map_location="cpu"</code> (or a device) to load a checkpoint saved on a GPU onto a machine without one, as microgpt does with <code>map_location=device</code>.</p>
+
+<h2 id="reproducibility">Reproducibility</h2>
+
+<p><code>torch.manual_seed(s)</code> seeds PyTorch's generator on every device (CPU, and each CUDA GPU). That covers weight initialisation, <code>torch.randint</code>, dropout and <code>torch.multinomial</code> sampling, unless you pass an explicit <code>generator=</code>. Python's <code>random</code> and NumPy have their own generators: seed them separately if you use them, as microgpt does with <code>random.seed(42)</code>.</p>
+
+<p>Seeds make the <em>inputs</em> to every operation the same; they do not promise that every <em>operation</em> is deterministic. Some GPU kernels use atomic additions whose order varies from run to run, so the float rounding varies. <code>torch.use_deterministic_algorithms(True)</code> tells PyTorch to choose deterministic implementations and to raise a <code>RuntimeError</code> for any op that has none (the docs list examples such as <code>torch.histc</code> on a CUDA tensor). On CUDA it also requires the environment variable <code>CUBLAS_WORKSPACE_CONFIG=:4096:8</code> (or <code>:16:8</code>), otherwise even <code>torch.mm</code> raises. Add <code>torch.backends.cudnn.benchmark = False</code> so cuDNN does not pick its algorithm by timing. All of that needs a CUDA GPU; on CPU, the check below simply passes.</p>
+
+<div class="code" data-lang="python">
+<pre><code>import torch
+from train_names import train
+
+torch.use_deterministic_algorithms(True)
+a = train(50, 3e-3, verbose=False)
+b = train(50, 3e-3, verbose=False)
+print(all(torch.equal(p, q) for p, q in zip(a.parameters(), b.parameters())))   # True
+print(torch.are_deterministic_algorithms_enabled())                            # True</code></pre>
+</div>
+
+<p>Two runs of 50 steps produce bit-identical weights (<code>torch.equal</code>, not <code>allclose</code>), because <code>train()</code> seeds the model and the loader's generator. With <code>num_workers &gt; 0</code>, each worker's torch generator is seeded from the loader's generator automatically, but NumPy and <code>random</code> inside workers are not; the DataLoader docs show a <code>worker_init_fn</code> that seeds them from <code>torch.initial_seed()</code>. Determinism has a cost (some deterministic kernels are slower), so many teams turn it on only when chasing a bug.</p>
+
+<h2 id="grad-accum">Gradient accumulation</h2>
+
+<p>Suppose the batch you want does not fit in memory. Because gradients add up across <code>backward()</code> calls (Chapter 4), you can run several small <strong>micro-batches</strong>, call <code>backward()</code> on each, and step once. That is <strong>gradient accumulation</strong>: the same gradient as one big batch, at the memory cost of a small one.</p>
+
+<p>The loss must be scaled so the accumulated gradient equals the big-batch gradient. The common recipe is "divide each micro-batch loss by the number of micro-batches <code>K</code>". That is exact only when every micro-batch has the same number of real tokens. With padded names it does not:</p>
+
+<div class="code" data-lang="python">
+<div class="code-hdr"><span class="lang">python</span><span class="title">accumulate.py</span></div>
+<pre><code>import torch
+import torch.nn.functional as F
+from train_names import NAMES, NamesDataset, MicroGPT, collate, VOCAB
+
+ds = NamesDataset(NAMES)
+big = [ds[i] for i in range(8)]                 # 8 names of different lengths
+micro = [big[:4], big[4:]]                      # 2 micro-batches of 4
+
+def grads(model):
+    return torch.cat([p.grad.flatten() for p in model.parameters()])
+
+def fresh():
+    torch.manual_seed(0)
+    return MicroGPT()
+
+# reference: one batch of 8
+m = fresh()
+x, y = collate(big)
+F.cross_entropy(m(x).view(-1, VOCAB), y.view(-1)).backward()
+ref = grads(m)
+
+# accumulate, dividing each micro-batch's mean loss by the number of micro-batches
+m = fresh()
+for chunk in micro:
+    x, y = collate(chunk)
+    (F.cross_entropy(m(x).view(-1, VOCAB), y.view(-1)) / len(micro)).backward()
+print("divide by K:      ", (grads(m) - ref).abs().max().item())
+
+# accumulate summed losses, divide by the TOTAL number of real target tokens
+m = fresh()
+n_tokens = sum((collate(chunk)[1] != -100).sum().item() for chunk in micro)
+for chunk in micro:
+    x, y = collate(chunk)
+    (F.cross_entropy(m(x).view(-1, VOCAB), y.view(-1), reduction="sum") / n_tokens).backward()
+print("divide by tokens: ", (grads(m) - ref).abs().max().item())
+print([ (collate(c)[1] != -100).sum().item() for c in micro ], ref.abs().max().item())</code></pre>
+</div>
+
+<div class="code" data-lang="text">
+<pre><code>divide by K:       0.0010072654113173485
+divide by tokens:  5.587935447692871e-09
+[25, 28] 0.04060910642147064</code></pre>
+</div>
+
+<p>The micro-batches hold 25 and 28 real tokens. Dividing by <code>K = 2</code> gives the first 25 tokens slightly more weight than the big batch does; the error is about 2.5% of the largest gradient. Summing and dividing by the total token count matches to float rounding. In a training loop: count the real tokens of all <code>K</code> micro-batches first (cheap, it is just the targets), then backward each with <code>reduction="sum"</code> divided by that count, then clip and step once.</p>
+
+<div class="callout pitfall">
+<div class="callout-title">Things that break accumulation</div>
+<p>Calling <code>zero_grad()</code> inside the micro-batch loop (it erases what you accumulated). Clipping per micro-batch instead of once on the total. Stepping the scheduler per micro-batch instead of per optimizer step. And layers that compute statistics across the batch (batch norm) see small batches, which accumulation cannot fix; transformers use RMSNorm or LayerNorm, which work per token, so they are unaffected.</p>
+</div>
+
+<h2 id="exercises">Exercises</h2>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 8.1</span>
+  <span class="exercise-diff easy">easy</span>
+  <span class="exercise-title">A collate function that also returns lengths</span>
+</div>
+<div class="exercise-body">
+<p>Write <code>collate_with_lengths(batch, pad_id=0)</code>: like <code>collate</code>, but the input pad value is a parameter, and it also returns a <code>(B,)</code> tensor of real lengths. Build a boolean <code>(B, T)</code> mask of real positions from the lengths with broadcasting, and assert it equals <code>targets != -100</code>. Test on "mia", "ella", "zoe".</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<div class="code" data-lang="python">
+<pre><code>import torch
+
+BOS, IGNORE = 26, -100
+
+def encode(name):
+    return [BOS] + [ord(ch) - ord("a") for ch in name] + [BOS]
+
+def collate_with_lengths(batch, pad_id=0):
+    lengths = torch.tensor([len(x) for x, _ in batch])
+    T = int(lengths.max())
+    inputs = torch.full((len(batch), T), pad_id, dtype=torch.long)
+    targets = torch.full((len(batch), T), IGNORE, dtype=torch.long)
+    for row, (x, y) in enumerate(batch):
+        inputs[row, : len(x)] = x
+        targets[row, : len(y)] = y
+    return inputs, targets, lengths
+
+pairs = []
+for name in ["mia", "ella", "zoe"]:
+    ids = encode(name)
+    pairs.append((torch.tensor(ids[:-1]), torch.tensor(ids[1:])))
+inputs, targets, lengths = collate_with_lengths(pairs)
+print(inputs)
+print(targets)
+print(lengths)
+mask = torch.arange(inputs.shape[1])[None, :] &lt; lengths[:, None]   # (B, T) real positions
+assert torch.equal(mask, targets != IGNORE)
+print(mask.sum().item())</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>tensor([[26, 12,  8,  0,  0],
+        [26,  4, 11, 11,  0],
+        [26, 25, 14,  4,  0]])
+tensor([[  12,    8,    0,   26, -100],
+        [   4,   11,   11,    0,   26],
+        [  25,   14,    4,   26, -100]])
+tensor([4, 5, 4])
+13</code></pre>
+</div>
+<p>The mask line is broadcasting from Chapter 3: <code>(1, T)</code> against <code>(B, 1)</code> gives <code>(B, T)</code>. Note that pad id 0 is also the letter "a"; that is harmless, because pad positions are never scored and never attended to by real positions.</p>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 8.2</span>
+  <span class="exercise-diff easy">easy</span>
+  <span class="exercise-title">Prove the pad inputs do not matter</span>
+</div>
+<div class="exercise-body">
+<p>Collate "ava" and "isabella". Compute the loss of an untrained <code>MicroGPT</code>, then replace every input token at a pad position with a random letter and compute it again. Explain why it does not change.</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<div class="code" data-lang="python">
+<pre><code>import torch
+import torch.nn.functional as F
+from train_names import NamesDataset, MicroGPT, collate, VOCAB
+
+torch.manual_seed(0)
+model = MicroGPT()
+inputs, targets = collate([NamesDataset(["ava", "isabella"])[i] for i in range(2)])
+pad = targets == -100
+
+def loss_of(x):
+    return F.cross_entropy(model(x).view(-1, VOCAB), targets.view(-1)).item()
+
+before = loss_of(inputs)
+scrambled = inputs.clone()
+scrambled[pad] = torch.randint(0, 26, (int(pad.sum()),))   # random letters in the pad slots
+print(inputs[0], scrambled[0], sep="\n")
+print(before, loss_of(scrambled))</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>tensor([26,  0, 21,  0, 26, 26, 26, 26, 26])
+tensor([26,  0, 21,  0, 18,  8,  1,  9, 13])
+3.290372610092163 3.290372610092163</code></pre>
+</div>
+<p>Pads sit after the real tokens. Causal attention lets a real position see only itself and earlier positions, so no real position ever reads a pad. The pad positions' own outputs change, but their targets are <code>-100</code>, so they are not in the loss. The loss is bit-identical.</p>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 8.3</span>
+  <span class="exercise-diff medium">medium</span>
+  <span class="exercise-title">Overfit a single name</span>
+</div>
+<div class="exercise-body">
+<p>Train a fresh <code>MicroGPT</code> on the single name "isabella" for 300 steps with AdamW at <code>lr=1e-2</code> and no weight decay, printing the loss to 6 decimals every 100 steps. Why does this reach about 0 when the 4-name batch could not?</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<div class="code" data-lang="python">
+<pre><code>import torch
+import torch.nn.functional as F
+from train_names import NamesDataset, MicroGPT, collate, VOCAB
+
+inputs, targets = collate([NamesDataset(["isabella"])[0]])
+torch.manual_seed(0)
+model = MicroGPT()
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-2, weight_decay=0.0)
+for step in range(301):
+    loss = F.cross_entropy(model(inputs).view(-1, VOCAB), targets.view(-1))
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+    if step % 100 == 0:
+        print(f"step {step:3d}  loss {loss.item():.6f}")</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>step   0  loss 3.285538
+step 100  loss 0.000009
+step 200  loss 0.000005
+step 300  loss 0.000003</code></pre>
+</div>
+<p>With one name, every context has exactly one correct continuation, including the very first prediction from <code>BOS</code>. With four names starting with four letters, the <code>BOS</code> context has four valid continuations, so the best possible probability there is 1/4. The floor is set by the data, not the model.</p>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 8.4</span>
+  <span class="exercise-diff medium">medium</span>
+  <span class="exercise-title">Keep the best checkpoint</span>
+</div>
+<div class="exercise-body">
+<p>Reproduce the overfitting run (600 steps, <code>lr=1e-2</code>, no schedule is fine) and evaluate every 25 steps. Save a checkpoint whenever val loss improves. Report the best step, and show that reloading the best checkpoint gives back its val loss.</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<div class="code" data-lang="python">
+<pre><code>import torch
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from train_names import NAMES, NamesDataset, MicroGPT, collate, evaluate, VOCAB
+
+torch.manual_seed(0)
+train_loader = DataLoader(NamesDataset(NAMES[:84]), batch_size=12, shuffle=True,
+                          collate_fn=collate, drop_last=True,
+                          generator=torch.Generator().manual_seed(0))
+val_loader = DataLoader(NamesDataset(NAMES[84:]), batch_size=12, collate_fn=collate)
+model = MicroGPT()
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-2, betas=(0.85, 0.99), weight_decay=0.0)
+
+best_val, best_step, step = float("inf"), 0, 0
+while step &lt; 600:
+    for inputs, targets in train_loader:
+        loss = F.cross_entropy(model(inputs).view(-1, VOCAB), targets.view(-1))
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        step += 1
+        if step % 25 == 0:
+            val_loss, _ = evaluate(model, val_loader)
+            if val_loss &lt; best_val:
+                best_val, best_step = val_loss, step
+                torch.save({"model": model.state_dict(), "step": step}, "best.pt")
+        if step == 600:
+            break
+
+print(f"best val {best_val:.4f} at step {best_step}; final val {evaluate(model, val_loader)[0]:.4f}")
+model.load_state_dict(torch.load("best.pt")["model"])
+print(f"reloaded best: val {evaluate(model, val_loader)[0]:.4f}")</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>best val 2.2931 at step 50; final val 4.5978
+reloaded best: val 2.2931</code></pre>
+</div>
+<p>This is <strong>early stopping</strong>: keep the weights from the step where val loss was lowest. Real runs save "latest" (for resuming) and "best" (for using) as separate files.</p>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 8.5</span>
+  <span class="exercise-diff hard">hard</span>
+  <span class="exercise-title">Resume a <code>DataLoader</code> run mid-epoch, exactly</span>
+</div>
+<div class="exercise-body">
+<p>With 84 names and <code>batch_size=12, drop_last=True</code>, an epoch is 7 batches. Write a loop that trains 20 steps with a shuffled <code>DataLoader</code>, and a resumed version that stops after step 10 (in the middle of the second epoch), saves model and optimizer, rebuilds both from scratch, and continues to step 20. The two loss sequences must be identical. Hint: make each epoch's shuffle depend only on the epoch number.</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<div class="code" data-lang="python">
+<pre><code>import torch
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from train_names import NAMES, NamesDataset, MicroGPT, collate, VOCAB
+
+dataset = NamesDataset(NAMES[:84])
+BATCHES_PER_EPOCH = len(dataset) // 12                 # 7 with drop_last=True
+
+def make_run():
+    torch.manual_seed(0)
+    model = MicroGPT()
+    opt = torch.optim.AdamW(model.parameters(), lr=3e-3, betas=(0.85, 0.99))
+    return model, opt
+
+def run(model, opt, start_step, end_step):
+    losses, step = [], start_step
+    while step &lt; end_step:
+        epoch, skip = divmod(step, BATCHES_PER_EPOCH)
+        gen = torch.Generator().manual_seed(1000 + epoch)    # order depends only on epoch
+        loader = DataLoader(dataset, batch_size=12, shuffle=True, collate_fn=collate,
+                            drop_last=True, generator=gen)
+        for i, (inputs, targets) in enumerate(loader):
+            if i &lt; skip:
+                continue                                      # already trained on these
+            loss = F.cross_entropy(model(inputs).view(-1, VOCAB), targets.view(-1))
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            losses.append(round(loss.item(), 6))
+            step += 1
+            if step == end_step:
+                break
+    return losses
+
+straight = run(*make_run(), 0, 20)
+
+model, opt = make_run()
+resumed = run(model, opt, 0, 10)                              # stops mid-epoch 1
+torch.save({"model": model.state_dict(), "opt": opt.state_dict(), "step": 10}, "mid.pt")
+model, opt = make_run()
+ckpt = torch.load("mid.pt")
+model.load_state_dict(ckpt["model"])
+opt.load_state_dict(ckpt["opt"])
+resumed += run(model, opt, ckpt["step"], 20)
+print(straight == resumed, straight[8:12])
+# True [3.130168, 3.033649, 3.067718, 2.956724]</code></pre>
+</div>
+<p>The only state the data pipeline needs is the step number: epoch and position within it follow from <code>divmod</code>. Skipping batches still runs <code>__getitem__</code> and collate for them, which is fine for small data; for large datasets, a custom sampler that starts at an offset avoids that work, and the separate <code>torchdata</code> package offers a <code>StatefulDataLoader</code> with its own <code>state_dict()</code>.</p>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 8.6</span>
+  <span class="exercise-diff hard">hard</span>
+  <span class="exercise-title">Accumulation equals the big batch, through an AdamW step</span>
+</div>
+<div class="exercise-body">
+<p>Take 12 names. Model A takes one AdamW step (<code>lr=1e-2, weight_decay=0.1</code>) on all 12 as one batch. Model B, from the same initial weights, accumulates gradients over three micro-batches of 4 and then takes one step. Make the parameters after the step match to about 1e-8.</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<div class="code" data-lang="python">
+<pre><code>import torch
+import torch.nn.functional as F
+from train_names import NAMES, NamesDataset, MicroGPT, collate, VOCAB
+
+ds = NamesDataset(NAMES)
+big = [ds[i] for i in range(12)]
+micro = [big[0:4], big[4:8], big[8:12]]
+
+def fresh():
+    torch.manual_seed(0)
+    model = MicroGPT()
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-2, weight_decay=0.1)
+    return model, opt
+
+# one optimizer step on the full batch of 12
+model_a, opt_a = fresh()
+x, y = collate(big)
+opt_a.zero_grad()
+F.cross_entropy(model_a(x).view(-1, VOCAB), y.view(-1)).backward()
+opt_a.step()
+
+# one optimizer step from 3 accumulated micro-batches
+model_b, opt_b = fresh()
+n_tokens = sum((collate(c)[1] != -100).sum().item() for c in micro)
+opt_b.zero_grad()
+for chunk in micro:
+    x, y = collate(chunk)
+    loss = F.cross_entropy(model_b(x).view(-1, VOCAB), y.view(-1), reduction="sum") / n_tokens
+    loss.backward()                                  # grads add up across micro-batches
+opt_b.step()
+
+diff = max((p - q).abs().max().item() for p, q in zip(model_a.parameters(), model_b.parameters()))
+print(f"max parameter difference: {diff:.1e}")
+# max parameter difference: 1.5e-08</code></pre>
+</div>
+<p>Note that the micro-batches are padded to their own longest name, not the big batch's, so they hold fewer pad slots; it does not matter, because pads contribute nothing. Exactly one <code>zero_grad</code> before the loop and one <code>step</code> after it.</p>
+</div>
+</details>
+</div>
+</div>
+
+<h2 id="recap">Recap</h2>
+<ul>
+  <li>Batches turn <code>(T,)</code> into <code>(B, T)</code>. Encode with <code>BOS</code> on both ends, shift by one for targets, right-pad inputs with any valid id and targets with <code>-100</code>. Causal attention plus <code>ignore_index</code> makes pads harmless.</li>
+  <li><code>Dataset</code> = <code>__len__</code> + <code>__getitem__</code>; <code>DataLoader</code> batches it. Variable-length data needs a <code>collate_fn</code>. Use <code>shuffle=True</code> with a seeded <code>generator</code> for training, <code>drop_last</code> for equal batches.</li>
+  <li><code>num_workers &gt; 0</code> on macOS means <code>spawn</code>: guard with <code>if __name__ == "__main__":</code>, keep dataset and collate at top level, and expect seconds of startup.</li>
+  <li>The loop: <code>train()</code>, forward, loss, <code>zero_grad</code>, <code>backward</code>, clip, <code>optimizer.step()</code>, <code>scheduler.step()</code>, log every N steps.</li>
+  <li>Eval: <code>eval()</code>, <code>no_grad</code>/<code>inference_mode</code>, sum losses and divide by real tokens; perplexity is <code>exp(loss)</code>. Averaging batch means is subtly wrong.</li>
+  <li>Sanity checks: first loss ≈ <code>ln(V)</code>; overfit one batch down to the data's floor; read the train/val curves.</li>
+  <li>Checkpoints hold model, optimizer, scheduler, step and RNG states; a correct resume reproduces the losses exactly. <code>torch.load</code> defaults to <code>weights_only=True</code> since 2.6.</li>
+  <li>Reproducibility: seed everything, seed the loader's generator, and use <code>use_deterministic_algorithms(True)</code> (plus <code>CUBLAS_WORKSPACE_CONFIG</code> on CUDA) when you need bit-identical runs.</li>
+  <li>Gradient accumulation: backward several micro-batches, step once. With padding, divide summed losses by the total token count, not by <code>K</code>.</li>
+</ul>
+
+<div class="page-nav">
+  <a href="07-losses-optimizers.html"><span class="lbl">← Prev</span><span class="ttl">Losses &amp; Optimizers</span></a>
+  <a href="09-devices-precision.html" class="next"><span class="lbl">Next →</span><span class="ttl">Devices &amp; Precision</span></a>
+</div>
+
+</main>
+</div>
+<script src="../assets/site.js"></script>
+</body>
+</html>

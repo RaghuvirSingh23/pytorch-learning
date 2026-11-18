@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>All Exercises — PyTorch</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<button class="sidebar-toggle" aria-label="Toggle navigation">☰ Menu</button>
+
+<div class="layout">
+<aside class="sidebar">
+  <a href="index.html" class="brand">PyTorch</a>
+  <span class="brand-sub">a deep dive — 2026</span>
+  <nav>
+    <ol>
+      <li><a href="chapters/01-why-pytorch.html">Why PyTorch</a></li>
+      <li><a href="chapters/02-tensors.html">Tensors</a></li>
+      <li><a href="chapters/03-tensor-math.html">Tensor Math &amp; Broadcasting</a></li>
+      <li><a href="chapters/04-autograd.html">Autograd</a></li>
+      <li><a href="chapters/05-nn-module.html">nn.Module</a></li>
+      <li><a href="chapters/06-transformer-blocks.html">Building a Transformer</a></li>
+      <li><a href="chapters/07-losses-optimizers.html">Losses &amp; Optimizers</a></li>
+      <li><a href="chapters/08-training-loop.html">The Training Loop</a></li>
+      <li><a href="chapters/09-devices-precision.html">Devices &amp; Precision</a></li>
+      <li><a href="chapters/10-inference.html">Inference &amp; Sampling</a></li>
+      <li><a href="chapters/11-performance.html">Performance &amp; Profiling</a></li>
+      <li><a href="chapters/12-debugging.html">Debugging PyTorch</a></li>
+      <li><a href="chapters/13-50-questions.html">The 50 Questions</a></li>
+      <li><a href="chapters/14-capstone.html">Capstone Project</a></li>
+    </ol>
+    <div class="extras">
+      <a href="exercises.html">All Exercises</a>
+    </div>
+  </nav>
+  <div class="progress"></div>
+</aside>
+
+<main class="content">
+
+<h1>
+  <span class="chap-num">Index</span>
+  All Exercises
+</h1>
+<p class="lede">
+  Every exercise, indexed by chapter and difficulty. Reading the
+  solutions teaches almost nothing. Typing them, running them, and
+  checking the shapes does.
+</p>
+
+<h2 id="ch1">Ch 1 — Why PyTorch</h2>
+<ul>
+  <li><a href="chapters/01-why-pytorch.html#exercises">EX 1.1</a> <span class="exercise-diff easy">easy</span> — Read your install</li>
+  <li><a href="chapters/01-why-pytorch.html#exercises">EX 1.2</a> <span class="exercise-diff easy">easy</span> — Count one scalar <code>linear</code></li>
+  <li><a href="chapters/01-why-pytorch.html#exercises">EX 1.3</a> <span class="exercise-diff medium">medium</span> — Time a loop against a tensor op</li>
+  <li><a href="chapters/01-why-pytorch.html#exercises">EX 1.4</a> <span class="exercise-diff medium">medium</span> — Rewrite <code>linear</code> with tensors</li>
+  <li><a href="chapters/01-why-pytorch.html#exercises">EX 1.5</a> <span class="exercise-diff medium">medium</span> — Rewrite <code>softmax</code> with tensors</li>
+  <li><a href="chapters/01-why-pytorch.html#exercises">EX 1.6</a> <span class="exercise-diff hard">hard</span> — Count the scalar forward pass</li>
+  <li><a href="chapters/01-why-pytorch.html#exercises">EX 1.7</a> <span class="exercise-diff hard">hard</span> — Tensorize <code>attention_head</code></li>
+</ul>
+
+<h2 id="ch2">Ch 2 — Tensors</h2>
+<ul>
+  <li><a href="chapters/02-tensors.html#exercises">EX 2.1</a> <span class="exercise-diff easy">easy</span> — Predict shape and dtype</li>
+  <li><a href="chapters/02-tensors.html#exercises">EX 2.2</a> <span class="exercise-diff easy">easy</span> — Indexing drill</li>
+  <li><a href="chapters/02-tensors.html#exercises">EX 2.3</a> <span class="exercise-diff medium">medium</span> — Stride puzzles</li>
+  <li><a href="chapters/02-tensors.html#exercises">EX 2.4</a> <span class="exercise-diff medium">medium</span> — A <code>(B, T)</code> batch of names</li>
+  <li><a href="chapters/02-tensors.html#exercises">EX 2.5</a> <span class="exercise-diff medium">medium</span> — Embedding lookup as a matmul</li>
+  <li><a href="chapters/02-tensors.html#exercises">EX 2.6</a> <span class="exercise-diff hard">hard</span> — Split and merge attention heads</li>
+  <li><a href="chapters/02-tensors.html#exercises">EX 2.7</a> <span class="exercise-diff hard">hard</span> — Address arithmetic by hand</li>
+</ul>
+
+<h2 id="ch3">Ch 3 — Tensor Math &amp; Broadcasting</h2>
+<ul>
+  <li><a href="chapters/03-tensor-math.html#exercises">EX 3.1</a> <span class="exercise-diff easy">easy</span> — Shape prediction drill</li>
+  <li><a href="chapters/03-tensor-math.html#exercises">EX 3.2</a> <span class="exercise-diff easy">easy</span> — Reductions on a 2×3 tensor</li>
+  <li><a href="chapters/03-tensor-math.html#exercises">EX 3.3</a> <span class="exercise-diff medium">medium</span> — Broadcasting bug hunt</li>
+  <li><a href="chapters/03-tensor-math.html#exercises">EX 3.4</a> <span class="exercise-diff medium">medium</span> — Stable <code>log_softmax</code> and cross-entropy</li>
+  <li><a href="chapters/03-tensor-math.html#exercises">EX 3.5</a> <span class="exercise-diff medium">medium</span> — RMSNorm with a learnable gain</li>
+  <li><a href="chapters/03-tensor-math.html#exercises">EX 3.6</a> <span class="exercise-diff hard">hard</span> — Attention scores three ways</li>
+  <li><a href="chapters/03-tensor-math.html#exercises">EX 3.7</a> <span class="exercise-diff hard">hard</span> — Matmul from broadcasting</li>
+</ul>
+
+<h2 id="ch4">Ch 4 — Autograd</h2>
+<ul>
+  <li><a href="chapters/04-autograd.html#exercises">EX 4.1</a> <span class="exercise-diff easy">easy</span> — Hand-derive, then check</li>
+  <li><a href="chapters/04-autograd.html#exercises">EX 4.2</a> <span class="exercise-diff easy">easy</span> — Accumulation puzzle</li>
+  <li><a href="chapters/04-autograd.html#exercises">EX 4.3</a> <span class="exercise-diff medium">medium</span> — Your linear() test, as a matrix</li>
+  <li><a href="chapters/04-autograd.html#exercises">EX 4.4</a> <span class="exercise-diff medium">medium</span> — Why is this gradient None?</li>
+  <li><a href="chapters/04-autograd.html#exercises">EX 4.5</a> <span class="exercise-diff medium">medium</span> — The gradient of the correct-token logit</li>
+  <li><a href="chapters/04-autograd.html#exercises">EX 4.6</a> <span class="exercise-diff hard">hard</span> — Write and gradcheck a custom ReLU</li>
+  <li><a href="chapters/04-autograd.html#exercises">EX 4.7</a> <span class="exercise-diff hard">hard</span> — PyTorch as a test oracle for your engine</li>
+</ul>
+
+<h2 id="ch5">Ch 5 — nn.Module</h2>
+<ul>
+  <li><a href="chapters/05-nn-module.html#exercises">EX 5.1</a> <span class="exercise-diff easy">easy</span> — Count parameters in your head</li>
+  <li><a href="chapters/05-nn-module.html#exercises">EX 5.2</a> <span class="exercise-diff easy">easy</span> — Parameter, buffer, or neither?</li>
+  <li><a href="chapters/05-nn-module.html#exercises">EX 5.3</a> <span class="exercise-diff medium">medium</span> — Find and fix the plain-list bug</li>
+  <li><a href="chapters/05-nn-module.html#exercises">EX 5.4</a> <span class="exercise-diff medium">medium</span> — Load a checkpoint after renaming</li>
+  <li><a href="chapters/05-nn-module.html#exercises">EX 5.5</a> <span class="exercise-diff medium">medium</span> — Freeze the embeddings</li>
+  <li><a href="chapters/05-nn-module.html#exercises">EX 5.6</a> <span class="exercise-diff hard">hard</span> — Write your own module registry</li>
+  <li><a href="chapters/05-nn-module.html#exercises">EX 5.7</a> <span class="exercise-diff hard">hard</span> — Resume training exactly</li>
+</ul>
+
+<h2 id="ch6">Ch 6 — Building a Transformer</h2>
+<ul>
+  <li><a href="chapters/06-transformer-blocks.html#exercises">EX 6.1</a> <span class="exercise-diff easy">easy</span> — Shape tracing with distinct sizes</li>
+  <li><a href="chapters/06-transformer-blocks.html#exercises">EX 6.2</a> <span class="exercise-diff medium">medium</span> — Prove the model is causal</li>
+  <li><a href="chapters/06-transformer-blocks.html#exercises">EX 6.3</a> <span class="exercise-diff medium">medium</span> — Forget contiguous()</li>
+  <li><a href="chapters/06-transformer-blocks.html#exercises">EX 6.4</a> <span class="exercise-diff easy">easy</span> — Tying at GPT-2 scale</li>
+  <li><a href="chapters/06-transformer-blocks.html#exercises">EX 6.5</a> <span class="exercise-diff medium">medium</span> — Swap ReLU for SwiGLU</li>
+  <li><a href="chapters/06-transformer-blocks.html#exercises">EX 6.6</a> <span class="exercise-diff hard">hard</span> — Multi-query attention</li>
+  <li><a href="chapters/06-transformer-blocks.html#exercises">EX 6.7</a> <span class="exercise-diff hard">hard</span> — Load FastMicroGPT's weights into GPT</li>
+</ul>
+
+<h2 id="ch7">Ch 7 — Losses &amp; Optimizers</h2>
+<ul>
+  <li><a href="chapters/07-losses-optimizers.html#exercises">EX 7.1</a> <span class="exercise-diff easy">easy</span> — Cross-entropy by hand</li>
+  <li><a href="chapters/07-losses-optimizers.html#exercises">EX 7.2</a> <span class="exercise-diff easy">easy</span> — Know your starting loss</li>
+  <li><a href="chapters/07-losses-optimizers.html#exercises">EX 7.3</a> <span class="exercise-diff medium">medium</span> — Prove that <code>ignore_index</code> masks padding</li>
+  <li><a href="chapters/07-losses-optimizers.html#exercises">EX 7.4</a> <span class="exercise-diff medium">medium</span> — Hand-check one AdamW step</li>
+  <li><a href="chapters/07-losses-optimizers.html#exercises">EX 7.5</a> <span class="exercise-diff medium">medium</span> — Warmup + cosine with real numbers</li>
+  <li><a href="chapters/07-losses-optimizers.html#exercises">EX 7.6</a> <span class="exercise-diff hard">hard</span> — Write <code>apply_adam</code> as a real <code>torch.optim.Optimizer</code></li>
+  <li><a href="chapters/07-losses-optimizers.html#exercises">EX 7.7</a> <span class="exercise-diff hard">hard</span> — Implement <code>clip_grad_norm_</code> yourself</li>
+  <li><a href="chapters/07-losses-optimizers.html#exercises">EX 7.8</a> <span class="exercise-diff hard">hard</span> — Label smoothing from the formula</li>
+</ul>
+
+<h2 id="ch8">Ch 8 — The Training Loop</h2>
+<ul>
+  <li><a href="chapters/08-training-loop.html#exercises">EX 8.1</a> <span class="exercise-diff easy">easy</span> — A collate function that also returns lengths</li>
+  <li><a href="chapters/08-training-loop.html#exercises">EX 8.2</a> <span class="exercise-diff easy">easy</span> — Prove the pad inputs do not matter</li>
+  <li><a href="chapters/08-training-loop.html#exercises">EX 8.3</a> <span class="exercise-diff medium">medium</span> — Overfit a single name</li>
+  <li><a href="chapters/08-training-loop.html#exercises">EX 8.4</a> <span class="exercise-diff medium">medium</span> — Keep the best checkpoint</li>
+  <li><a href="chapters/08-training-loop.html#exercises">EX 8.5</a> <span class="exercise-diff hard">hard</span> — Resume a <code>DataLoader</code> run mid-epoch, exactly</li>
+  <li><a href="chapters/08-training-loop.html#exercises">EX 8.6</a> <span class="exercise-diff hard">hard</span> — Accumulation equals the big batch, through an AdamW step</li>
+</ul>
+
+<h2 id="ch9">Ch 9 — Devices &amp; Precision</h2>
+<ul>
+  <li><a href="chapters/09-devices-precision.html#exercises">EX 9.1</a> <span class="exercise-diff easy">easy</span> — Memory for a 1.3B model</li>
+  <li><a href="chapters/09-devices-precision.html#exercises">EX 9.2</a> <span class="exercise-diff easy">easy</span> — Where integers stop being exact</li>
+  <li><a href="chapters/09-devices-precision.html#exercises">EX 9.3</a> <span class="exercise-diff medium">medium</span> — Move a model and a batch to the best device</li>
+  <li><a href="chapters/09-devices-precision.html#exercises">EX 9.4</a> <span class="exercise-diff medium">medium</span> — Trace dtypes through an autocast forward pass</li>
+  <li><a href="chapters/09-devices-precision.html#exercises">EX 9.5</a> <span class="exercise-diff hard">hard</span> — Decode bf16 bits by hand</li>
+  <li><a href="chapters/09-devices-precision.html#exercises">EX 9.6</a> <span class="exercise-diff hard">hard</span> — How many sequences fit on an 80 GB GPU?</li>
+  <li><a href="chapters/09-devices-precision.html#exercises">EX 9.7</a> <span class="exercise-diff medium">medium</span> — Why the master weights stay fp32</li>
+</ul>
+
+<h2 id="ch10">Ch 10 — Inference &amp; Sampling</h2>
+<ul>
+  <li><a href="chapters/10-inference.html#exercises">EX 10.1</a> <span class="exercise-diff easy">easy</span> — Temperature by hand</li>
+  <li><a href="chapters/10-inference.html#exercises">EX 10.2</a> <span class="exercise-diff easy">easy</span> — Which switch does what</li>
+  <li><a href="chapters/10-inference.html#exercises">EX 10.3</a> <span class="exercise-diff medium">medium</span> — Implement top-p the other way round</li>
+  <li><a href="chapters/10-inference.html#exercises">EX 10.4</a> <span class="exercise-diff medium">medium</span> — Add a repetition penalty</li>
+  <li><a href="chapters/10-inference.html#exercises">EX 10.5</a> <span class="exercise-diff medium">medium</span> — Measure the quadratic cost</li>
+  <li><a href="chapters/10-inference.html#exercises">EX 10.6</a> <span class="exercise-diff hard">hard</span> — Prove chunked prefill is exact</li>
+  <li><a href="chapters/10-inference.html#exercises">EX 10.7</a> <span class="exercise-diff hard">hard</span> — Evict finished rows from the batch</li>
+</ul>
+
+<h2 id="ch11">Ch 11 — Performance &amp; Profiling</h2>
+<ul>
+  <li><a href="chapters/11-performance.html#exercises">EX 11.1</a> <span class="exercise-diff easy">easy</span> — Find the hidden syncs</li>
+  <li><a href="chapters/11-performance.html#exercises">EX 11.2</a> <span class="exercise-diff easy">easy</span> — Arithmetic intensity by hand</li>
+  <li><a href="chapters/11-performance.html#exercises">EX 11.3</a> <span class="exercise-diff medium">medium</span> — Write a correct benchmark</li>
+  <li><a href="chapters/11-performance.html#exercises">EX 11.4</a> <span class="exercise-diff medium">medium</span> — Profile and name the top op</li>
+  <li><a href="chapters/11-performance.html#exercises">EX 11.5</a> <span class="exercise-diff medium">medium</span> — When does compile pay off?</li>
+  <li><a href="chapters/11-performance.html#exercises">EX 11.6</a> <span class="exercise-diff hard">hard</span> — Replace the top op</li>
+  <li><a href="chapters/11-performance.html#exercises">EX 11.7</a> <span class="exercise-diff hard">hard</span> — Find the CPU/GPU crossover</li>
+</ul>
+
+<h2 id="ch12">Ch 12 — Debugging PyTorch</h2>
+<ul>
+  <li><a href="chapters/12-debugging.html#exercises">EX 12.1</a> <span class="exercise-diff easy">easy</span> — Read the error</li>
+  <li><a href="chapters/12-debugging.html#exercises">EX 12.2</a> <span class="exercise-diff easy">easy</span> — The loss that never reaches zero</li>
+  <li><a href="chapters/12-debugging.html#exercises">EX 12.3</a> <span class="exercise-diff medium">medium</span> — <code>cross_entropy</code> with sequence logits</li>
+  <li><a href="chapters/12-debugging.html#exercises">EX 12.4</a> <span class="exercise-diff medium">medium</span> — The loss floor at 2.36</li>
+  <li><a href="chapters/12-debugging.html#exercises">EX 12.5</a> <span class="exercise-diff medium">medium</span> — The head split that peeks at the future</li>
+  <li><a href="chapters/12-debugging.html#exercises">EX 12.6</a> <span class="exercise-diff hard">hard</span> — The layers that never train</li>
+  <li><a href="chapters/12-debugging.html#exercises">EX 12.7</a> <span class="exercise-diff hard">hard</span> — Find the in-place op</li>
+  <li><a href="chapters/12-debugging.html#exercises">EX 12.8</a> <span class="exercise-diff hard">hard</span> — A debug hook that names the first bad module</li>
+</ul>
+
+<h2 id="ch14">Ch 14 — Capstone Project</h2>
+<ul>
+  <li><a href="chapters/14-capstone.html">EX 14.1</a> <span class="exercise-diff easy">easy</span> — Milestone 1 · Data and tokenizer</li>
+  <li><a href="chapters/14-capstone.html">EX 14.2</a> <span class="exercise-diff medium">medium</span> — Milestone 2 · Dataset, collate and a resumable batch stream</li>
+  <li><a href="chapters/14-capstone.html">EX 14.3</a> <span class="exercise-diff medium">medium</span> — Milestone 3 · The GPT module</li>
+  <li><a href="chapters/14-capstone.html">EX 14.4</a> <span class="exercise-diff medium">medium</span> — Milestone 4 · Training and evaluation</li>
+  <li><a href="chapters/14-capstone.html">EX 14.5</a> <span class="exercise-diff medium">medium</span> — Milestone 5 · Checkpoint and exact resume</li>
+  <li><a href="chapters/14-capstone.html">EX 14.6</a> <span class="exercise-diff hard">hard</span> — Milestone 6 · Generation with a KV cache</li>
+  <li><a href="chapters/14-capstone.html">EX 14.7</a> <span class="exercise-diff hard">hard</span> — Milestone 7 · Measure it</li>
+  <li><a href="chapters/14-capstone.html">EX 14.8</a> <span class="exercise-diff hard">hard</span> — Stretch · Precision, fused attention, devices, MQA, a bigger model</li>
+</ul>
+
+<hr>
+
+<p style="text-align: center; color: var(--text-faint); font-family: var(--mono); font-size: 14px;">
+  93 exercises · 50 Q&amp;As · 14 chapters · tensors → autograd → transformers → inference
+</p>
+
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

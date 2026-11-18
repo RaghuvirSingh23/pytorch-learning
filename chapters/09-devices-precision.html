@@ -1,0 +1,912 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>9 · Devices &amp; Precision — PyTorch</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<button class="sidebar-toggle" aria-label="Toggle navigation">☰ Menu</button>
+<div class="layout">
+<aside class="sidebar">
+  <a href="../index.html" class="brand">PyTorch</a>
+  <span class="brand-sub">a deep dive — 2026</span>
+  <nav>
+    <ol>
+      <li><a href="01-why-pytorch.html">Why PyTorch</a></li>
+      <li><a href="02-tensors.html">Tensors</a></li>
+      <li><a href="03-tensor-math.html">Tensor Math &amp; Broadcasting</a></li>
+      <li><a href="04-autograd.html">Autograd</a></li>
+      <li><a href="05-nn-module.html">nn.Module</a></li>
+      <li><a href="06-transformer-blocks.html">Building a Transformer</a></li>
+      <li><a href="07-losses-optimizers.html">Losses &amp; Optimizers</a></li>
+      <li><a href="08-training-loop.html">The Training Loop</a></li>
+      <li><a href="09-devices-precision.html">Devices &amp; Precision</a></li>
+      <li><a href="10-inference.html">Inference &amp; Sampling</a></li>
+      <li><a href="11-performance.html">Performance &amp; Profiling</a></li>
+      <li><a href="12-debugging.html">Debugging PyTorch</a></li>
+      <li><a href="13-50-questions.html">The 50 Questions</a></li>
+      <li><a href="14-capstone.html">Capstone Project</a></li>
+    </ol>
+    <div class="extras">
+      <a href="../exercises.html">All Exercises</a>
+      <a href="../index.html">← Home</a>
+    </div>
+  </nav>
+  <div class="progress"></div>
+</aside>
+
+<main class="content">
+
+<h1>
+  <span class="chap-num">Chapter 09</span>
+  Devices &amp; Precision
+</h1>
+<p class="lede">
+  Two questions decide whether a model fits on a machine and how fast it runs:
+  <strong>where</strong> the tensors live (CPU, a CUDA GPU, Apple's
+  <code>mps</code>) and <strong>how many bits</strong> each number gets. This
+  chapter covers moving models and data between devices, the floating-point
+  formats from the bit level up (fp32, fp16, bf16, TF32, fp8), mixed precision
+  with <code>autocast</code> and <code>GradScaler</code>, and the arithmetic that
+  tells you how many bytes training and inference really need, KV cache included.
+</p>
+
+<h2 id="devices">Devices: where a tensor lives</h2>
+
+<p>Every tensor has a <strong>device</strong>: the memory it is stored in, and therefore the processor that runs operations on it. <code>torch.device("cpu")</code> is ordinary RAM. <code>torch.device("cuda")</code> is an NVIDIA GPU's memory (<code>"cuda:1"</code> picks the second GPU). <code>torch.device("mps")</code> is Apple Silicon's GPU through Metal. An operation runs on the device of its inputs, and all its tensor inputs must be on the same one.</p>
+
+<p>microgpt reads its device from the <code>DEVICE</code> environment variable. The usual pattern picks the best one available:</p>
+
+<div class="code" data-lang="python">
+<div class="code-hdr"><span class="lang">python</span><span class="title">device.py</span></div>
+<pre><code>import torch
+
+def best_device():
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+device = best_device()
+print(device, torch.cuda.is_available(), torch.backends.mps.is_available())
+# mps False True                       (on the Apple Silicon laptop used here)
+
+x = torch.ones(2, 3)
+y = x.to(device)                 # a NEW tensor on the device; x is untouched
+print(x.device, y.device, y is x)              # cpu mps:0 False
+print(y.to(device) is y)         # already there: no copy, same object   -&gt; True
+
+model = torch.nn.Linear(3, 2)
+returned = model.to(device)      # moves the parameters IN PLACE, returns self
+print(returned is model, model.weight.device)  # True mps:0
+
+print(y.sum().item(), y.cpu().device)          # 6.0 cpu</code></pre>
+</div>
+
+<p>The one asymmetry to remember: <strong><code>tensor.to(device)</code> returns a new tensor</strong> and leaves the original where it was, so you must reassign (<code>x = x.to(device)</code>). <strong><code>module.to(device)</code> moves the module's parameters and buffers in place</strong> and returns the same module, so <code>model.to(device)</code> on its own line works. That is why microgpt writes <code>model = FastMicroGPT().to(device)</code> but builds its token tensors with <code>device=device</code> directly. Creating a tensor on the device (<code>torch.zeros(..., device=device)</code>) is better than creating it on the CPU and copying.</p>
+
+<p><code>.item()</code>, <code>.tolist()</code> and <code>.cpu()</code> copy data back to the host. NumPy only understands host memory:</p>
+
+<div class="code" data-lang="python">
+<pre><code>import torch
+
+model = torch.nn.Linear(3, 2).to("mps")
+x = torch.ones(4, 3)                     # forgot to move the batch
+try:
+    model(x)
+except RuntimeError as e:
+    print("RuntimeError:", e)
+
+a = torch.ones(3, device="mps")
+b = torch.ones(3)
+try:
+    a + b
+except RuntimeError as e:
+    print("RuntimeError:", e)
+
+print(a + torch.tensor(2.0))             # a 0-dim CPU tensor is allowed, like a Python number
+
+try:
+    a.numpy()
+except TypeError as e:
+    print("TypeError:", e)</code></pre>
+</div>
+
+<div class="code" data-lang="text">
+<pre><code>RuntimeError: Tensor for argument input is on cpu but expected on mps
+RuntimeError: Expected all tensors to be on the same device, but found at least two devices, mps:0 and cpu!
+tensor([3., 3., 3.], device='mps:0')
+TypeError: can't convert mps:0 device type tensor to numpy. Use Tensor.cpu() to copy the tensor to host memory first.</code></pre>
+</div>
+
+<p>The second message is the one you will see most, with <code>cuda:0 and cpu</code> on an NVIDIA machine. The fix is always the same: move the model once, and move every batch inside the loop. Chapter 12 shows how to find which tensor was left behind.</p>
+
+<h4>Host-to-GPU copies: <code>pin_memory</code> and <code>non_blocking</code> (CUDA)</h4>
+
+<p>Ordinary host memory is <strong>pageable</strong>: the operating system may move it around, so the GPU cannot read it directly. A copy to the GPU first goes through a <strong>pinned</strong> (page-locked) staging buffer. If the batch is already in pinned memory, the GPU's copy engine can read it directly, and the copy can be <strong>asynchronous</strong>: the CPU queues it and moves on while the bytes travel.</p>
+
+<div class="code" data-lang="python">
+<pre><code># needs a CUDA GPU
+loader = DataLoader(dataset, batch_size=64, shuffle=True, collate_fn=collate,
+                    pin_memory=True)                 # worker output lands in pinned memory
+for inputs, targets in loader:
+    inputs = inputs.to("cuda", non_blocking=True)    # async copy, CPU does not wait
+    targets = targets.to("cuda", non_blocking=True)
+    logits = model(inputs)                           # queued after the copy on the same stream
+    ...</code></pre>
+</div>
+
+<p>This is safe because CUDA runs operations in order on a <strong>stream</strong>: the forward pass is queued behind the copy and cannot start before the data arrives. It also hints at something bigger: <strong>CUDA operations are asynchronous</strong>. <code>model(inputs)</code> returns as soon as the kernels are queued, long before the GPU finishes them. The CPU only waits when it needs a result, such as at <code>loss.item()</code>. That is why timing GPU code with <code>time.perf_counter()</code> alone gives nonsense; Chapter 11 does it properly with <code>torch.cuda.synchronize()</code> and CUDA events. <code>pin_memory</code> is a CUDA feature; leave it off on CPU-only and <code>mps</code> machines.</p>
+
+<h2 id="float-formats">Floating-point formats from zero</h2>
+
+<p>A floating-point number stores three fields:</p>
+<ul>
+  <li><strong>sign</strong>: 1 bit, 0 for positive.</li>
+  <li><strong>exponent</strong>: which power of two the number is near. More exponent bits = wider <strong>range</strong> (how big and how small).</li>
+  <li><strong>mantissa</strong> (or fraction): the digits after the leading 1. More mantissa bits = finer <strong>precision</strong> (how close two neighbouring values are).</li>
+</ul>
+
+<p>For a normal number, <code>value = (-1)^sign × 2^(exponent - bias) × 1.mantissa</code>. The <strong>bias</strong> lets the stored exponent be unsigned: 127 for 8-bit exponents, 15 for 5-bit ones. Take 6.5: it is <code>1.625 × 2^2</code>, and 0.625 in binary is <code>.101</code>. So fp32 stores sign 0, exponent <code>2 + 127 = 129 = 10000001</code>, mantissa <code>101000...</code>. You can look at the actual bits by reinterpreting the tensor's memory as an integer with <code>.view(torch.int32)</code>:</p>
+
+<div class="code" data-lang="python">
+<div class="code-hdr"><span class="lang">python</span><span class="title">bits.py</span></div>
+<pre><code>import torch
+
+def fp32_fields(x):
+    bits = torch.tensor(x, dtype=torch.float32).view(torch.int32).item() &amp; 0xFFFFFFFF
+    b = f"{bits:032b}"
+    return b[0], b[1:9], b[9:], f"0x{bits:08x}"
+
+def bf16_fields(x):
+    bits = torch.tensor(x, dtype=torch.bfloat16).view(torch.int16).item() &amp; 0xFFFF
+    b = f"{bits:016b}"
+    return b[0], b[1:9], b[9:], f"0x{bits:04x}"
+
+def fp16_fields(x):
+    bits = torch.tensor(x, dtype=torch.float16).view(torch.int16).item() &amp; 0xFFFF
+    b = f"{bits:016b}"
+    return b[0], b[1:6], b[6:], f"0x{bits:04x}"
+
+for x in (1.0, 6.5, -0.15625):
+    print(f"{x:&gt;8}  fp32 {fp32_fields(x)}")
+    print(f"{'':&gt;8}  bf16 {bf16_fields(x)}")
+    print(f"{'':&gt;8}  fp16 {fp16_fields(x)}")
+
+s, e, m, _ = fp32_fields(6.5)
+value = (-1) ** int(s) * 2.0 ** (int(e, 2) - 127) * (1 + int(m, 2) / 2 ** 23)
+print(int(e, 2), int(e, 2) - 127, 1 + int(m, 2) / 2 ** 23, value)</code></pre>
+</div>
+
+<div class="code" data-lang="text">
+<pre><code>     1.0  fp32 ('0', '01111111', '00000000000000000000000', '0x3f800000')
+          bf16 ('0', '01111111', '0000000', '0x3f80')
+          fp16 ('0', '01111', '0000000000', '0x3c00')
+     6.5  fp32 ('0', '10000001', '10100000000000000000000', '0x40d00000')
+          bf16 ('0', '10000001', '1010000', '0x40d0')
+          fp16 ('0', '10001', '1010000000', '0x4680')
+-0.15625  fp32 ('1', '01111100', '01000000000000000000000', '0xbe200000')
+          bf16 ('1', '01111100', '0100000', '0xbe20')
+          fp16 ('1', '01100', '0100000000', '0xb100')
+129 2 1.625 6.5</code></pre>
+</div>
+
+<p>Look at the hex: <strong>bf16 is the top 16 bits of fp32</strong> (<code>0x40d00000</code> becomes <code>0x40d0</code>). Same sign, same 8-bit exponent, mantissa cut from 23 bits to 7. fp16 instead has a 5-bit exponent and a 10-bit mantissa, so its exponent field is different.</p>
+
+<table>
+  <tr><th>format</th><th>bits</th><th>sign / exponent / mantissa</th><th>where you meet it</th></tr>
+  <tr><td>fp32 (<code>torch.float32</code>)</td><td>32</td><td>1 / 8 / 23</td><td>PyTorch's default; master weights and optimizer state</td></tr>
+  <tr><td>fp16 (<code>torch.float16</code>, "half")</td><td>16</td><td>1 / 5 / 10</td><td>Older mixed-precision training (with loss scaling); inference</td></tr>
+  <tr><td>bf16 (<code>torch.bfloat16</code>, "brain float")</td><td>16</td><td>1 / 8 / 7</td><td>Today's default for LLM training and inference</td></tr>
+  <tr><td>TF32 (not a storage dtype)</td><td>19 used</td><td>1 / 8 / 10</td><td>Internal format of fp32 matmuls on NVIDIA tensor cores (Ampere and newer)</td></tr>
+  <tr><td>fp8 e4m3 (<code>torch.float8_e4m3fn</code>)</td><td>8</td><td>1 / 4 / 3</td><td>Weights and activations on NVIDIA Ada, Hopper and newer GPUs</td></tr>
+  <tr><td>fp8 e5m2 (<code>torch.float8_e5m2</code>)</td><td>8</td><td>1 / 5 / 2</td><td>Gradients in fp8 training (more range, less precision)</td></tr>
+</table>
+
+<p><code>torch.finfo</code> reports each format's limits. <code>max</code> is the largest finite value; <code>tiny</code> is the smallest positive <em>normal</em> value (subnormals go lower, with fewer significant bits); <code>eps</code> is the gap between 1.0 and the next representable number, i.e. the relative precision.</p>
+
+<div class="code" data-lang="python">
+<pre><code>import torch
+
+dtypes = [torch.float32, torch.float16, torch.bfloat16,
+          torch.float8_e4m3fn, torch.float8_e5m2]
+print(f"{'dtype':20s} {'bits':&gt;4s} {'max':&gt;12s} {'tiny':&gt;12s} {'eps':&gt;12s}")
+for dt in dtypes:
+    fi = torch.finfo(dt)
+    print(f"{str(dt):20s} {fi.bits:4d} {fi.max:12.6g} {fi.tiny:12.6g} {fi.eps:12.6g}")</code></pre>
+</div>
+
+<div class="code" data-lang="text">
+<pre><code>dtype                bits          max         tiny          eps
+torch.float32          32  3.40282e+38  1.17549e-38  1.19209e-07
+torch.float16          16        65504  6.10352e-05  0.000976562
+torch.bfloat16         16  3.38953e+38  1.17549e-38    0.0078125
+torch.float8_e4m3fn     8          448     0.015625        0.125
+torch.float8_e5m2       8        57344  6.10352e-05         0.25</code></pre>
+</div>
+
+<p>Read the trade-off off the table. fp16 is precise (<code>eps</code> about 0.001, three decimal digits) but tops out at 65,504. bf16 has fp32's range (up to 3.4e38) but only <code>eps = 1/128</code>, two to three significant digits. The <code>fn</code> in <code>float8_e4m3fn</code> means "finite": it has no infinity, and spends those bit patterns on extra range (max 448 instead of 240).</p>
+
+<h2 id="range-precision">Range and precision, demonstrated</h2>
+
+<div class="code" data-lang="python">
+<div class="code-hdr"><span class="lang">python</span><span class="title">range_precision.py</span></div>
+<pre><code>import torch
+
+big = torch.tensor([65504.0, 65519.0, 65520.0, 70000.0])
+print(big.to(torch.float16))                  # fp16 max is 65504
+print(big.to(torch.bfloat16))                 # bf16 has the range, not the precision
+print(torch.tensor(60000.0, dtype=torch.float16) * 2)
+
+small = torch.tensor([1e-4, 6e-8, 1e-8])
+print(small.to(torch.float16))                # fp16 underflows below ~6e-8
+print(small.to(torch.bfloat16))
+
+one = torch.tensor([1 + 1/256, 1 + 1/128, 1 + 3/256], dtype=torch.float32)
+print(one.to(torch.bfloat16))                 # bf16 steps near 1.0 are 1/128
+print(one.to(torch.float16))                  # fp16 steps near 1.0 are 1/1024
+print(torch.tensor(256.0, dtype=torch.bfloat16) + 1)</code></pre>
+</div>
+
+<div class="code" data-lang="text">
+<pre><code>tensor([65504., 65504.,    inf,    inf], dtype=torch.float16)
+tensor([65536., 65536., 65536., 70144.], dtype=torch.bfloat16)
+tensor(inf, dtype=torch.float16)
+tensor([1.0002e-04, 5.9605e-08, 0.0000e+00], dtype=torch.float16)
+tensor([1.0014e-04, 6.0070e-08, 1.0012e-08], dtype=torch.bfloat16)
+tensor([1.0000, 1.0078, 1.0156], dtype=torch.bfloat16)
+tensor([1.0039, 1.0078, 1.0117], dtype=torch.float16)
+tensor(256., dtype=torch.bfloat16)</code></pre>
+</div>
+
+<ul>
+  <li><strong>fp16 overflow</strong>: anything from 65,520 up rounds to <code>inf</code>, and so does <code>60000 × 2</code>. One <code>inf</code> in a forward pass becomes <code>nan</code> everywhere after it (<code>inf - inf</code>, <code>0 × inf</code>).</li>
+  <li><strong>fp16 underflow</strong>: below about 6e-8 (the smallest subnormal), values become 0. Gradients live down there; the <a href="#gradscaler">GradScaler section</a> deals with it.</li>
+  <li><strong>bf16 range</strong>: 70,000 and 1e-8 are both fine, just rounded (70,000 becomes 70,144).</li>
+  <li><strong>bf16 precision</strong>: near 1.0 the representable values are <code>1, 1 + 1/128, 1 + 2/128, ...</code>. <code>1 + 1/256</code> sits exactly halfway and rounds to the even neighbour, 1.0: the addition is lost. At 256 the spacing is 2, so <code>256 + 1 = 256</code>.</li>
+</ul>
+
+<h4>Adding many small numbers</h4>
+
+<p>Precision bites hardest in long sums, because each addition rounds to the spacing near the running total. Once the total is big enough that half the spacing exceeds the number being added, every addition rounds back to where it was:</p>
+
+<div class="code" data-lang="python">
+<pre><code>import torch
+
+for dt in (torch.float32, torch.bfloat16, torch.float16):
+    acc = torch.tensor(0.0, dtype=dt)
+    step = torch.tensor(1e-4, dtype=dt)
+    for _ in range(10_000):                   # 10,000 x 0.0001 should be 1.0
+        acc = acc + step
+    print(f"{str(dt):15s} running sum = {acc.item():.6f}")
+
+x = torch.full((10_000,), 1e-4, dtype=torch.bfloat16)
+print(x.sum().item(), x.sum().dtype)          # torch.sum accumulates in float32 internally</code></pre>
+</div>
+
+<div class="code" data-lang="text">
+<pre><code>torch.float32   running sum = 1.000054
+torch.bfloat16  running sum = 0.031250
+torch.float16   running sum = 0.250000
+1.0 torch.bfloat16</code></pre>
+</div>
+
+<p>bf16 gets stuck at 0.03125: there the spacing is <code>2^-5 × 2^-7 = 0.000244</code>, half of which is bigger than 0.0001. fp16, with 3 more mantissa bits, gets stuck later, at 0.25. <code>torch.sum</code> on the same bf16 tensor returns 1.0, because PyTorch's reductions keep a float32 accumulator for bf16 and fp16 inputs and only round the final result. GPU matmuls do the same: tensor cores multiply bf16 inputs but <strong>accumulate in fp32</strong>. That is the general rule of mixed precision: store and multiply in low precision, add up in high precision.</p>
+
+<h2 id="tf32">TF32: faster fp32 matmuls (CUDA, Ampere and newer)</h2>
+
+<p>NVIDIA's tensor cores from Ampere (A100, RTX 30xx) onward can run fp32 matrix multiplies in <strong>TF32</strong>: each input is rounded to a 10-bit mantissa (fp16's precision) while keeping fp32's 8-bit exponent (its range), and products are accumulated in fp32. Inputs and outputs are still <code>torch.float32</code> tensors; only the internal multiply is coarser. For neural network training the loss of precision rarely matters, and the matmuls run several times faster.</p>
+
+<p>PyTorch leaves it <strong>off</strong> for matmuls by default (so fp32 means fp32), and on for cuDNN convolutions. Two equivalent ways to turn it on:</p>
+
+<div class="code" data-lang="python">
+<pre><code>import torch
+
+print(torch.get_float32_matmul_precision())       # 'highest' is the default
+print(torch.backends.cuda.matmul.allow_tf32)      # False by default
+print(torch.backends.cudnn.allow_tf32)            # True by default (convolutions)
+torch.set_float32_matmul_precision("high")        # allow TF32 for fp32 matmuls
+print(torch.backends.cuda.matmul.allow_tf32)      # True</code></pre>
+</div>
+
+<p><code>"highest"</code> means real fp32. <code>"high"</code> allows TF32 (or an equivalent bf16-based method) when the hardware has it, and is the same as setting <code>allow_tf32 = True</code>. <code>"medium"</code> allows bf16 internally. The PyTorch docs say this flag currently affects only CUDA; the lines above run anywhere, but on a Mac or a CPU they change nothing. If you see "TensorFloat32 tensor cores ... available but not enabled" in a warning on an NVIDIA GPU, this is the switch it means.</p>
+
+<h2 id="autocast">Mixed precision with <code>torch.autocast</code></h2>
+
+<p><strong>Mixed precision</strong> means running most of the arithmetic in a 16-bit format (half the memory traffic, much faster on tensor cores) while keeping the numerically sensitive parts in fp32. You could convert the model with <code>model.to(torch.bfloat16)</code>, but then the weights themselves are bf16, and as <a href="#ex-9-7">Exercise 9.7</a> shows, small optimizer updates to bf16 weights get rounded away.</p>
+
+<p><code>torch.autocast</code> is the standard tool. Inside its <code>with</code> block, each operation is cast per a fixed list:</p>
+<ul>
+  <li><strong>Lower-precision ops</strong> (matmul-like: <code>linear</code>, <code>matmul</code>, <code>bmm</code>, convolutions, and on CPU also <code>scaled_dot_product_attention</code>): inputs are cast to bf16/fp16, so the output is bf16/fp16.</li>
+  <li><strong>fp32 ops</strong> (sensitive reductions and losses: <code>cross_entropy</code>, <code>nll_loss</code>, <code>mse_loss</code>, and on CUDA also <code>softmax</code>, <code>log_softmax</code>, <code>layer_norm</code>, <code>sum</code>, <code>exp</code>, <code>log</code>, <code>pow</code> and others): inputs are cast to fp32.</li>
+  <li><strong>Everything else</strong> (<code>relu</code>, addition, indexing): runs in whatever dtype its inputs have; mixed inputs promote to the wider type.</li>
+</ul>
+
+<p>The lists differ between devices; the <a href="https://docs.pytorch.org/docs/2.8/amp.html">AMP docs</a> have them in full. Here it is on the CPU with bf16, which runs anywhere:</p>
+
+<div class="code" data-lang="python">
+<div class="code-hdr"><span class="lang">python</span><span class="title">autocast_cpu.py</span></div>
+<pre><code>import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+torch.manual_seed(0)
+model = nn.Sequential(nn.Linear(16, 64), nn.ReLU(), nn.Linear(64, 27))
+x = torch.randn(8, 16)
+y = torch.randint(0, 27, (8,))
+
+with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+    h = model[0](x)                       # linear: autocast runs it in bf16
+    r = model[1](h)                       # relu: not on any list, follows its input
+    logits = model[2](r)
+    probs = torch.softmax(logits, dim=-1)
+    rms = F.rms_norm(logits, (27,))
+    loss = F.cross_entropy(logits, y)     # on the CPU fp32 list
+    print("linear  ", h.dtype)
+    print("relu    ", r.dtype)
+    print("logits  ", logits.dtype)
+    print("softmax ", probs.dtype)
+    print("rms_norm", rms.dtype)
+    print("loss    ", loss.dtype)
+
+loss.backward()                           # backward outside the autocast block
+print("weight  ", model[0].weight.dtype)
+print("grad    ", model[0].weight.grad.dtype)
+
+with torch.no_grad():
+    ref = F.cross_entropy(model(x), y)
+print(f"fp32 loss {ref.item():.6f}   autocast loss {loss.item():.6f}")</code></pre>
+</div>
+
+<div class="code" data-lang="text">
+<pre><code>linear   torch.bfloat16
+relu     torch.bfloat16
+logits   torch.bfloat16
+softmax  torch.bfloat16
+rms_norm torch.bfloat16
+loss     torch.float32
+weight   torch.float32
+grad     torch.float32
+fp32 loss 3.439390   autocast loss 3.439569</code></pre>
+</div>
+
+<p>Three things to notice. The <strong>parameters stay fp32</strong>: autocast casts a bf16 copy of each weight for the matmul (and caches it within the block), so the optimizer still updates fp32 master values, and gradients arrive in fp32. The loss is fp32 even though the logits are bf16. And on the CPU, <code>softmax</code> and <code>rms_norm</code> stay in bf16 because they are not on the CPU's fp32 list; under CUDA autocast, <code>softmax</code> would be fp32. The loss differs from fp32 in the fourth decimal: that is the bf16 rounding of the matmuls.</p>
+
+<p>Call <code>backward()</code> outside the <code>with</code> block; the docs say backward under autocast is not recommended, and each backward op automatically runs in the dtype its forward op used. Apple's <code>mps</code> backend supports autocast too: in torch 2.8 on this laptop, <code>torch.autocast(device_type="mps", dtype=torch.float16)</code> (and <code>bfloat16</code>) turn a <code>Linear</code>'s output into that dtype.</p>
+
+<h4>On a CUDA GPU: bf16</h4>
+
+<p>On Ampere and newer GPUs, bf16 autocast is the default recipe. It is the training loop from Chapter 8 with one <code>with</code> line added (needs a CUDA GPU):</p>
+
+<div class="code" data-lang="python">
+<pre><code>model = MicroGPT().to("cuda")
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-3, betas=(0.85, 0.99))
+for inputs, targets in train_loader:
+    inputs = inputs.to("cuda", non_blocking=True)
+    targets = targets.to("cuda", non_blocking=True)
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        logits = model(inputs)
+        loss = F.cross_entropy(logits.view(-1, VOCAB), targets.view(-1))
+    optimizer.zero_grad(set_to_none=True)
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    optimizer.step()
+    scheduler.step()</code></pre>
+</div>
+
+<h2 id="gradscaler">fp16 and <code>GradScaler</code></h2>
+
+<p>bf16 has fp32's exponent range, so gradients that fit in fp32 essentially never underflow in bf16. fp16 is different: its smallest value is about 6e-8, and gradients are often smaller, especially for activations deep in a network late in training. Those gradients become exactly 0 and the corresponding weights stop learning. You can see it on the CPU:</p>
+
+<div class="code" data-lang="python">
+<div class="code-hdr"><span class="lang">python</span><span class="title">underflow.py</span></div>
+<pre><code>import torch
+
+x = torch.tensor([3e-4, 5e-4], dtype=torch.float16, requires_grad=True)   # fp16 activations
+
+def loss_fn(x):
+    return ((x * x).float() * 1e-5).sum()     # the loss itself is fp32, as under autocast
+
+loss_fn(x).backward()                         # true grad = 2 * x * 1e-5 = [6e-9, 1e-8]
+print(x.grad)                                 # tensor([0., 0.], dtype=torch.float16)
+
+x.grad = None
+scale = 65536.0                               # GradScaler's default initial scale (2**16)
+(loss_fn(x) * scale).backward()               # scale the fp32 loss, then backward
+print(x.grad)                                 # tensor([0.0004, 0.0007], dtype=torch.float16)
+print(x.grad.float() / scale)                 # tensor([5.9990e-09, 1.0004e-08])</code></pre>
+</div>
+
+<p><strong>Loss scaling</strong> is the fix: multiply the loss by a large constant <code>S</code> before <code>backward()</code>. By the chain rule every gradient is multiplied by <code>S</code> too, which lifts them out of the underflow zone. Then divide the gradients by <code>S</code> in fp32 before the optimizer uses them. The result above is the correct gradient to 3 digits, where the unscaled backward gave 0.</p>
+
+<p>Choosing <code>S</code> by hand is fragile: too small and gradients underflow, too large and they overflow to <code>inf</code>. <code>torch.amp.GradScaler</code> adjusts it automatically. It starts at <code>init_scale=65536</code>; if any gradient comes out <code>inf</code> or <code>nan</code>, it skips that optimizer step and halves the scale (<code>backoff_factor=0.5</code>); after 2,000 clean steps in a row (<code>growth_interval</code>) it doubles it (<code>growth_factor=2.0</code>). The loop (needs a CUDA GPU):</p>
+
+<div class="code" data-lang="python">
+<pre><code>scaler = torch.amp.GradScaler("cuda")
+for inputs, targets in train_loader:
+    inputs = inputs.to("cuda", non_blocking=True)
+    targets = targets.to("cuda", non_blocking=True)
+    with torch.autocast(device_type="cuda", dtype=torch.float16):
+        logits = model(inputs)
+        loss = F.cross_entropy(logits.view(-1, VOCAB), targets.view(-1))
+    optimizer.zero_grad(set_to_none=True)
+    scaler.scale(loss).backward()        # backward of loss * S
+    scaler.unscale_(optimizer)           # grads /= S in place, so clipping sees true values
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    scaler.step(optimizer)               # skips optimizer.step() if any grad is inf/nan
+    scaler.update()                      # adjust S for the next iteration
+    scheduler.step()</code></pre>
+</div>
+
+<p>Use bf16 when the hardware supports it (NVIDIA Ampere and newer, recent TPUs and CPUs) and skip the scaler entirely. fp16 plus <code>GradScaler</code> is for older GPUs such as V100 and T4. The old spelling <code>torch.cuda.amp.GradScaler</code> is deprecated in favour of <code>torch.amp.GradScaler("cuda")</code>.</p>
+
+<h2 id="memory">Memory math</h2>
+
+<p>How much memory does a model need? Start from bytes per parameter. <code>tensor.element_size()</code> gives the bytes per element of its dtype, so <code>t.element_size() * t.numel()</code> is the size of any tensor, on any device.</p>
+
+<table>
+  <tr><th>setup</th><th>weights</th><th>grads</th><th>optimizer</th><th>bytes / param</th></tr>
+  <tr><td>fp32 training, Adam</td><td>4</td><td>4</td><td>8 (m, v)</td><td>16</td></tr>
+  <tr><td>autocast training, Adam (params stay fp32)</td><td>4</td><td>4</td><td>8</td><td>16</td></tr>
+  <tr><td>classic mixed precision (16-bit weights + fp32 master copy)</td><td>2 + 4</td><td>2</td><td>8</td><td>16</td></tr>
+  <tr><td>inference, bf16 / fp16</td><td>2</td><td>-</td><td>-</td><td>2</td></tr>
+  <tr><td>inference, int8 / fp8 weights</td><td>1</td><td>-</td><td>-</td><td>1 (+ small scales)</td></tr>
+</table>
+
+<p>So <strong>training with Adam costs about 16 bytes per parameter</strong> whichever mixed-precision scheme you use, before counting activations. Check it on microgpt's nine weight matrices:</p>
+
+<div class="code" data-lang="python">
+<div class="code-hdr"><span class="lang">python</span><span class="title">memory.py</span></div>
+<pre><code>import torch
+
+# microgpt's nine weight matrices, [out][in] as in FastMicroGPT
+shapes = [(27, 16), (16, 16),                        # token, position embeddings
+          (16, 16), (16, 16), (16, 16), (16, 16),    # query, key, value, attention output
+          (64, 16), (16, 64),                        # MLP expand, contract
+          (27, 16)]                                  # language-model head
+params = [torch.nn.Parameter(0.08 * torch.randn(*s)) for s in shapes]
+n = sum(p.numel() for p in params)
+
+def nbytes(t):
+    return t.element_size() * t.numel()
+
+sum(p.square().sum() for p in params).backward()     # any loss, just to create .grad
+opt = torch.optim.Adam(params, lr=0.01, betas=(0.85, 0.99), eps=1e-8)
+opt.step()                                           # Adam allocates its state lazily, here
+
+weights = sum(nbytes(p) for p in params)
+grads = sum(nbytes(p.grad) for p in params)
+adam = sum(nbytes(v) for st in opt.state.values() for v in st.values())
+print(f"parameters      {n}")
+print(f"weights   fp32  {weights:6d} bytes  ({weights / n:.0f} per param)")
+print(f"grads     fp32  {grads:6d} bytes  ({grads / n:.0f} per param)")
+print(f"Adam m, v, step {adam:6d} bytes  ({adam / n:.3f} per param)")
+print(f"total           {weights + grads + adam:6d} bytes  ({(weights + grads + adam) / n:.3f} per param)")
+print(params[0].element_size(), params[0].to(torch.bfloat16).element_size())</code></pre>
+</div>
+
+<div class="code" data-lang="text">
+<pre><code>parameters      4192
+weights   fp32   16768 bytes  (4 per param)
+grads     fp32   16768 bytes  (4 per param)
+Adam m, v, step  33572 bytes  (8.009 per param)
+total            67108 bytes  (16.009 per param)
+4 2</code></pre>
+</div>
+
+<p>The extra 36 bytes are Adam's <code>step</code> counter: one 4-byte scalar tensor for each of the 9 parameter tensors. microgpt's whole training state is 67 KB. Now scale up to a <strong>7-billion-parameter</strong> model:</p>
+
+<ul>
+  <li>Training with Adam: <code>7e9 × 16 = 112 GB</code>. That does not fit on one 80 GB GPU even before activations, which is why large models are trained with the optimizer state and gradients sharded across GPUs (FSDP, ZeRO).</li>
+  <li>Inference weights in bf16: <code>7e9 × 2 = 14 GB</code>. In int8 or fp8: 7 GB.</li>
+</ul>
+
+<p><strong>Activations</strong> are the other big term in training: every intermediate the backward pass needs is kept until backward runs. They grow with batch size × sequence length × layers × width, not with parameter count, so they have no per-parameter number. Autocast stores many of them in bf16, halving that part. <strong>Activation checkpointing</strong> (<code>torch.utils.checkpoint</code>) discards them and recomputes them during backward, trading compute for memory.</p>
+
+<h4>The KV cache</h4>
+
+<p>At inference, the dominant extra memory is the <strong>KV cache</strong>: for every layer and every past token, the model keeps that token's key and value vectors so it never recomputes them. microgpt's scalar <code>gpt_step</code> does exactly this with its <code>key_cache</code> and <code>value_cache</code> lists. Its size:</p>
+
+<div class="code" data-lang="text">
+<pre><code>KV bytes = 2 (K and V) × layers × kv_heads × head_dim × seq_len × batch × bytes_per_value</code></pre>
+</div>
+
+<div class="code" data-lang="python">
+<pre><code>def kv_cache_bytes(layers, kv_heads, head_dim, seq_len, batch, bytes_per_value):
+    return 2 * layers * kv_heads * head_dim * seq_len * batch * bytes_per_value   # 2 = K and V
+
+GiB = 2 ** 30
+print(kv_cache_bytes(1, 4, 4, 16, 1, 4))                     # microgpt, fp32 -&gt; 2048
+print(kv_cache_bytes(32, 32, 128, 4096, 1, 2) / GiB)         # Llama-2-7B shape, bf16 -&gt; 2.0
+print(kv_cache_bytes(32, 8, 128, 4096, 1, 2) / GiB)          # same, 8 KV heads (GQA) -&gt; 0.5
+print(kv_cache_bytes(32, 32, 128, 4096, 1, 2) / 4096 / 2**20) # MiB per token -&gt; 0.5
+
+P = 7e9
+print(P * 16 / 1e9, P * 2 / 1e9, P * 1 / 1e9)                # GB: train (Adam), bf16, 8-bit
+# 112.0 14.0 7.0</code></pre>
+</div>
+
+<p>microgpt (1 layer, 4 heads of size 4, 16 tokens, fp32) needs 2 KB. A Llama-2-7B-shaped model (32 layers, 32 KV heads of size 128) needs half a MiB <em>per token</em>: 2 GiB for one 4,096-token sequence, so seven such sequences (15 GB) already outweigh the 14 GB of bf16 weights. <strong>Grouped-query attention</strong> (GQA) shares each K/V head among several query heads; with 8 KV heads the cache shrinks 4×. This formula is the core of inference capacity planning, and Chapter 10 builds the cache itself.</p>
+
+<h4>Measuring what is allocated</h4>
+
+<p>On CUDA, PyTorch's caching allocator reports how much memory tensors currently hold and the peak since you last reset (needs a CUDA GPU):</p>
+
+<div class="code" data-lang="python">
+<pre><code>torch.cuda.reset_peak_memory_stats()
+loss = F.cross_entropy(model(inputs).view(-1, VOCAB), targets.view(-1))
+loss.backward()
+optimizer.step()
+print(f"{torch.cuda.memory_allocated() / 2**20:.1f} MiB held by tensors now")
+print(f"{torch.cuda.max_memory_allocated() / 2**20:.1f} MiB peak during the step")
+print(f"{torch.cuda.memory_reserved() / 2**20:.1f} MiB reserved by the caching allocator")</code></pre>
+</div>
+
+<p>The peak is what decides whether a step fits; it usually occurs during backward, when activations and gradients coexist. <code>memory_reserved</code> is larger, because PyTorch keeps freed blocks for reuse instead of returning them to the driver, which is why <code>nvidia-smi</code> shows more than <code>memory_allocated</code>. On a Mac, <code>torch.mps.current_allocated_memory()</code> plays the same role:</p>
+
+<div class="code" data-lang="python">
+<pre><code>import torch
+
+before = torch.mps.current_allocated_memory()
+w = torch.empty(1024, 1024, device="mps")              # 1M float32 values
+after = torch.mps.current_allocated_memory()
+print(w.element_size() * w.numel(), after - before)    # 4194304 4194304
+del w
+print(torch.mps.current_allocated_memory() - before)   # 0</code></pre>
+</div>
+
+<h2 id="quantization">A first look at quantization</h2>
+
+<p><strong>Quantization</strong> stores weights in fewer bits than bf16 to cut memory and memory bandwidth at inference. The simplest form is <strong>int8 with a scale</strong>: for each output row of a weight matrix, find the largest absolute value, map it to 127, and store <code>round(w / scale)</code> as an 8-bit integer plus one fp32 scale per row. To use the weight, multiply back: <code>w ≈ q × scale</code>. fp8 is the floating-point alternative: a cast to <code>float8_e4m3fn</code>.</p>
+
+<div class="code" data-lang="python">
+<div class="code-hdr"><span class="lang">python</span><span class="title">quant_teaser.py</span></div>
+<pre><code>import torch
+
+torch.manual_seed(0)
+w = 0.08 * torch.randn(64, 16)                         # like microgpt's mlp_expand_weights
+
+# int8, symmetric, one scale per output row
+scale = w.abs().amax(dim=1, keepdim=True) / 127        # (64, 1) fp32 scales
+q = torch.round(w / scale).clamp(-127, 127).to(torch.int8)
+w_int8 = q.float() * scale                             # dequantize to use it
+
+w_fp8 = w.to(torch.float8_e4m3fn).float()              # fp8 e4m3: 3 mantissa bits
+w_bf16 = w.to(torch.bfloat16).float()                  # bf16: 7 mantissa bits
+
+print(q.dtype, q[0, :6].tolist(), f"scale={scale[0].item():.6f}")
+for name, approx in (("bf16", w_bf16), ("int8", w_int8), ("fp8 e4m3", w_fp8)):
+    err = (approx - w).abs()
+    print(f"{name:9s} max abs error {err.max().item():.6f}  mean {err.mean().item():.6f}")
+print(q.element_size() * q.numel() + scale.element_size() * scale.numel(),
+      w.element_size() * w.numel())</code></pre>
+</div>
+
+<div class="code" data-lang="text">
+<pre><code>torch.int8 [-68, -69, -15, -26, 51, 42] scale=0.001332
+bf16      max abs error 0.000742  mean 0.000092
+int8      max abs error 0.001249  mean 0.000328
+fp8 e4m3  max abs error 0.015619  mean 0.001459
+1280 4096</code></pre>
+</div>
+
+<p>int8 with per-row scales is within 0.0013 of every weight, while storing 1,280 bytes instead of 4,096. A plain fp8 cast is coarser here: 3 mantissa bits means each value can be off by up to about 6% of itself. Real fp8 and int8 schemes add per-tensor, per-channel or per-block scales, quantize activations as well, and run matmuls directly in 8 bits on hardware that supports it. Libraries such as <code>torchao</code> package these recipes. This tutorial stops at the idea: fewer bits per weight, plus a scale to keep the range.</p>
+
+<div class="hands-on">
+<div class="hands-on-hdr">Hands-on · do this now</div>
+<div class="hands-on-body">
+<p>1. Run <code>device.py</code> and note which device your machine picks. If it is <code>mps</code> or <code>cuda</code>, run the Chapter 8 script's model on it (Exercise 9.3) and confirm the logits match the CPU to about 1e-5.</p>
+<p>2. Run <code>range_precision.py</code>, then predict before running: what is <code>torch.tensor(1000.0, dtype=torch.bfloat16) + 1</code>? (At 1000 the bf16 spacing is <code>2^9 / 128 = 4</code>, so the answer is 1000.)</p>
+<p>3. Run <code>autocast_cpu.py</code>, then change <code>device_type="cpu"</code> to <code>"mps"</code> (and move the model and data there) if you are on a Mac. Which dtypes change? (With torch 2.8 on the laptop used here, only <code>softmax</code>: it comes out <code>float32</code> under <code>mps</code> autocast, as it would on CUDA.)</p>
+<p>4. Use <code>kv_cache_bytes</code> to answer: how many tokens of KV cache fit in 1 GiB for the Llama-2-7B shape in bf16? (2,048.)</p>
+</div>
+</div>
+
+<h2 id="exercises">Exercises</h2>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 9.1</span>
+  <span class="exercise-diff easy">easy</span>
+  <span class="exercise-title">Memory for a 1.3B model</span>
+</div>
+<div class="exercise-body">
+<p>A 1.3-billion-parameter model has 24 layers, 16 KV heads, head dimension 128. Estimate (a) training memory with Adam and mixed precision, excluding activations, (b) bf16 inference weights, (c) the bf16 KV cache for a batch of 8 sequences of 2,048 tokens.</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<div class="code" data-lang="python">
+<pre><code>def kv_cache_bytes(layers, kv_heads, head_dim, seq_len, batch, bytes_per_value):
+    return 2 * layers * kv_heads * head_dim * seq_len * batch * bytes_per_value
+
+P = 1.3e9
+print(f"train, Adam + mixed precision: {P * 16 / 1e9:.1f} GB")
+print(f"inference weights, bf16:       {P * 2 / 1e9:.1f} GB")
+kv = kv_cache_bytes(layers=24, kv_heads=16, head_dim=128, seq_len=2048, batch=8, bytes_per_value=2)
+print(f"KV cache, 8 x 2048 tokens:     {kv / 2**30:.2f} GiB")</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>train, Adam + mixed precision: 20.8 GB
+inference weights, bf16:       2.6 GB
+KV cache, 8 x 2048 tokens:     3.00 GiB</code></pre>
+</div>
+<p>At this batch size the KV cache is already larger than the weights.</p>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 9.2</span>
+  <span class="exercise-diff easy">easy</span>
+  <span class="exercise-title">Where integers stop being exact</span>
+</div>
+<div class="exercise-body">
+<p>Find the smallest positive integer that bf16 cannot represent exactly, and the same for fp16, by searching with tensors. Predict both from the mantissa widths first. Also reproduce the fp16 overflow at 65,520 and the bf16 rounding of <code>1 + 1/256</code>.</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<p>With <code>m</code> stored mantissa bits, every integer up to <code>2^(m+1)</code> is exact; the next one is not. bf16: <code>2^8 + 1 = 257</code>. fp16: <code>2^11 + 1 = 2049</code>. fp32: <code>2^24 + 1</code>.</p>
+<div class="code" data-lang="python">
+<pre><code>import torch
+
+def first_unrepresentable_integer(dtype):
+    n = 1
+    while torch.tensor(n, dtype=torch.float64).to(dtype).item() == n:
+        n += 1
+    return n
+
+for dt in (torch.bfloat16, torch.float16):
+    n = first_unrepresentable_integer(dt)
+    print(dt, n, torch.tensor(n, dtype=dt).item())
+print(torch.tensor(2**24 + 1, dtype=torch.float32).item())        # fp32: 2^24 + 1
+print(torch.tensor([65504.0, 65520.0]).half())
+print(torch.tensor(1 + 1/256).bfloat16().item(), torch.tensor(1 + 1/128).bfloat16().item())</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>torch.bfloat16 257 256.0
+torch.float16 2049 2048.0
+16777216.0
+tensor([65504.,    inf], dtype=torch.float16)
+1.0 1.0078125</code></pre>
+</div>
+<p>One consequence: a bf16 tensor cannot count tokens or positions past 256 exactly. Keep indices and counters in integer dtypes.</p>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 9.3</span>
+  <span class="exercise-diff medium">medium</span>
+  <span class="exercise-title">Move a model and a batch to the best device</span>
+</div>
+<div class="exercise-body">
+<p>Using <code>MicroGPT</code>, <code>NamesDataset</code> and <code>collate</code> from Chapter 8's <code>train_names.py</code>, compute logits for a batch of 4 names on the CPU, then move model and batch to <code>best_device()</code>, assert every parameter is there, run the forward again, and compare with the CPU result.</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<div class="code" data-lang="python">
+<pre><code>import torch
+from train_names import NAMES, NamesDataset, MicroGPT, collate
+
+def best_device():
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+device = best_device()
+torch.manual_seed(0)
+model = MicroGPT()
+inputs, targets = collate([NamesDataset(NAMES)[i] for i in range(4)])
+ref = model(inputs)                                  # CPU result, for comparison
+
+model.to(device)                                     # in place
+inputs, targets = inputs.to(device), targets.to(device)   # NOT in place: reassign
+assert all(t.device.type == device.type for t in list(model.parameters()) + list(model.buffers()))
+logits = model(inputs)
+print(device, logits.device, logits.shape)
+print(torch.allclose(logits.cpu(), ref, atol=1e-5), (logits.cpu() - ref).abs().max().item())</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>mps mps:0 torch.Size([4, 9, 27])
+True 4.470348358154297e-08</code></pre>
+</div>
+<p>Different devices use different kernels and summation orders, so results agree to float32 rounding, not bit for bit. Compare across devices with <code>allclose</code>, never <code>==</code>. Note <code>MicroGPT</code> creates its position indices with <code>device=idx.device</code>, so it follows its input automatically.</p>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 9.4</span>
+  <span class="exercise-diff medium">medium</span>
+  <span class="exercise-title">Trace dtypes through an autocast forward pass</span>
+</div>
+<div class="exercise-body">
+<p>Register a forward hook on every submodule of Chapter 8's <code>MicroGPT</code> that records the input and output dtype, run a forward pass and the loss under CPU bf16 autocast, and print the trace. Explain why some <code>Linear</code> layers receive fp32 inputs.</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<div class="code" data-lang="python">
+<pre><code>import torch
+import torch.nn.functional as F
+from train_names import NAMES, NamesDataset, MicroGPT, collate, VOCAB
+
+torch.manual_seed(0)
+model = MicroGPT()
+inputs, targets = collate([NamesDataset(NAMES)[i] for i in range(4)])
+
+seen = []
+def record(module, args, output):
+    seen.append((type(module).__name__, args[0].dtype, output.dtype))
+
+hooks = [m.register_forward_hook(record) for m in model.modules() if m is not model]
+with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+    logits = model(inputs)
+    loss = F.cross_entropy(logits.view(-1, VOCAB), targets.view(-1))
+for h in hooks:
+    h.remove()
+
+for name, dtype_in, dtype_out in seen:
+    print(f"{name:10s} in={str(dtype_in):15s} out={dtype_out}")
+print("logits", logits.dtype, "| loss", loss.dtype, "| weights", model.qkv.weight.dtype)</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>Embedding  in=torch.int64     out=torch.float32
+Embedding  in=torch.int64     out=torch.float32
+Linear     in=torch.float32   out=torch.bfloat16
+Linear     in=torch.bfloat16  out=torch.bfloat16
+Linear     in=torch.float32   out=torch.bfloat16
+Linear     in=torch.bfloat16  out=torch.bfloat16
+Linear     in=torch.float32   out=torch.bfloat16
+logits torch.bfloat16 | loss torch.float32 | weights torch.float32</code></pre>
+</div>
+<p>The order is <code>tok</code>, <code>pos</code>, <code>qkv</code>, <code>proj</code>, <code>up</code>, <code>down</code>, <code>head</code>. Embedding lookups are not on autocast's list, so they return fp32. The residual stream <code>x</code> stays fp32 all the way: <code>x + self.proj(...)</code> adds fp32 and bf16, and type promotion picks fp32. So <code>qkv</code>, <code>up</code> and <code>head</code>, which read the (normalised) residual stream, get fp32 inputs and autocast casts them; <code>proj</code> and <code>down</code> read outputs of other bf16 ops. A residual stream in fp32 is a nice side effect: the running sum keeps full precision.</p>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 9.5</span>
+  <span class="exercise-diff hard">hard</span>
+  <span class="exercise-title">Decode bf16 bits by hand</span>
+</div>
+<div class="exercise-body">
+<p>Write <code>decode_bf16(x)</code> that converts <code>x</code> to bf16, reads its 16 bits with <code>.view(torch.int16)</code>, extracts sign, exponent and mantissa with shifts and masks, and rebuilds the value with the formula from this chapter. Check it against PyTorch for 1.0, -6.5, 0.1, 3.14159, 1e-3 and 70000.</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<div class="code" data-lang="python">
+<pre><code>import torch
+
+def decode_bf16(x):
+    bits = torch.tensor(x, dtype=torch.bfloat16).view(torch.int16).item() &amp; 0xFFFF
+    sign = bits &gt;&gt; 15
+    exponent = (bits &gt;&gt; 7) &amp; 0xFF                # 8 bits
+    mantissa = bits &amp; 0x7F                       # 7 bits
+    assert 0 &lt; exponent &lt; 255, "only normal numbers here"
+    value = (-1) ** sign * 2.0 ** (exponent - 127) * (1 + mantissa / 128)
+    return sign, exponent, mantissa, value
+
+for x in (1.0, -6.5, 0.1, 3.14159, 1e-3, 70000.0):
+    s, e, m, v = decode_bf16(x)
+    stored = torch.tensor(x, dtype=torch.bfloat16).item()
+    print(f"{x:&gt;9}: sign={s} exp={e:3d} (2^{e - 127:+d}) mant={m:3d}  value={v:&lt;12g} torch={stored:g}")</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>      1.0: sign=0 exp=127 (2^+0) mant=  0  value=1            torch=1
+     -6.5: sign=1 exp=129 (2^+2) mant= 80  value=-6.5         torch=-6.5
+      0.1: sign=0 exp=123 (2^-4) mant= 77  value=0.100098     torch=0.100098
+  3.14159: sign=0 exp=128 (2^+1) mant= 73  value=3.14062      torch=3.14062
+    0.001: sign=0 exp=117 (2^-10) mant=  3  value=0.000999451  torch=0.000999451
+  70000.0: sign=0 exp=143 (2^+16) mant=  9  value=70144        torch=70144</code></pre>
+</div>
+<p>The <code>&amp; 0xFFFF</code> undoes the sign extension of a negative <code>int16</code>. 0.1 has no exact binary representation in any format; bf16 keeps 0.100098. π keeps only 3.14062, which is why nobody accumulates in bf16. Exponent 0 (zero and subnormals) and 255 (infinity and NaN) are special and excluded here.</p>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 9.6</span>
+  <span class="exercise-diff hard">hard</span>
+  <span class="exercise-title">How many sequences fit on an 80 GB GPU?</span>
+</div>
+<div class="exercise-body">
+<p>You serve a 7B model in bf16 on one 80 GB GPU, with the Llama-2-7B shape (32 layers, head dim 128). Ignoring activations and allocator overhead, how many concurrent 4,096-token sequences fit with 32 KV heads? With 8 KV heads (GQA)? What else would double the answer?</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<div class="code" data-lang="python">
+<pre><code>def kv_cache_bytes(layers, kv_heads, head_dim, seq_len, batch, bytes_per_value):
+    return 2 * layers * kv_heads * head_dim * seq_len * batch * bytes_per_value
+
+gpu = 80e9
+weights = 7e9 * 2                                    # bf16
+free = gpu - weights
+for kv_heads in (32, 8):
+    per_seq = kv_cache_bytes(32, kv_heads, 128, 4096, 1, 2)
+    print(f"kv_heads={kv_heads:2d}: {per_seq / 1e9:.3f} GB per sequence -&gt; {int(free // per_seq)} sequences")</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>kv_heads=32: 2.147 GB per sequence -&gt; 30 sequences
+kv_heads= 8: 0.537 GB per sequence -&gt; 122 sequences</code></pre>
+</div>
+<p>Storing the cache in an 8-bit format (fp8 KV cache) halves <code>bytes_per_value</code> and doubles the count; so would quantizing the weights to 8 bits, which frees another 7 GB. Real servers also lose memory to activations, fragmentation and CUDA context, which is why they allocate the cache in fixed-size pages (vLLM's PagedAttention) instead of one big block per sequence.</p>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise" id="ex-9-7">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 9.7</span>
+  <span class="exercise-diff medium">medium</span>
+  <span class="exercise-title">Why the master weights stay fp32</span>
+</div>
+<div class="exercise-body">
+<p>A weight equals 1.0 and each optimizer step subtracts 0.001 (a typical <code>lr × update</code>). Show what one step does to a bf16 weight and to an fp32 weight, then apply 1,000 steps to each. Connect the result to how <code>autocast</code> handles parameters.</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<div class="code" data-lang="python">
+<pre><code>import torch
+
+w = torch.tensor(1.0)
+update = torch.tensor(1e-3)                         # lr * gradient, a typical step
+print((w.bfloat16() - update.bfloat16()).item())    # bf16 weight: the step is lost
+print((w - update).item())                          # fp32 weight: the step lands
+
+w16 = torch.tensor(1.0, dtype=torch.bfloat16)
+w32 = torch.tensor(1.0)
+for _ in range(1000):
+    w16 = w16 - update.bfloat16()
+    w32 = w32 - update
+print(w16.item(), w32.item())                       # after 1000 steps: should be ~0.0</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>1.0
+0.9990000128746033
+1.0 9.324634447693825e-06</code></pre>
+</div>
+<p>Near 1.0 the bf16 spacing is 1/128 ≈ 0.0078 (and 1/256 just below 1.0), so subtracting 0.001 rounds straight back to 1.0. After 1,000 steps the bf16 weight has not moved at all, while fp32 has travelled the full distance. This is why autocast keeps parameters in fp32 and only casts copies for the matmuls, and why "classic" mixed precision kept an fp32 master copy of fp16 weights.</p>
+</div>
+</details>
+</div>
+</div>
+
+<h2 id="recap">Recap</h2>
+<ul>
+  <li>A tensor's device is where it lives; all inputs to an op must share it. Pick <code>cuda</code>, then <code>mps</code>, then <code>cpu</code>. <code>tensor.to()</code> returns a new tensor (reassign it); <code>module.to()</code> moves in place.</li>
+  <li>Mixing devices raises "Expected all tensors to be on the same device". <code>.item()</code>, <code>.cpu()</code> and <code>.numpy()</code> need the data on the host.</li>
+  <li>On CUDA, <code>pin_memory=True</code> + <code>non_blocking=True</code> make host-to-GPU copies asynchronous; GPU ops are asynchronous in general (Chapter 11).</li>
+  <li>Floats are sign / exponent (range) / mantissa (precision). fp32 1/8/23, fp16 1/5/10 (max 65,504), bf16 1/8/7 (fp32's range, <code>eps = 1/128</code>), TF32 1/8/10 inside tensor cores, fp8 e4m3 (max 448) and e5m2.</li>
+  <li>fp16 overflows past 65,504 and underflows below 6e-8; bf16 rounds <code>1 + 1/256</code> to 1. Long sums need fp32 accumulators, which PyTorch reductions and tensor cores use.</li>
+  <li>TF32 for fp32 matmuls: <code>torch.set_float32_matmul_precision("high")</code>, CUDA only, off by default.</li>
+  <li><code>torch.autocast</code> runs matmuls in bf16/fp16 and sensitive ops in fp32, while parameters and gradients stay fp32. fp16 also needs <code>torch.amp.GradScaler("cuda")</code> to stop gradient underflow; bf16 does not.</li>
+  <li>Training with Adam ≈ 16 bytes/param plus activations; bf16 inference = 2 bytes/param; KV cache = <code>2 × layers × kv_heads × head_dim × seq_len × batch × bytes</code>. Measure with <code>element_size() * numel()</code> and <code>torch.cuda.max_memory_allocated()</code>.</li>
+  <li>Quantization stores weights in 8 bits (or fewer) plus scales, halving bf16's memory again.</li>
+</ul>
+
+<div class="page-nav">
+  <a href="08-training-loop.html"><span class="lbl">← Prev</span><span class="ttl">The Training Loop</span></a>
+  <a href="10-inference.html" class="next"><span class="lbl">Next →</span><span class="ttl">Inference &amp; Sampling</span></a>
+</div>
+
+</main>
+</div>
+<script src="../assets/site.js"></script>
+</body>
+</html>

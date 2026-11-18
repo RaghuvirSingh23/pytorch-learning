@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PyTorch — A Deep Dive</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<button class="sidebar-toggle" aria-label="Toggle navigation">☰ Menu</button>
+
+<div class="layout">
+<aside class="sidebar">
+  <a href="index.html" class="brand">PyTorch</a>
+  <span class="brand-sub">a deep dive — 2026</span>
+  <nav>
+    <ol>
+      <li><a href="chapters/01-why-pytorch.html">Why PyTorch</a></li>
+      <li><a href="chapters/02-tensors.html">Tensors</a></li>
+      <li><a href="chapters/03-tensor-math.html">Tensor Math &amp; Broadcasting</a></li>
+      <li><a href="chapters/04-autograd.html">Autograd</a></li>
+      <li><a href="chapters/05-nn-module.html">nn.Module</a></li>
+      <li><a href="chapters/06-transformer-blocks.html">Building a Transformer</a></li>
+      <li><a href="chapters/07-losses-optimizers.html">Losses &amp; Optimizers</a></li>
+      <li><a href="chapters/08-training-loop.html">The Training Loop</a></li>
+      <li><a href="chapters/09-devices-precision.html">Devices &amp; Precision</a></li>
+      <li><a href="chapters/10-inference.html">Inference &amp; Sampling</a></li>
+      <li><a href="chapters/11-performance.html">Performance &amp; Profiling</a></li>
+      <li><a href="chapters/12-debugging.html">Debugging PyTorch</a></li>
+      <li><a href="chapters/13-50-questions.html">The 50 Questions</a></li>
+      <li><a href="chapters/14-capstone.html">Capstone Project</a></li>
+    </ol>
+    <div class="extras">
+      <a href="exercises.html">All Exercises</a>
+    </div>
+  </nav>
+  <div class="progress"></div>
+</aside>
+
+<main class="content">
+
+<section class="hero">
+  <h1>
+    <span class="chap-num">A Deep Dive</span>
+    PyTorch, from first principles.
+  </h1>
+  <p class="lede">
+    You built a GPT out of plain Python numbers: a <code>Value</code> class,
+    hand-written <code>backward()</code>, and Adam in a <code>for</code> loop.
+    It works and it's slow. PyTorch is the same ideas, done for whole
+    grids of numbers at once, with the gradient bookkeeping done for you.
+    This tutorial starts at "what is a tensor" and ends with you rebuilding
+    microgpt in PyTorch: batched training, a KV cache, sampling, and a
+    profile that shows where the time goes.
+  </p>
+  <div class="hero-meta">
+    <span><strong>14</strong> chapters</span>
+    <span><strong>90+</strong> exercises</span>
+    <span><strong>50</strong> interview-style questions</span>
+    <span>~<strong>8 hours</strong> to read, weeks to internalise</span>
+  </div>
+</section>
+
+<h2 id="how-to-use">How to use this tutorial</h2>
+
+<p>
+  This is a <strong>hands-on</strong> tutorial. You learn PyTorch by
+  running it and looking at what comes back: shapes, numbers, gradients.
+  Every chapter contains:
+</p>
+<ul>
+  <li><strong>Concept prose</strong>: what the feature is, why it exists, and the smallest example that shows it.</li>
+  <li><strong>Code examples</strong>: every snippet is copy-pasteable and was run against PyTorch 2.8. Expected output is shown in comments or in an output block.</li>
+  <li><strong>Hands-on blocks</strong>: things you should actually type, with what you should see.</li>
+  <li><strong>microgpt links</strong>: where the idea shows up in <code>microgpt.py</code>, so each new API lands on code you already understand.</li>
+  <li><strong>Pitfalls</strong>: the bugs that cost real people real days.</li>
+  <li><strong>Exercises</strong>: several per chapter, each with a collapsible solution. Do them. Don't peek.</li>
+</ul>
+
+<div class="callout tip">
+<div class="callout-title">Before you start</div>
+<p>Make a scratch directory with its own virtual environment and stay in it for the whole course:</p>
+<div class="code terminal" data-lang="sh">
+<pre><code>$ mkdir -p ~/learning-pytorch &amp;&amp; cd ~/learning-pytorch
+$ python3 -m venv .venv &amp;&amp; source .venv/bin/activate
+$ pip install torch numpy
+$ python -c "import torch; print(torch.__version__)"
+2.8.0</code></pre>
+</div>
+<p>Any PyTorch 2.x prints a version and works for almost everything here. Chapters that need a GPU say so, and show what to expect on CPU or Apple Silicon (<code>mps</code>) instead.</p>
+</div>
+
+<h2 id="what-you-will-learn">What you will learn</h2>
+
+<p>By the end of this tutorial you will:</p>
+<ul>
+  <li>Read any tensor expression and say its output <strong>shape</strong> before you run it, including broadcasting and batched matmul.</li>
+  <li>Explain what <code>loss.backward()</code> does in terms of the <code>Value</code> engine you already wrote, and know when gradients accumulate, when they're freed, and how to turn tracking off.</li>
+  <li>Write <code>nn.Module</code>s for embeddings, attention, RMSNorm, and MLPs, and know exactly which tensors are parameters, buffers, or plain intermediates.</li>
+  <li>Write a training loop that is correct (zero grads, train/eval modes, checkpoints) and fast enough (batches, devices, mixed precision).</li>
+  <li>Run inference the way serving engines do: <code>inference_mode</code>, temperature, top-k/top-p, and a KV cache in PyTorch.</li>
+  <li>Time GPU code correctly, read a profiler trace, and debug shape errors, NaNs, and silent broadcasting bugs.</li>
+</ul>
+
+<h2 id="contents">Table of contents</h2>
+
+<div class="toc-grid">
+  <a href="chapters/01-why-pytorch.html" class="toc-card">
+    <span class="num">01</span>
+    <h3>Why PyTorch</h3>
+    <p>From microgpt's scalar <code>Value</code> engine to tensors: what a framework gives you, and why the same model runs hundreds of times faster.</p>
+  </a>
+  <a href="chapters/02-tensors.html" class="toc-card">
+    <span class="num">02</span>
+    <h3>Tensors</h3>
+    <p>Shape, dtype, device. Creating, indexing, and slicing. Views vs copies, strides, and <code>contiguous()</code>.</p>
+  </a>
+  <a href="chapters/03-tensor-math.html" class="toc-card">
+    <span class="num">03</span>
+    <h3>Tensor Math &amp; Broadcasting</h3>
+    <p>Elementwise ops, reductions over a <code>dim</code>, the broadcasting rules, <code>@</code>, batched matmul, and <code>einsum</code>.</p>
+  </a>
+  <a href="chapters/04-autograd.html" class="toc-card">
+    <span class="num">04</span>
+    <h3>Autograd</h3>
+    <p>The graph PyTorch records, <code>backward()</code>, gradient accumulation, <code>no_grad</code>, <code>detach</code>, and how it maps to your <code>Value</code> class.</p>
+  </a>
+  <a href="chapters/05-nn-module.html" class="toc-card">
+    <span class="num">05</span>
+    <h3>nn.Module</h3>
+    <p>Parameters, buffers, submodules, <code>forward</code>, <code>state_dict</code>, and train vs eval mode. <code>nn.Linear</code> and <code>nn.Embedding</code> from the inside.</p>
+  </a>
+  <a href="chapters/06-transformer-blocks.html" class="toc-card">
+    <span class="num">06</span>
+    <h3>Building a Transformer</h3>
+    <p>RMSNorm, causal masks, multi-head attention with <code>(B, H, T, D)</code> shapes, <code>scaled_dot_product_attention</code>, and the MLP. microgpt, tensorized.</p>
+  </a>
+  <a href="chapters/07-losses-optimizers.html" class="toc-card">
+    <span class="num">07</span>
+    <h3>Losses &amp; Optimizers</h3>
+    <p><code>cross_entropy</code> on logits, SGD, Adam, AdamW, learning-rate schedules, and gradient clipping.</p>
+  </a>
+  <a href="chapters/08-training-loop.html" class="toc-card">
+    <span class="num">08</span>
+    <h3>The Training Loop</h3>
+    <p>Batches and padding, <code>Dataset</code> and <code>DataLoader</code>, train/eval loops, checkpoints, and reproducibility.</p>
+  </a>
+  <a href="chapters/09-devices-precision.html" class="toc-card">
+    <span class="num">09</span>
+    <h3>Devices &amp; Precision</h3>
+    <p>CPU, CUDA, and MPS. fp32, fp16, bf16, TF32. <code>autocast</code>, <code>GradScaler</code>, and how much memory a model really needs.</p>
+  </a>
+  <a href="chapters/10-inference.html" class="toc-card">
+    <span class="num">10</span>
+    <h3>Inference &amp; Sampling</h3>
+    <p><code>inference_mode</code>, greedy vs sampling, temperature, top-k, top-p, a KV cache in PyTorch, and batched generation.</p>
+  </a>
+  <a href="chapters/11-performance.html" class="toc-card">
+    <span class="num">11</span>
+    <h3>Performance &amp; Profiling</h3>
+    <p>Timing asynchronous GPU code correctly, <code>torch.profiler</code>, launch overhead, hidden syncs, and <code>torch.compile</code>.</p>
+  </a>
+  <a href="chapters/12-debugging.html" class="toc-card">
+    <span class="num">12</span>
+    <h3>Debugging PyTorch</h3>
+    <p>Shape errors, NaNs, device mismatches, silent broadcasting, in-place errors, and checking your code against a reference.</p>
+  </a>
+  <a href="chapters/13-50-questions.html" class="toc-card">
+    <span class="num">13</span>
+    <h3>The 50 Questions</h3>
+    <p>Every common interview and real-world PyTorch question, answered with code.</p>
+  </a>
+  <a href="chapters/14-capstone.html" class="toc-card">
+    <span class="num">14</span>
+    <h3>Capstone Project</h3>
+    <p>Rebuild microgpt in PyTorch from an empty file: batched training, AdamW, checkpoints, KV-cache generation, and a profile.</p>
+  </a>
+</div>
+
+<h2 id="prereqs">Prerequisites</h2>
+<ul>
+  <li>Comfortable Python: functions, classes, list comprehensions.</li>
+  <li>The transformer at the level of <code>microgpt.py</code>: embeddings, attention, MLP, softmax, cross-entropy, and Adam. If you can explain what <code>gpt_step</code> does, you're ready.</li>
+  <li>High-school calculus is enough: "the derivative says which way is downhill". Chapter 4 rebuilds the rest.</li>
+  <li>A GPU is optional. Everything runs on a laptop CPU; the GPU-only parts (CUDA timing, TF32, <code>GradScaler</code>) say so.</li>
+</ul>
+
+<div class="callout history">
+<div class="callout-title">What this tutorial is not</div>
+<p>
+  This is not a reference manual. For exhaustive detail, read the official
+  <a href="https://docs.pytorch.org/docs/stable/index.html">PyTorch documentation</a>
+  and the <a href="https://docs.pytorch.org/tutorials/">official tutorials</a>.
+  This tutorial is the <em>curriculum</em> those docs assume you already have:
+  a guided path through the parts you will actually use to train and serve
+  language models, with exercises that build the intuition a reference
+  page can't.
+</p>
+</div>
+
+<p style="text-align: center; margin-top: 60px;">
+  <a href="chapters/01-why-pytorch.html" style="font-size: 20px;">→ Begin: Chapter 1 — Why PyTorch</a>
+</p>
+
+</main>
+</div>
+
+<script src="assets/site.js"></script>
+</body>
+</html>

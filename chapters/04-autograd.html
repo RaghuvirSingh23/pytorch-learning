@@ -1,0 +1,918 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>4 · Autograd — PyTorch</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<button class="sidebar-toggle" aria-label="Toggle navigation">☰ Menu</button>
+<div class="layout">
+<aside class="sidebar">
+  <a href="../index.html" class="brand">PyTorch</a>
+  <span class="brand-sub">a deep dive — 2026</span>
+  <nav>
+    <ol>
+      <li><a href="01-why-pytorch.html">Why PyTorch</a></li>
+      <li><a href="02-tensors.html">Tensors</a></li>
+      <li><a href="03-tensor-math.html">Tensor Math &amp; Broadcasting</a></li>
+      <li><a href="04-autograd.html">Autograd</a></li>
+      <li><a href="05-nn-module.html">nn.Module</a></li>
+      <li><a href="06-transformer-blocks.html">Building a Transformer</a></li>
+      <li><a href="07-losses-optimizers.html">Losses &amp; Optimizers</a></li>
+      <li><a href="08-training-loop.html">The Training Loop</a></li>
+      <li><a href="09-devices-precision.html">Devices &amp; Precision</a></li>
+      <li><a href="10-inference.html">Inference &amp; Sampling</a></li>
+      <li><a href="11-performance.html">Performance &amp; Profiling</a></li>
+      <li><a href="12-debugging.html">Debugging PyTorch</a></li>
+      <li><a href="13-50-questions.html">The 50 Questions</a></li>
+      <li><a href="14-capstone.html">Capstone Project</a></li>
+    </ol>
+    <div class="extras">
+      <a href="../exercises.html">All Exercises</a>
+      <a href="../index.html">← Home</a>
+    </div>
+  </nav>
+  <div class="progress"></div>
+</aside>
+
+<main class="content">
+
+<h1>
+  <span class="chap-num">Chapter 04</span>
+  Autograd
+</h1>
+<p class="lede">
+  You already wrote an autograd engine: the <code>Value</code> class in
+  <code>microgpt_scalar.py</code>. PyTorch's autograd is the same idea, one
+  graph node per tensor operation instead of per number. This chapter maps
+  every piece of your engine onto PyTorch's, then covers the parts you never
+  needed in a scalar engine: gradient accumulation across calls, freeing the
+  graph, turning tracking off for inference, and writing your own backward.
+</p>
+
+<h2 id="value-recap">Your engine, in four ideas</h2>
+
+<p>Here is the backward pass you wrote. Read it once more, because every PyTorch concept in this chapter is one of its lines.</p>
+
+<div class="code" data-lang="python">
+<div class="code-hdr"><span class="lang">python</span><span class="title">microgpt_scalar.py (excerpt)</span></div>
+<pre><code>class Value:
+    def __init__(self, data, children=(), local_gradients=()):
+        self.data = data
+        self.grad = 0.0
+        self._children = children
+        self._local_gradients = local_gradients
+
+    def __mul__(self, other):
+        other = other if isinstance(other, Value) else Value(other)
+        return Value(
+            self.data * other.data,
+            children=(self, other),
+            local_gradients=(other.data, self.data),
+        )
+
+    def backward(self):
+        ...                                  # build topological_order
+        self.grad = 1.0
+        for value in reversed(topological_order):
+            for child, local_gradient in zip(value._children, value._local_gradients):
+                child.grad += local_gradient * value.grad</code></pre>
+</div>
+
+<ol>
+  <li><strong>Children.</strong> Every result remembers the values it was computed from. That set of links is the <strong>computation graph</strong>: a directed acyclic graph (DAG) whose edges point from a result back to its inputs.</li>
+  <li><strong>Local gradients.</strong> At creation time, each result stores the derivative of itself with respect to each child. For <code>a * b</code> that is <code>(b, a)</code>.</li>
+  <li><strong>Topological order.</strong> Walk the graph so that a node is processed only after every node that uses it. Then its <code>.grad</code> is complete before it passes gradient on.</li>
+  <li><strong>Chain rule with <code>+=</code>.</strong> <code>child.grad += local_gradient * value.grad</code>. The <code>+=</code> matters: when a value is used twice, both paths contribute.</li>
+</ol>
+
+<p>Right after the class, your file tests it:</p>
+
+<div class="code" data-lang="python">
+<pre><code>a = Value(2.0)
+b = Value(-3.0)
+m = a * b
+c = m + a
+
+assert c.data == -4.0
+c.backward()
+
+assert c.grad == 1.0
+assert m.grad == 1.0
+assert a.grad == -2.0      # b + 1: one path through m, one direct
+assert b.grad == 2.0</code></pre>
+</div>
+
+<h2 id="same-test">The same test, with tensors</h2>
+
+<p>A <strong>tensor</strong> can join the graph by being created with <code>requires_grad=True</code>. That flag means "record every operation that uses me, because someone will want my gradient later".</p>
+
+<div class="code" data-lang="python">
+<pre><code>import torch
+
+a = torch.tensor(2.0, requires_grad=True)
+b = torch.tensor(-3.0, requires_grad=True)
+m = a * b
+c = m + a
+
+print(c)
+c.backward()
+print(a.grad, b.grad)</code></pre>
+</div>
+
+<div class="code" data-lang="text">
+<pre><code>tensor(-4., grad_fn=&lt;AddBackward0&gt;)
+tensor(-2.) tensor(2.)</code></pre>
+</div>
+
+<p>Same numbers. <code>grad_fn=&lt;AddBackward0&gt;</code> is the node that knows how to push gradient back through the <code>+</code>. We will open it up in a moment.</p>
+
+<p>Two of your four asserts are missing. Try reading <code>m.grad</code>:</p>
+
+<div class="code" data-lang="text">
+<pre><code>UserWarning: The .grad attribute of a Tensor that is not a leaf Tensor is being accessed. Its .grad attribute won't be populated during autograd.backward(). If you indeed want the .grad field to be populated for a non-leaf Tensor, use .retain_grad() on the non-leaf Tensor. ...
+None</code></pre>
+</div>
+
+<p>Your engine kept a gradient on every node. PyTorch, by default, only keeps gradients on <strong>leaf tensors</strong>: tensors you created directly, not results of operations. Intermediates like <code>m</code> can be huge (a <code>(batch, seq, 4096)</code> activation), and nobody updates them, so storing their gradients would waste memory. If you do want one, ask:</p>
+
+<div class="code" data-lang="python">
+<pre><code>a = torch.tensor(2.0, requires_grad=True)
+b = torch.tensor(-3.0, requires_grad=True)
+m = a * b
+m.retain_grad()          # ask autograd to keep m's gradient too
+c = m + a
+c.retain_grad()
+c.backward()
+
+assert c.item() == -4.0
+assert c.grad.item() == 1.0
+assert m.grad.item() == 1.0
+assert a.grad.item() == -2.0
+assert b.grad.item() == 2.0
+print("all four asserts pass")</code></pre>
+</div>
+
+<div class="code" data-lang="text">
+<pre><code>all four asserts pass</code></pre>
+</div>
+
+<p>Your second test, <code>y = (3.0 / x) - x</code>, works the same way:</p>
+
+<div class="code" data-lang="python">
+<pre><code>x = torch.tensor(2.0, requires_grad=True)
+y = (3.0 / x) - x
+y.backward()
+print(y.item(), x.grad.item())     # -0.5 -1.75</code></pre>
+</div>
+
+<h2 id="graph">The graph PyTorch records</h2>
+
+<p>Three attributes describe where a tensor sits in the graph:</p>
+
+<table>
+  <tr><th>Attribute</th><th>Meaning</th></tr>
+  <tr><td><code>requires_grad</code></td><td>Should operations on this tensor be recorded? Results inherit <code>True</code> if any input has it.</td></tr>
+  <tr><td><code>is_leaf</code></td><td><code>True</code> if no recorded operation produced this tensor. Leaves are where gradients get stored (<code>.grad</code>).</td></tr>
+  <tr><td><code>grad_fn</code></td><td>The backward node that produced this tensor, or <code>None</code> for leaves. This is your <code>_children</code> + <code>_local_gradients</code>, packaged as an object.</td></tr>
+</table>
+
+<div class="code" data-lang="python">
+<pre><code>a = torch.tensor(2.0, requires_grad=True)
+b = torch.tensor(-3.0, requires_grad=True)
+k = torch.tensor(5.0)                 # requires_grad defaults to False
+m = a * b
+c = m + a
+
+for name, t in [("a", a), ("b", b), ("k", k), ("m", m), ("c", c)]:
+    fn = t.grad_fn.name() if t.grad_fn is not None else None
+    print(name, t.requires_grad, t.is_leaf, fn)</code></pre>
+</div>
+
+<div class="code" data-lang="text">
+<pre><code>a True True None
+b True True None
+k False True None
+m True False MulBackward0
+c True False AddBackward0</code></pre>
+</div>
+
+<p><code>k</code> is a leaf too (every tensor that doesn't require grad counts as a leaf), but autograd ignores it: no <code>.grad</code> ever lands there. That is what a constant in your scalar engine was, a <code>Value(other)</code> wrapped around a plain float.</p>
+
+<h4>Walking the graph</h4>
+
+<p>Each backward node has <code>next_functions</code>: a tuple of <code>(node, index)</code> pairs, one per input of the forward operation. Following them from the output is the same recursion as your <code>build_topological_order</code>:</p>
+
+<div class="code" data-lang="python">
+<pre><code>def walk(fn, depth=0):
+    print("    " * depth + fn.name())
+    for child, _ in fn.next_functions:
+        if child is not None:          # None = input that doesn't need grad
+            walk(child, depth + 1)
+
+walk(c.grad_fn)
+print(c.grad_fn.next_functions[1][0].variable is a)</code></pre>
+</div>
+
+<div class="code" data-lang="text">
+<pre><code>AddBackward0
+    MulBackward0
+        torch::autograd::AccumulateGrad
+        torch::autograd::AccumulateGrad
+    torch::autograd::AccumulateGrad
+True</code></pre>
+</div>
+
+<p>The leaves show up as <code>AccumulateGrad</code> nodes. Each one holds a reference to its leaf tensor (<code>.variable</code>), and its whole job is <code>leaf.grad += incoming_gradient</code>: your <code>+=</code>, moved into a node. The diamond is visible too: <code>a</code>'s <code>AccumulateGrad</code> is reached twice, once directly from <code>AddBackward0</code> and once through <code>MulBackward0</code>.</p>
+
+<h4>Saved tensors: lazy local gradients</h4>
+
+<p>Your <code>__mul__</code> computed the local gradients <code>(other.data, self.data)</code> eagerly. PyTorch instead <strong>saves the tensors it will need</strong> and computes the local gradient during backward. For a multiply that is the two inputs; for <code>exp</code> it is the output (since d/dx e<sup>x</sup> = e<sup>x</sup>, exactly like your <code>exp()</code> stored <code>result</code>):</p>
+
+<div class="code" data-lang="python">
+<pre><code>m = a * b
+print(m.grad_fn._saved_self, m.grad_fn._saved_other)
+
+x = torch.tensor(2.0, requires_grad=True)
+e = x.exp()
+print(e.grad_fn.name(), e.grad_fn._saved_result)</code></pre>
+</div>
+
+<div class="code" data-lang="text">
+<pre><code>tensor(2., requires_grad=True) tensor(-3., requires_grad=True)
+ExpBackward0 tensor(7.3891, grad_fn=&lt;ExpBackward0&gt;)</code></pre>
+</div>
+
+<p>(The <code>_saved_*</code> attributes are for inspection only; the leading underscore means "not a stable API".) The mapping:</p>
+
+<table>
+  <tr><th>Your <code>Value</code> engine</th><th>PyTorch autograd</th></tr>
+  <tr><td><code>Value(2.0)</code> you want a gradient for</td><td>leaf tensor with <code>requires_grad=True</code></td></tr>
+  <tr><td><code>_children</code></td><td><code>grad_fn.next_functions</code></td></tr>
+  <tr><td><code>_local_gradients</code> (numbers, computed in forward)</td><td>saved tensors (computed into gradients in backward)</td></tr>
+  <tr><td><code>build_topological_order</code> + reversed loop</td><td>the C++ autograd engine, run by <code>.backward()</code></td></tr>
+  <tr><td><code>child.grad += ...</code></td><td><code>AccumulateGrad</code> node writing into <code>leaf.grad</code></td></tr>
+  <tr><td><code>.grad</code> on every node</td><td><code>.grad</code> on leaves only (unless <code>retain_grad()</code>)</td></tr>
+</table>
+
+<div class="callout hood">
+<div class="callout-title">Under the hood: how the engine orders work</div>
+<p>Instead of a depth-first topological sort, the engine first counts, for every node reachable from the output, how many gradients it must wait for. Then it runs a ready queue: a node executes only once all its incoming gradients have arrived and been summed. That gives the same guarantee as your reversed topological order. The graph is also <strong>dynamic</strong> ("define-by-run"): it is rebuilt from scratch on every forward pass, exactly like your <code>calculate_document_loss</code> creates fresh <code>Value</code> objects for each document. That is why Python <code>if</code> and <code>for</code> inside a model just work.</p>
+</div>
+
+<h2 id="backward">backward(): scalars, accumulation, zeroing</h2>
+
+<p><code>t.backward()</code> starts the chain rule at <code>t</code> with an initial gradient of 1 (your <code>self.grad = 1.0</code>) and runs back to every leaf. It returns nothing; results land in each leaf's <code>.grad</code>.</p>
+
+<h4>Gradients accumulate across calls</h4>
+
+<p>Since leaves receive gradient with <code>+=</code>, calling <code>backward()</code> again adds to what is already there:</p>
+
+<div class="code" data-lang="python">
+<pre><code>x = torch.tensor(3.0, requires_grad=True)
+
+for step in range(3):
+    y = x * x            # build a fresh graph each time
+    y.backward()         # dy/dx = 2x = 6
+    print(step, x.grad)</code></pre>
+</div>
+
+<div class="code" data-lang="text">
+<pre><code>0 tensor(6.)
+1 tensor(12.)
+2 tensor(18.)</code></pre>
+</div>
+
+<p>This is deliberate. It lets you split a big batch into small pieces, call <code>backward()</code> on each, and end up with the gradient of the whole batch (<strong>gradient accumulation</strong>, used when a batch doesn't fit in memory). But in a normal training loop you must clear gradients before each backward. You did this in microgpt with <code>for parameter in parameters: parameter.grad = 0.0</code>. PyTorch's version:</p>
+
+<div class="code" data-lang="python">
+<pre><code>x = torch.tensor(3.0, requires_grad=True)
+
+for step in range(3):
+    x.grad = None        # what optimizer.zero_grad(set_to_none=True) does
+    y = x * x
+    y.backward()
+    print(step, x.grad)  # 6. every time</code></pre>
+</div>
+
+<p>In practice you call <code>optimizer.zero_grad()</code> (or <code>model.zero_grad()</code>), which does that for every parameter. Since PyTorch 2.0 its default is <code>set_to_none=True</code>: <code>.grad</code> becomes <code>None</code> instead of a tensor of zeros, which saves a memory write and lets the next backward simply assign. <code>zero_grad(set_to_none=False)</code> keeps the old zero-fill. microgpt's training loop spells the default out: <code>optimizer.zero_grad(set_to_none=True)</code>, then <code>loss.backward()</code>.</p>
+
+<div class="callout pitfall">
+<div class="callout-title">Forgetting <code>zero_grad</code> doesn't crash</div>
+<p>It trains on the running sum of every gradient since the start. Loss usually still goes down for a while, then the steps get huge and it diverges. If a loop "almost works", check that <code>zero_grad()</code> runs once per optimizer step.</p>
+</div>
+
+<h4>Non-scalar outputs need a <code>gradient</code></h4>
+
+<p>Your engine always started from one number, the loss. If the output is a vector, "the gradient" is ambiguous: of which number? PyTorch refuses to guess:</p>
+
+<div class="code" data-lang="python">
+<pre><code>x = torch.tensor([1.0, 2.0, 3.0], requires_grad=True)
+y = x * x                     # shape (3,), not a scalar
+
+try:
+    y.backward()
+except RuntimeError as e:
+    print("RuntimeError:", e)
+
+y.backward(gradient=torch.ones(3))     # "pretend loss = y.sum()"
+print(x.grad)
+
+x.grad = None
+y = x * x
+y.backward(gradient=torch.tensor([1.0, 0.0, 10.0]))
+print(x.grad)</code></pre>
+</div>
+
+<div class="code" data-lang="text">
+<pre><code>RuntimeError: grad can be implicitly created only for scalar outputs
+tensor([2., 4., 6.])
+tensor([ 2.,  0., 60.])</code></pre>
+</div>
+
+<p>The <code>gradient</code> argument is the starting <code>.grad</code> for each element of <code>y</code>: the vector you would have put in <code>self.grad</code> if it were a list. It must have <code>y</code>'s shape. Passing weights <code>v</code> computes the gradient of <code>(v * y).sum()</code>; mathematically that is a vector-Jacobian product, which is all reverse-mode autodiff ever computes.</p>
+
+<h4>The graph is freed after backward</h4>
+
+<p>Your engine kept every <code>Value</code> alive until Python garbage-collected it. PyTorch frees the saved tensors as soon as backward has used them, because in a real model they are most of the memory. Go through the same graph twice and you hit this:</p>
+
+<div class="code" data-lang="python">
+<pre><code>a = torch.tensor(2.0, requires_grad=True)
+b = torch.tensor(-3.0, requires_grad=True)
+c = a * b + a
+
+c.backward()
+c.backward()</code></pre>
+</div>
+
+<div class="code" data-lang="text">
+<pre><code>RuntimeError: Trying to backward through the graph a second time (or directly access saved tensors after they have already been freed). Saved intermediate values of the graph are freed when you call .backward() or autograd.grad(). Specify retain_graph=True if you need to backward through the graph a second time or if you need to access saved tensors after calling backward.</code></pre>
+</div>
+
+<p>If you really need two passes over one graph (two losses sharing a trunk, for example), keep it alive on every pass except the last:</p>
+
+<div class="code" data-lang="python">
+<pre><code>a = torch.tensor(2.0, requires_grad=True)
+b = torch.tensor(-3.0, requires_grad=True)
+c = a * b + a
+c.backward(retain_graph=True)   # keep saved tensors alive
+print(a.grad)                   # tensor(-2.)
+c.backward()                    # second pass works; frees the graph now
+print(a.grad)                   # tensor(-4.)  accumulated</code></pre>
+</div>
+
+<p>Usually the better fix is to add the losses and call backward once: <code>(loss1 + loss2).backward()</code>.</p>
+
+<div class="hands-on">
+<div class="hands-on-hdr">Hands-on · do this now</div>
+<div class="hands-on-body">
+<p>1. In <code>~/learning-pytorch/ch04</code>, save the <code>a</code>, <code>b</code>, <code>m</code>, <code>c</code> example as <code>graph.py</code> and run it. Add the <code>walk()</code> function and confirm you see the diamond (three <code>AccumulateGrad</code> lines, two of them for <code>a</code>).</p>
+<p>2. Check the leaf identities yourself:</p>
+<div class="code" data-lang="python">
+<pre><code>mul = c.grad_fn.next_functions[0][0]
+print(mul.next_functions[0][0].variable is a)   # True
+print(mul.next_functions[1][0].variable is b)   # True</code></pre>
+</div>
+<p>3. Run the accumulation loop, then add <code>x.grad = None</code> and watch the doubling stop.</p>
+<p>4. Call <code>c.backward()</code> twice and read the full error. Then fix it with <code>retain_graph=True</code> on the first call and predict <code>a.grad</code> before printing it.</p>
+</div>
+</div>
+
+<h2 id="tracking-off">Turning tracking off</h2>
+
+<p>Recording a graph costs time and, more importantly, memory: every saved tensor stays alive until backward. Sometimes you know you will never call backward. There are four tools, each for a different job.</p>
+
+<h4><code>torch.no_grad()</code>: for the weight update</h4>
+
+<p>Your SGD step was <code>parameter.data -= learning_rate * parameter.grad</code>. Try that on a tensor leaf directly:</p>
+
+<div class="code" data-lang="python">
+<pre><code>w = torch.tensor([0.5, -1.0], requires_grad=True)
+loss = (w * w).sum()
+loss.backward()
+
+try:
+    w -= 0.1 * w.grad
+except RuntimeError as e:
+    print("RuntimeError:", e)
+
+with torch.no_grad():
+    w -= 0.1 * w.grad          # the update itself is not recorded
+print(w, w.is_leaf)</code></pre>
+</div>
+
+<div class="code" data-lang="text">
+<pre><code>RuntimeError: a leaf Variable that requires grad is being used in an in-place operation.
+tensor([ 0.4000, -0.8000], requires_grad=True) True</code></pre>
+</div>
+
+<p>Autograd refuses because recording "w was modified using w" would make <code>w</code> a non-leaf whose history includes itself. Inside <code>torch.no_grad()</code>, nothing is recorded and results have <code>requires_grad=False</code>. Every optimizer's <code>step()</code> runs under it.</p>
+
+<h4><code>torch.inference_mode()</code>: for serving</h4>
+
+<p>A stricter, faster <code>no_grad</code>. Tensors created inside are marked as <strong>inference tensors</strong>, which skips some bookkeeping (version counters, view tracking) that autograd needs. The price: they can never be used in autograd later.</p>
+
+<div class="code" data-lang="python">
+<pre><code>w = torch.tensor([0.5, -1.0], requires_grad=True)
+
+with torch.no_grad():
+    y = w * 2
+print(y.requires_grad, y.grad_fn)        # False None
+
+with torch.inference_mode():
+    z = w * 2
+print(z.requires_grad, z.is_inference())  # False True
+
+(z * w).sum().backward()</code></pre>
+</div>
+
+<div class="code" data-lang="text">
+<pre><code>RuntimeError: Inference tensors cannot be saved for backward. To work around you can make a clone to get a normal tensor and use it in autograd.</code></pre>
+</div>
+
+<p>microgpt uses it as a decorator on <code>evaluate_model</code>, <code>predict_next_character</code> and <code>generate_name</code>. That is the right choice: nothing in those functions will ever be backpropagated. Every serving engine does the same.</p>
+
+<h4><code>.detach()</code>: cut one tensor out of the graph</h4>
+
+<p><code>t.detach()</code> returns a new tensor that shares <code>t</code>'s memory but has no <code>grad_fn</code> and <code>requires_grad=False</code>. Gradient will not flow back through it. Use it when one value should be treated as a constant (a target computed from the model itself, a value you want to log or plot).</p>
+
+<div class="code" data-lang="python">
+<pre><code>w = torch.tensor([0.5, -1.0], requires_grad=True)
+h = w * 3
+d = h.detach()
+
+print(d.requires_grad, d.grad_fn)        # False None
+print(d.data_ptr() == h.data_ptr())      # True: same memory, no copy
+
+d[0] = 100.0                             # writes through to h
+print(h)                                 # tensor([100.,  -3.], grad_fn=&lt;MulBackward0&gt;)</code></pre>
+</div>
+
+<p>Shared memory means writes go through. Use <code>h.detach().clone()</code> if you need an independent copy. <code>.item()</code>, <code>.tolist()</code> and <code>.numpy()</code> also leave the graph, since they produce plain Python or NumPy values.</p>
+
+<h4><code>requires_grad_(False)</code>: freeze a parameter</h4>
+
+<p>To stop training some weights (pretrained embeddings, a frozen backbone while you fine-tune a head), switch the flag off on the leaf. The trailing underscore is PyTorch's convention for "modifies in place".</p>
+
+<div class="code" data-lang="python">
+<pre><code>emb = torch.randn(4, 2, requires_grad=True)     # pretend: pretrained embeddings
+head = torch.randn(2, 3, requires_grad=True)     # trainable head
+
+emb.requires_grad_(False)                        # freeze
+
+x = emb[torch.tensor([0, 2])]                    # look up two rows
+loss = (x @ head).sum()
+loss.backward()
+
+print(emb.grad, head.grad is not None)           # None True</code></pre>
+</div>
+
+<table>
+  <tr><th>Tool</th><th>Scope</th><th>Use it for</th></tr>
+  <tr><td><code>torch.no_grad()</code></td><td>a block of code</td><td>optimizer updates, weight init, evaluation inside a training script</td></tr>
+  <tr><td><code>torch.inference_mode()</code></td><td>a block of code</td><td>pure inference and serving; results must never meet autograd</td></tr>
+  <tr><td><code>t.detach()</code></td><td>one tensor</td><td>treat a value as a constant; log or plot it</td></tr>
+  <tr><td><code>p.requires_grad_(False)</code></td><td>one leaf, permanently</td><td>freezing parameters during fine-tuning</td></tr>
+</table>
+
+<div class="callout tip">
+<div class="callout-title">Why an inference engineer cares</div>
+<p>In training, the saved tensors of every layer stay alive from the forward pass until backward reaches that layer. That "activation memory" is often larger than the weights. Under <code>inference_mode</code> nothing is saved, so each activation can be freed as soon as the next layer has consumed it. Forgetting the decorator in a serving path is a classic way to run out of GPU memory at a fraction of the batch size you expected.</p>
+</div>
+
+<h2 id="autograd-grad">torch.autograd.grad: gradients without .grad</h2>
+
+<p><code>backward()</code> writes into <code>.grad</code> of every leaf it reaches. <code>torch.autograd.grad(outputs, inputs)</code> instead <strong>returns</strong> the gradients for the inputs you name and leaves every <code>.grad</code> alone. Use it for quick checks, for gradient penalties, and for anything where accumulating into <code>.grad</code> would be a side effect you don't want.</p>
+
+<div class="code" data-lang="python">
+<pre><code>a = torch.tensor(2.0, requires_grad=True)
+b = torch.tensor(-3.0, requires_grad=True)
+c = a * b + a
+
+ga, gb = torch.autograd.grad(c, [a, b])
+print(ga, gb)                  # tensor(-2.) tensor(2.)
+print(a.grad, b.grad)          # None None: untouched
+
+x = torch.tensor(2.0, requires_grad=True)
+y = x ** 3
+(dy,) = torch.autograd.grad(y, x, create_graph=True)   # 3x^2 = 12, itself differentiable
+(d2y,) = torch.autograd.grad(dy, x)                    # 6x = 12
+print(dy, d2y)</code></pre>
+</div>
+
+<div class="code" data-lang="text">
+<pre><code>tensor(-2.) tensor(2.)
+None None
+tensor(12., grad_fn=&lt;MulBackward0&gt;) tensor(12.)</code></pre>
+</div>
+
+<p><code>create_graph=True</code> records the backward pass itself as a graph, so the gradient has a <code>grad_fn</code> and can be differentiated again. Your <code>Value</code> engine could not do that: its local gradients were plain floats, not <code>Value</code>s.</p>
+
+<h2 id="custom-function">Writing your own autograd.Function</h2>
+
+<p>Sometimes you need an operation whose backward you write yourself: a fused CUDA kernel, a numerically safer formula, a straight-through estimator. You subclass <code>torch.autograd.Function</code> with two static methods. This is the closest PyTorch gets to your <code>Value</code> methods.</p>
+
+<div class="code" data-lang="python">
+<div class="code-hdr"><span class="lang">python</span><span class="title">square.py</span></div>
+<pre><code>import torch
+
+class Square(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x):
+        ctx.save_for_backward(x)        # like local_gradients, but saved lazily
+        return x * x
+
+    @staticmethod
+    def backward(ctx, grad_output):     # grad_output = dLoss/d(output)
+        (x,) = ctx.saved_tensors
+        return grad_output * 2 * x      # dLoss/dx = dLoss/dout * dout/dx
+
+x = torch.tensor([1.0, -2.0, 3.0], requires_grad=True)
+y = Square.apply(x)
+print(y)
+y.sum().backward()
+print(x.grad)
+
+torch.manual_seed(0)
+x64 = torch.randn(5, dtype=torch.float64, requires_grad=True)
+print(torch.autograd.gradcheck(Square.apply, (x64,)))</code></pre>
+</div>
+
+<div class="code" data-lang="text">
+<pre><code>tensor([1., 4., 9.], grad_fn=&lt;SquareBackward&gt;)
+tensor([ 2., -4.,  6.])
+True</code></pre>
+</div>
+
+<ul>
+  <li><code>ctx</code> is a per-call context object. <code>ctx.save_for_backward(...)</code> stores tensors for backward; read them back with <code>ctx.saved_tensors</code>. (Always use this for tensors, not <code>ctx.x = x</code>; it lets autograd detect in-place modification and free memory correctly.)</li>
+  <li><code>backward</code> receives one gradient per forward output and returns one gradient per forward input. The multiply by <code>grad_output</code> is your <code>local_gradient * value.grad</code>.</li>
+  <li>You call it as <code>Square.apply(x)</code>, never <code>Square()(x)</code> or <code>Square.forward</code>.</li>
+</ul>
+
+<h4>gradcheck: test your backward against finite differences</h4>
+
+<p><code>torch.autograd.gradcheck</code> nudges each input element by a small <code>eps</code>, measures how the output moves (the <strong>numerical</strong> Jacobian), and compares that with what your backward returns (the <strong>analytical</strong> Jacobian). A wrong backward fails loudly:</p>
+
+<div class="code" data-lang="python">
+<pre><code>class BadSquare(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x):
+        ctx.save_for_backward(x)
+        return x * x
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (x,) = ctx.saved_tensors
+        return grad_output * x          # forgot the 2
+
+torch.manual_seed(0)
+x64 = torch.randn(3, dtype=torch.float64, requires_grad=True)
+try:
+    torch.autograd.gradcheck(BadSquare.apply, (x64,))
+except RuntimeError as e:
+    print(type(e).__name__)
+    print(e)</code></pre>
+</div>
+
+<div class="code" data-lang="text">
+<pre><code>GradcheckError
+Jacobian mismatch for output 0 with respect to input 0,
+numerical:tensor([[ 3.0820,  0.0000,  0.0000],
+        [ 0.0000, -0.5869,  0.0000],
+        [ 0.0000,  0.0000, -4.3576]], dtype=torch.float64)
+analytical:tensor([[ 1.5410,  0.0000,  0.0000],
+        [-0.0000, -0.2934, -0.0000],
+        [-0.0000, -0.0000, -2.1788]], dtype=torch.float64)</code></pre>
+</div>
+
+<p>The analytical column is exactly half the numerical one: the missing 2.</p>
+
+<div class="callout pitfall">
+<div class="callout-title">gradcheck needs float64</div>
+<p>Finite differences divide a tiny output change by a tiny <code>eps</code> (default <code>1e-6</code>). In float32, which has about 7 significant digits, that difference is mostly rounding noise. Run the <em>correct</em> <code>Square</code> on a float32 input and gradcheck warns "Input #0 requires gradient and is not a double precision floating point or complex", then fails with numerical <code>2.9802</code> against analytical <code>3.0820</code>. Always build gradcheck inputs with <code>dtype=torch.float64</code>.</p>
+</div>
+
+<h2 id="exercises">Exercises</h2>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 4.1</span>
+  <span class="exercise-diff easy">easy</span>
+  <span class="exercise-title">Hand-derive, then check</span>
+</div>
+<div class="exercise-body">
+<p>Using only operations your <code>Value</code> class has, let <code>L = log(x*x + 1) * w + relu(w)</code> at <code>x = 1.0</code>, <code>w = 3.0</code>. Derive <code>dL/dx</code> and <code>dL/dw</code> on paper, then check with PyTorch.</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<p>dL/dx = w &middot; 2x / (x&sup2; + 1) = 3 &middot; 2 / 2 = <strong>3</strong>. dL/dw = log(x&sup2; + 1) + relu'(w) = log 2 + 1 &asymp; <strong>1.6931</strong> (relu' is 1 because w &gt; 0).</p>
+<div class="code" data-lang="python">
+<pre><code>import torch
+
+x = torch.tensor(1.0, requires_grad=True)
+w = torch.tensor(3.0, requires_grad=True)
+L = (x * x + 1).log() * w + w.relu()
+L.backward()
+print(L.item(), x.grad.item(), w.grad.item())
+# 5.079441547393799 3.0 1.6931471824645996</code></pre>
+</div>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 4.2</span>
+  <span class="exercise-diff easy">easy</span>
+  <span class="exercise-title">Accumulation puzzle</span>
+</div>
+<div class="exercise-body">
+<p>Predict both printed values before running:</p>
+<div class="code" data-lang="python">
+<pre><code>w = torch.tensor(1.0, requires_grad=True)
+for i in range(3):
+    loss = (i + 1) * w * w
+    loss.backward()
+print(w.grad)
+
+w.grad = None
+loss = w * w
+loss.backward(retain_graph=True)
+loss.backward()
+print(w.grad)</code></pre>
+</div>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<p>First loop: dL/dw = 2(i+1)w = 2, 4, 6 at w = 1. Nothing clears <code>.grad</code>, so it prints <code>tensor(12.)</code>. Second part: two backward passes over the same graph, each adding 2w = 2, so <code>tensor(4.)</code>. The <code>retain_graph=True</code> on the first call is what makes the second call legal; it doesn't change the values.</p>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 4.3</span>
+  <span class="exercise-diff medium">medium</span>
+  <span class="exercise-title">Your linear() test, as a matrix</span>
+</div>
+<div class="exercise-body">
+<p><code>microgpt_scalar.py</code> tests <code>linear([2, 3], [[1, -1], [0.5, 2]])</code>, calls <code>linear_outputs[0].backward()</code> and asserts the input gradients are <code>[1.0, -1.0]</code>. Reproduce it with one weight tensor <code>W</code> and one input tensor <code>x</code>. Before running, predict <code>W.grad</code>: which rows are non-zero, and why?</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<div class="code" data-lang="python">
+<pre><code>import torch
+import torch.nn.functional as F
+
+x = torch.tensor([2.0, 3.0], requires_grad=True)
+W = torch.tensor([[1.0, -1.0],
+                  [0.5,  2.0]], requires_grad=True)
+
+out = W @ x                      # same as F.linear(x, W): weights are [out][in]
+print(out, torch.equal(out, F.linear(x, W)))
+out[0].backward()
+print(x.grad)
+print(W.grad)</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>tensor([-1.,  7.], grad_fn=&lt;MvBackward0&gt;) True
+tensor([ 1., -1.])
+tensor([[2., 3.],
+        [0., 0.]])</code></pre>
+</div>
+<p><code>out[0] = W[0,0]*x[0] + W[0,1]*x[1]</code>, so the gradient with respect to row 0 of <code>W</code> is <code>x</code> itself, and row 1 never touched <code>out[0]</code>, so it gets zeros. In general, for <code>out = W @ x</code> with upstream gradient <code>g</code>, <code>W.grad = outer(g, x)</code> and <code>x.grad = W.T @ g</code>. Note that <code>.grad</code> always has the same shape as the tensor it belongs to.</p>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 4.4</span>
+  <span class="exercise-diff medium">medium</span>
+  <span class="exercise-title">Why is this gradient None?</span>
+</div>
+<div class="exercise-body">
+<p>Only <code>w2</code> gets a gradient here. Find both bugs and fix them so that <code>w1</code>, <code>w2</code> and <code>scale</code> all receive gradients.</p>
+<div class="code" data-lang="python">
+<pre><code>torch.manual_seed(0)
+w1 = torch.randn(4, 3, requires_grad=True) * 0.08
+w2 = torch.randn(3, 2, requires_grad=True)
+scale = torch.tensor(2.0, requires_grad=True)
+
+x = torch.randn(5, 4)
+h = x @ w1
+h = h * scale.item()
+out = h @ w2
+loss = out.pow(2).mean()
+loss.backward()
+
+print(w1.grad, w2.grad is None, scale.grad)
+# UserWarning: The .grad attribute of a Tensor that is not a leaf Tensor is being accessed. ...
+# None False None</code></pre>
+</div>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<p><strong>Bug 1:</strong> <code>torch.randn(..., requires_grad=True) * 0.08</code> is an operation, so <code>w1</code> is its <em>result</em>, a non-leaf. The real leaf (the unscaled random tensor) did get a gradient, but you threw away your only reference to it. microgpt's <code>make_parameter</code> gets this right: it builds the values first, then wraps them in <code>nn.Parameter</code>. <strong>Bug 2:</strong> <code>scale.item()</code> turns the tensor into a Python float, which is a constant to autograd.</p>
+<div class="code" data-lang="python">
+<pre><code>torch.manual_seed(0)
+w1 = (torch.randn(4, 3) * 0.08).requires_grad_()     # leaf: scale first, then track
+w2 = torch.randn(3, 2, requires_grad=True)
+scale = torch.tensor(2.0, requires_grad=True)
+
+x = torch.randn(5, 4)
+h = x @ w1
+h = h * scale                                         # keep it a tensor op
+out = h @ w2
+loss = out.pow(2).mean()
+loss.backward()
+
+print(w1.is_leaf, w1.grad.shape, w2.grad.shape, scale.grad)
+# True torch.Size([4, 3]) torch.Size([3, 2]) tensor(0.0192)</code></pre>
+</div>
+<p>Other causes of a <code>None</code> gradient worth checking in this order: the tensor isn't a leaf; the forward ran under <code>no_grad</code>/<code>inference_mode</code>; a <code>.detach()</code>, <code>.item()</code>, <code>.numpy()</code> or <code>.tolist()</code> sits on the path; the parameter simply isn't used in the loss.</p>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 4.5</span>
+  <span class="exercise-diff medium">medium</span>
+  <span class="exercise-title">The gradient of the correct-token logit</span>
+</div>
+<div class="exercise-body">
+<p><code>microgpt_scalar.py</code> asserts that after <code>example_loss.backward()</code> the correct-token logit has a negative gradient. Show that for <code>loss = -log(softmax(z)[target])</code> the full gradient is <code>softmax(z) - onehot(target)</code>. Use <code>z = [1.0, 2.0, 3.0]</code>, <code>target = 2</code>, and compare autograd's answer with that formula.</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<div class="code" data-lang="python">
+<pre><code>import torch
+
+z = torch.tensor([1.0, 2.0, 3.0], requires_grad=True)
+target = 2
+loss = -torch.log_softmax(z, dim=-1)[target]
+loss.backward()
+
+expected = torch.softmax(z.detach(), dim=-1)
+expected[target] -= 1.0
+print(z.grad)
+print(expected)
+print(torch.allclose(z.grad, expected))</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>tensor([ 0.0900,  0.2447, -0.3348])
+tensor([ 0.0900,  0.2447, -0.3348])
+True</code></pre>
+</div>
+<p>The correct token's entry is <code>p - 1</code>, always negative, so gradient descent raises that logit; every other logit's gradient is its probability, so they get pushed down. Note the <code>z.detach()</code>: we want plain numbers for the expected value, not another graph. (<code>torch.log_softmax</code> is used instead of <code>softmax(...).log()</code> because it is numerically stable; Chapter 7 covers why.)</p>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 4.6</span>
+  <span class="exercise-diff hard">hard</span>
+  <span class="exercise-title">Write and gradcheck a custom ReLU</span>
+</div>
+<div class="exercise-body">
+<p>Write <code>MyReLU</code> as a <code>torch.autograd.Function</code> using the same local gradient as your <code>Value.relu()</code> (<code>float(data &gt; 0)</code>). Verify it with <code>gradcheck</code>, check it matches <code>torch.relu</code> in value and gradient, then run gradcheck on the input <code>[0.0, 1.0]</code> and explain the result.</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<div class="code" data-lang="python">
+<pre><code>import torch
+
+class MyReLU(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x):
+        ctx.save_for_backward(x)
+        return x.clamp(min=0)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (x,) = ctx.saved_tensors
+        return grad_output * (x &gt; 0).to(grad_output.dtype)   # Value.relu: float(data &gt; 0)
+
+torch.manual_seed(0)
+x = torch.randn(6, dtype=torch.float64, requires_grad=True)
+print(torch.autograd.gradcheck(MyReLU.apply, (x,)))
+
+y = MyReLU.apply(x)
+y2 = torch.relu(x)
+g1, = torch.autograd.grad(y.sum(), x)
+g2, = torch.autograd.grad(y2.sum(), x)
+print(torch.equal(y, y2), torch.equal(g1, g2))
+
+x0 = torch.tensor([0.0, 1.0], dtype=torch.float64, requires_grad=True)
+try:
+    torch.autograd.gradcheck(MyReLU.apply, (x0,))
+except RuntimeError as e:
+    print(type(e).__name__)
+    print(e)</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>True
+True True
+GradcheckError
+Jacobian mismatch for output 0 with respect to input 0,
+numerical:tensor([[0.5000, 0.0000],
+        [0.0000, 1.0000]], dtype=torch.float64)
+analytical:tensor([[0., 0.],
+        [0., 1.]], dtype=torch.float64)</code></pre>
+</div>
+<p>At exactly 0, ReLU has a kink and no derivative. gradcheck uses a central difference, (f(0+&epsilon;) &minus; f(0&minus;&epsilon;)) / 2&epsilon; = &epsilon; / 2&epsilon; = 0.5, while your backward (and PyTorch's own) picks 0 by convention. Neither is "wrong"; the check is just meaningless at a non-differentiable point. Test with random inputs, which are never exactly 0.</p>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 4.7</span>
+  <span class="exercise-diff hard">hard</span>
+  <span class="exercise-title">PyTorch as a test oracle for your engine</span>
+</div>
+<div class="exercise-body">
+<p>Copy the <code>Value</code> class (plus <code>import math</code>) from <code>microgpt_scalar.py</code> into <code>value_engine.py</code>. Write a script that evaluates several two-input expressions with both <code>Value</code> and float64 tensors at <code>a = 2, b = -3</code> and compares the gradients. Then make a broken copy of the engine with <code>child.grad = ...</code> instead of <code>child.grad += ...</code>. Which expressions catch the bug, which one doesn't, and why? Which of your original asserts would have failed?</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<div class="code" data-lang="python">
+<div class="code-hdr"><span class="lang">python</span><span class="title">oracle.py</span></div>
+<pre><code>import math
+import torch
+from value_engine import Value      # your Value class, copied into value_engine.py
+
+expressions = {
+    "a*b + a":            lambda a, b: a * b + a,
+    "(a+b)*(a-b)":        lambda a, b: (a + b) * (a - b),
+    "a/b - b**2":         lambda a, b: a / b - b ** 2,
+    "(a*a).exp().log()+b": lambda a, b: (a * a).exp().log() + b,
+    "(a*b).relu()*a":     lambda a, b: (a * b).relu() * a,
+}
+
+def close(u, v):
+    return math.isclose(u, v, rel_tol=1e-9, abs_tol=1e-12)
+
+all_ok = True
+for name, f in expressions.items():
+    va, vb = Value(2.0), Value(-3.0)
+    f(va, vb).backward()
+
+    ta = torch.tensor(2.0, dtype=torch.float64, requires_grad=True)
+    tb = torch.tensor(-3.0, dtype=torch.float64, requires_grad=True)
+    f(ta, tb).backward()
+
+    ok = close(va.grad, ta.grad.item()) and close(vb.grad, tb.grad.item())
+    all_ok = all_ok and ok
+    print(f"{name:20s} Value=({va.grad:+.4f}, {vb.grad:+.4f}) "
+          f"torch=({ta.grad.item():+.4f}, {tb.grad.item():+.4f}) "
+          f"{'ok' if ok else 'MISMATCH'}")
+print("all ok:", all_ok)</code></pre>
+</div>
+<p>With your real engine every line says <code>ok</code>. With <code>=</code> instead of <code>+=</code>:</p>
+<div class="code" data-lang="text">
+<pre><code>a*b + a              Value=(-3.0000, +2.0000) torch=(-2.0000, +2.0000) MISMATCH
+(a+b)*(a-b)          Value=(+5.0000, +5.0000) torch=(+4.0000, +6.0000) MISMATCH
+a/b - b**2           Value=(-0.3333, -0.2222) torch=(-0.3333, +5.7778) MISMATCH
+(a*a).exp().log()+b  Value=(+2.0000, +1.0000) torch=(+4.0000, +1.0000) MISMATCH
+(a*b).relu()*a       Value=(-0.0000, +0.0000) torch=(+0.0000, +0.0000) ok
+all ok: False</code></pre>
+</div>
+<p>Every expression where a value feeds into two places (<code>a</code> in <code>a*b + a</code>, <code>b</code> used twice in <code>a/b - b**2</code>, <code>a</code> as both operands of <code>a*a</code>) loses one path: the later write overwrites the earlier one. The ReLU case passes by luck, since <code>a*b = -6</code> makes every gradient 0, and 0 overwritten by 0 is still 0. Your original <code>assert a.grad == -2.0</code> would fail with <code>-3.0</code>: the reversed order visits <code>c</code> first (setting <code>a.grad = 1</code>) and then <code>m</code>, which overwrites it with <code>b = -3</code>. Lesson: an oracle test needs inputs that exercise every path, which is why PyTorch's own test suite runs gradcheck on random inputs.</p>
+</div>
+</details>
+</div>
+</div>
+
+<h2 id="recap">Recap</h2>
+<ul>
+  <li>A tensor with <code>requires_grad=True</code> makes PyTorch record a graph of backward nodes. <code>grad_fn.next_functions</code> are your <code>_children</code>; saved tensors are your <code>_local_gradients</code>, computed lazily.</li>
+  <li><code>backward()</code> starts from a scalar with gradient 1. For a non-scalar output, pass <code>gradient=</code> with the output's shape.</li>
+  <li>Only leaves get <code>.grad</code> (use <code>retain_grad()</code> for intermediates). Leaves accumulate with <code>+=</code> through <code>AccumulateGrad</code>, so clear them each step with <code>optimizer.zero_grad()</code>.</li>
+  <li>The graph's saved tensors are freed after backward. A second backward needs <code>retain_graph=True</code>, but summing the losses is usually better.</li>
+  <li><code>no_grad</code> for updates and init, <code>inference_mode</code> for serving, <code>detach()</code> to make one value a constant, <code>requires_grad_(False)</code> to freeze.</li>
+  <li><code>torch.autograd.grad</code> returns gradients without touching <code>.grad</code>; <code>create_graph=True</code> allows higher derivatives.</li>
+  <li>Custom ops: subclass <code>torch.autograd.Function</code>, save with <code>ctx.save_for_backward</code>, call with <code>.apply</code>, and always <code>gradcheck</code> in float64.</li>
+</ul>
+
+<div class="page-nav">
+  <a href="03-tensor-math.html"><span class="lbl">← Prev</span><span class="ttl">Tensor Math &amp; Broadcasting</span></a>
+  <a href="05-nn-module.html" class="next"><span class="lbl">Next →</span><span class="ttl">nn.Module</span></a>
+</div>
+
+</main>
+</div>
+<script src="../assets/site.js"></script>
+</body>
+</html>

@@ -1,0 +1,997 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>10 · Inference &amp; Sampling — PyTorch</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<button class="sidebar-toggle" aria-label="Toggle navigation">☰ Menu</button>
+<div class="layout">
+<aside class="sidebar">
+  <a href="../index.html" class="brand">PyTorch</a>
+  <span class="brand-sub">a deep dive — 2026</span>
+  <nav>
+    <ol>
+      <li><a href="01-why-pytorch.html">Why PyTorch</a></li>
+      <li><a href="02-tensors.html">Tensors</a></li>
+      <li><a href="03-tensor-math.html">Tensor Math &amp; Broadcasting</a></li>
+      <li><a href="04-autograd.html">Autograd</a></li>
+      <li><a href="05-nn-module.html">nn.Module</a></li>
+      <li><a href="06-transformer-blocks.html">Building a Transformer</a></li>
+      <li><a href="07-losses-optimizers.html">Losses &amp; Optimizers</a></li>
+      <li><a href="08-training-loop.html">The Training Loop</a></li>
+      <li><a href="09-devices-precision.html">Devices &amp; Precision</a></li>
+      <li><a href="10-inference.html">Inference &amp; Sampling</a></li>
+      <li><a href="11-performance.html">Performance &amp; Profiling</a></li>
+      <li><a href="12-debugging.html">Debugging PyTorch</a></li>
+      <li><a href="13-50-questions.html">The 50 Questions</a></li>
+      <li><a href="14-capstone.html">Capstone Project</a></li>
+    </ol>
+    <div class="extras">
+      <a href="../exercises.html">All Exercises</a>
+      <a href="../index.html">← Home</a>
+    </div>
+  </nav>
+  <div class="progress"></div>
+</aside>
+
+<main class="content">
+
+<h1>
+  <span class="chap-num">Chapter 10</span>
+  Inference &amp; Sampling
+</h1>
+<p class="lede">
+  Training is over; now the model has to produce text. This chapter turns
+  logits into tokens (greedy, temperature, top-k, top-p), builds a KV cache
+  in PyTorch so each new token costs one position instead of the whole
+  prefix, and generates for a batch of prompts of different lengths. That
+  loop, scaled up, is what every LLM serving engine runs.
+</p>
+
+<h2 id="two-switches">Two switches: <code>eval()</code> and <code>inference_mode()</code></h2>
+
+<p><strong>Inference</strong> means running a trained model forward to get predictions, with no learning. Two separate switches prepare a model for it, and they do unrelated things.</p>
+
+<ul>
+  <li><code>model.eval()</code> sets <code>module.training = False</code> on the model and every submodule. Layers that behave differently while training read that flag. The common one is <strong>dropout</strong>, a layer that zeroes random activations during training (and scales the rest up) to fight overfitting. In eval mode it passes values through unchanged. <code>eval()</code> does nothing to gradients.</li>
+  <li><code>torch.inference_mode()</code> tells autograd (Chapter 4) to record nothing inside the block: no graph, no saved tensors. It is <code>torch.no_grad()</code> plus two more savings: it skips the version counters autograd uses to detect in-place edits, and it skips view tracking. Tensors created inside are marked as <strong>inference tensors</strong> and can never enter autograd later.</li>
+</ul>
+
+<div class="code" data-lang="python">
+<pre><code>import torch
+import torch.nn as nn
+
+torch.manual_seed(0)
+drop = nn.Dropout(p=0.5)
+x = torch.ones(8)
+
+drop.train()
+print(drop(x))     # tensor([0., 0., 2., 0., 0., 0., 2., 2.])
+drop.eval()
+print(drop(x))     # tensor([1., 1., 1., 1., 1., 1., 1., 1.])
+
+w = torch.ones(3, requires_grad=True)
+with torch.no_grad():
+    y = w * 2
+print(y.requires_grad, y.is_inference())    # False False
+with torch.inference_mode():
+    z = w * 2
+print(z.requires_grad, z.is_inference())    # False True</code></pre>
+</div>
+
+<p>The price of the stricter mode: an inference tensor cannot be saved for a backward pass or edited in place outside the block.</p>
+
+<div class="code" data-lang="python">
+<pre><code>try:
+    (w * z).sum().backward()     # autograd would have to save z for w's gradient
+except RuntimeError as e:
+    print(e)
+try:
+    z.add_(1)
+except RuntimeError as e:
+    print(str(e).split(".")[0])
+print(z.clone().is_inference())  # a clone made outside the block is a normal tensor</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>Inference tensors cannot be saved for backward. To work around you can make a clone to get a normal tensor and use it in autograd.
+Inplace update to inference tensor outside InferenceMode is not allowed
+False</code></pre>
+</div>
+
+<table>
+  <tr><th></th><th>Changes layer behaviour (dropout)</th><th>Stops graph recording</th><th>Output usable in autograd later</th></tr>
+  <tr><td><code>model.eval()</code></td><td>yes</td><td>no</td><td>yes</td></tr>
+  <tr><td><code>torch.no_grad()</code></td><td>no</td><td>yes</td><td>yes</td></tr>
+  <tr><td><code>torch.inference_mode()</code></td><td>no</td><td>yes, with less bookkeeping</td><td>no</td></tr>
+</table>
+
+<p>You want both for generation. microgpt already does it: <code>evaluate_model</code>, <code>predict_next_character</code> and <code>generate_name</code> are decorated with <code>@torch.inference_mode()</code>, and the first two call <code>model.eval()</code>. <code>FastMicroGPT</code> has no dropout, so <code>eval()</code> changes nothing today; keep it anyway, because the day someone adds dropout, a missing <code>eval()</code> makes generation silently noisy (Chapter 12 shows this bug).</p>
+
+<h2 id="logits-to-token">From logits to a token</h2>
+
+<p>The model's output is <strong>logits</strong>: one raw score per vocabulary entry for every position, shape <code>(B, T, V)</code>. Only the last position predicts the next token, so generation looks at <code>logits[:, -1]</code>, shape <code>(B, V)</code>. A <strong>decoding strategy</strong> turns that row into one token id.</p>
+
+<h4>Greedy: take the largest</h4>
+<p><code>logits.argmax(dim=-1)</code> picks the highest score. It is deterministic: the same prompt always gives the same output, which is good for tests and bad for variety (a small model tends to loop on its favourite continuation).</p>
+
+<h4>Temperature: sharpen or flatten</h4>
+<p>Divide the logits by a <strong>temperature</strong> <code>T</code> before the softmax. <code>T &lt; 1</code> stretches the gaps between logits, so the top token gets more of the probability. <code>T &gt; 1</code> shrinks the gaps toward uniform. Worked example with logits <code>[2, 1, 0]</code>: at <code>T = 0.5</code> they become <code>[4, 2, 0]</code>, and softmax gives <code>e<sup>4</sup> / (e<sup>4</sup> + e<sup>2</sup> + 1) = 54.6 / 63.0 ≈ 0.87</code> for the first token.</p>
+
+<div class="code" data-lang="python">
+<pre><code>import torch.nn.functional as F
+
+logits = torch.tensor([2.0, 1.0, 0.0])
+print(logits.argmax())                      # tensor(0): greedy
+for T in [0.5, 1.0, 2.0]:
+    print(T, F.softmax(logits / T, dim=-1).round(decimals=2))</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>0.5 tensor([0.8700, 0.1200, 0.0200])
+1.0 tensor([0.6700, 0.2400, 0.0900])
+2.0 tensor([0.5100, 0.3100, 0.1900])</code></pre>
+</div>
+
+<p>As <code>T</code> goes to 0 this becomes greedy; as it grows the distribution becomes uniform. This is the line <code>model(input_ids)[-1] / temperature</code> in microgpt's <code>generate_name</code>. A temperature of exactly 0 would divide by zero, which is why microgpt rejects <code>TEMPERATURE &lt;= 0</code> and why the <code>sample()</code> function below treats 0 as "use argmax".</p>
+
+<h4>Top-k: keep only the k best</h4>
+<p>Even at a sensible temperature, the long tail of unlikely tokens adds up, and one bad draw derails a sequence. <strong>Top-k</strong> keeps the <code>k</code> highest logits and sets the rest to <code>-inf</code>, so softmax gives them exactly zero. <code>torch.topk(t, k)</code> returns the <code>k</code> largest values and their indices, sorted.</p>
+
+<div class="code" data-lang="python">
+<pre><code>logits = torch.tensor([3.0, 2.5, 1.0, 0.5, -1.0])
+print(F.softmax(logits, dim=-1).round(decimals=3))
+# tensor([0.5430, 0.3290, 0.0730, 0.0450, 0.0100])
+
+vals, idx = torch.topk(logits, k=2)
+print(vals, idx)                  # tensor([3.0000, 2.5000]) tensor([0, 1])
+kth = vals[-1]                    # the 2nd-largest logit
+kept = logits.masked_fill(logits &lt; kth, float("-inf"))
+print(F.softmax(kept, dim=-1).round(decimals=3))
+# tensor([0.6220, 0.3780, 0.0000, 0.0000, 0.0000])</code></pre>
+</div>
+
+<p>microgpt's <code>predict_next_character</code> calls <code>torch.topk(probabilities, k=5)</code> to print its top five guesses; same function, used for display instead of filtering.</p>
+
+<h4>Top-p (nucleus): keep the smallest set that covers p</h4>
+<p>A fixed <code>k</code> is wrong in both directions: when the model is sure, <code>k = 50</code> lets in 49 junk tokens; when it is unsure, <code>k = 5</code> cuts off good ones. <strong>Top-p</strong>, also called <strong>nucleus sampling</strong>, keeps the smallest set of most-likely tokens whose probabilities add up to at least <code>p</code>. The recipe: sort descending, take the running total with <code>cumsum</code>, drop every token whose <em>preceding</em> mass already reached <code>p</code>, and put the survivors back in vocabulary order with <code>scatter</code>.</p>
+
+<div class="code" data-lang="python">
+<pre><code>logits = torch.tensor([0.5, 3.0, -1.0, 2.5, 1.0])     # same scores, unsorted
+top_p = 0.9
+
+sorted_logits, sorted_idx = torch.sort(logits, descending=True)
+probs = F.softmax(sorted_logits, dim=-1)
+cum = probs.cumsum(dim=-1)
+remove = (cum - probs) &gt;= top_p        # mass *before* this token already reaches p
+sorted_logits = sorted_logits.masked_fill(remove, float("-inf"))
+filtered = torch.full_like(logits, float("-inf")).scatter(-1, sorted_idx, sorted_logits)
+print(filtered)                        # tensor([  -inf, 3.0000,   -inf, 2.5000, 1.0000])
+print(F.softmax(filtered, dim=-1).round(decimals=3))
+# tensor([0.0000, 0.5740, 0.0000, 0.3480, 0.0780])</code></pre>
+</div>
+
+<table>
+  <tr><th>sorted position</th><th>vocab id (<code>sorted_idx</code>)</th><th><code>probs</code></th><th><code>cum</code></th><th>mass before (<code>cum - probs</code>)</th><th>kept at p = 0.9?</th></tr>
+  <tr><td>0</td><td>1</td><td>0.543</td><td>0.543</td><td>0.000</td><td>yes</td></tr>
+  <tr><td>1</td><td>3</td><td>0.329</td><td>0.872</td><td>0.543</td><td>yes</td></tr>
+  <tr><td>2</td><td>4</td><td>0.073</td><td>0.946</td><td>0.872</td><td>yes: the set only reaches 0.9 with this token</td></tr>
+  <tr><td>3</td><td>0</td><td>0.045</td><td>0.990</td><td>0.946</td><td>no</td></tr>
+  <tr><td>4</td><td>2</td><td>0.010</td><td>1.000</td><td>0.990</td><td>no</td></tr>
+</table>
+
+<p>Testing "mass before" instead of <code>cum &gt; p</code> is what guarantees the top token always survives (its mass before is 0), even for a tiny <code>p</code>.</p>
+
+<h4>Drawing the token: <code>torch.multinomial</code></h4>
+<p><code>torch.multinomial(probs, num_samples)</code> draws indices with probability proportional to <code>probs</code> (the weights need not sum to 1). For a <code>(B, V)</code> input it draws independently per row and returns <code>(B, num_samples)</code>. For reproducible sampling, pass your own <strong><code>torch.Generator</code></strong>, an object that owns a random-number stream, instead of relying on the global seed that every other random call also consumes.</p>
+
+<div class="code" data-lang="python">
+<pre><code>probs = torch.tensor([0.6, 0.3, 0.1])
+g = torch.Generator().manual_seed(42)
+a = torch.multinomial(probs, num_samples=10, replacement=True, generator=g)
+g = torch.Generator().manual_seed(42)
+b = torch.multinomial(probs, num_samples=10, replacement=True, generator=g)
+print(a)                    # tensor([0, 0, 0, 0, 0, 0, 2, 2, 0, 0])
+print(torch.equal(a, b))    # True: same seed, same stream, same draws
+
+counts = torch.bincount(torch.multinomial(probs, 100_000, replacement=True, generator=g), minlength=3)
+print(counts / 100_000)     # tensor([0.5995, 0.2987, 0.1018])
+
+batch = torch.tensor([[0.9, 0.1, 0.0], [0.0, 0.0, 1.0]])
+print(torch.multinomial(batch, num_samples=1, generator=g))   # tensor([[0], [2]])</code></pre>
+</div>
+
+<p>A generator lives on one device: use <code>torch.Generator(device="cuda")</code> for CUDA tensors.</p>
+
+<h4>One <code>sample()</code> function</h4>
+<p>Everything above, for a batch of rows, in the order engines apply it: temperature, then top-k, then top-p, then draw.</p>
+
+<div class="code" data-lang="python">
+<div class="code-hdr"><span class="lang">python</span><span class="title">sample()</span></div>
+<pre><code>def sample(logits, temperature=1.0, top_k=None, top_p=None, generator=None):
+    """logits: (B, V). Returns next token ids, shape (B, 1)."""
+    if temperature == 0:                                   # greedy
+        return logits.argmax(dim=-1, keepdim=True)
+    logits = logits / temperature
+    if top_k is not None:
+        kth = torch.topk(logits, top_k, dim=-1).values[:, -1:]      # (B, 1)
+        logits = logits.masked_fill(logits &lt; kth, float("-inf"))
+    if top_p is not None:
+        sorted_logits, sorted_idx = torch.sort(logits, dim=-1, descending=True)
+        probs = F.softmax(sorted_logits, dim=-1)
+        remove = (probs.cumsum(dim=-1) - probs) &gt;= top_p
+        sorted_logits = sorted_logits.masked_fill(remove, float("-inf"))
+        logits = torch.full_like(logits, float("-inf")).scatter(
+            -1, sorted_idx, sorted_logits)
+    probs = F.softmax(logits, dim=-1)
+    return torch.multinomial(probs, num_samples=1, generator=generator)</code></pre>
+</div>
+
+<p>Test it against facts you know must hold: temperature 0 is argmax; <code>top_k=1</code> and a tiny <code>top_p</code> are argmax at any temperature; filtered draws only ever return kept tokens, in the renormalised ratio.</p>
+
+<div class="code" data-lang="python">
+<pre><code>logits = torch.tensor([[0.5, 3.0, -1.0, 2.5, 1.0],
+                       [2.0, 1.0, 0.0, 0.0, 0.0]])
+g = torch.Generator().manual_seed(0)
+
+assert sample(logits, temperature=0).squeeze(1).tolist() == [1, 0]
+for _ in range(100):
+    assert sample(logits, 5.0, top_k=1, generator=g).squeeze(1).tolist() == [1, 0]
+    assert sample(logits, 5.0, top_p=1e-6, generator=g).squeeze(1).tolist() == [1, 0]
+
+draws = torch.cat([sample(logits, 1.0, top_k=2, generator=g) for _ in range(20_000)], dim=1)
+print(torch.bincount(draws[0], minlength=5) / 20_000)
+# tensor([0.0000, 0.6226, 0.0000, 0.3774, 0.0000])   expected 0.622 / 0.378
+draws = torch.cat([sample(logits, 1.0, top_p=0.9, generator=g) for _ in range(20_000)], dim=1)
+print(torch.bincount(draws[0], minlength=5) / 20_000)
+# tensor([0.0000, 0.5728, 0.0000, 0.3485, 0.0787])   expected 0.574 / 0.348 / 0.078
+print("all sample() tests passed")</code></pre>
+</div>
+
+<div class="callout pitfall">
+<div class="callout-title">Ties in top-k</div>
+<p><code>logits &lt; kth</code> keeps every logit equal to the k-th one, so with ties you can keep more than <code>k</code> tokens. That is harmless for sampling; if you need exactly <code>k</code>, build the mask from the indices <code>torch.topk</code> returns instead.</p>
+</div>
+
+<h2 id="prefill-decode">Prefill and decode</h2>
+
+<p>Generating text has two phases with very different costs.</p>
+<ul>
+  <li><strong>Prefill</strong>: run the whole prompt through the model in one forward pass. All prompt positions are processed in parallel, which is matrix-matrix work.</li>
+  <li><strong>Decode</strong>: produce one new token per step. Each step depends on the token chosen by the previous step, so the steps are sequential.</li>
+</ul>
+
+<p>Here is how microgpt decodes:</p>
+
+<div class="code" data-lang="python">
+<div class="code-hdr"><span class="lang">python</span><span class="title">microgpt.py · generate_name (excerpt)</span></div>
+<pre><code>for _ in range(fast_block_size - len(prefix)):
+    input_ids = torch.tensor(generated_token_ids, dtype=torch.long, device=device)
+    next_token_logits = model(input_ids)[-1] / temperature
+    ...
+    generated_token_ids.append(next_token_id)</code></pre>
+</div>
+
+<p>Every step feeds the <em>whole</em> sequence so far back into the model and keeps only the last row of logits. With an empty prompt the forwards see 1, 2, ..., 16 positions: 136 positions of work to produce 16 tokens, and in general <code>N(N+1)/2</code> for <code>N</code> tokens. That is <strong>quadratic</strong> in the output length, and attention inside each forward adds another factor of <code>T</code>.</p>
+
+<p>Your scalar version already avoids this. <code>gpt_step</code> in <code>microgpt_scalar.py</code> takes one <code>token_id</code> and <code>position_id</code>, computes that position's query, key and value, appends the key and value to <code>key_cache</code> and <code>value_cache</code>, and attends over the cache. One position per step.</p>
+
+<p>Why reusing old keys and values is exact: with a causal mask, position <code>t</code> only attends to positions <code>0..t</code>, so nothing appended later can change position <code>t</code>'s key or value. They are computed once and are final. Recomputing them every step, as <code>generate_name</code> does, gets the same numbers at quadratic cost. A <strong>KV cache</strong> is storage for those keys and values so each decode step computes only the new position.</p>
+
+<h2 id="kv-cache">A KV cache in PyTorch</h2>
+
+<p>The scalar version grows Python lists. On a GPU, growing tensors means reallocating and copying every step, so real implementations <strong>preallocate</strong>: one tensor for keys and one for values, each <code>(B, H, T_max, D)</code> (batch, heads, maximum length, head size), filled in as tokens arrive. A forward call that adds <code>T</code> new tokens starting at cache column <code>pos</code> then:</p>
+<ol>
+  <li>embeds the new tokens with position embeddings for positions <code>pos .. pos+T-1</code> (looked up by index, not by <code>[:T]</code>);</li>
+  <li>computes q, k, v for the new tokens only;</li>
+  <li>writes k and v into columns <code>[pos : pos+T]</code> of the cache;</li>
+  <li>attends with the new queries over cache columns <code>[: pos+T]</code>, where the query in column <code>c</code> may see keys in columns <code>&lt;= c</code>.</li>
+</ol>
+<p>Prefill is one call with <code>pos=0</code> and the whole prompt; each decode step is a call with <code>T = 1</code>. Step 4 is why the mask is built from column numbers rather than <code>is_causal=True</code>: with 1 query and many keys, <code>is_causal</code> aligns the mask to the top-left and the new token would see only key 0 (the pitfall in Chapter 6).</p>
+
+<p>Below is microgpt's <code>FastMicroGPT</code> rewritten for a batch dimension and an optional cache. The parameter names and shapes are the same as yours, weights stored <code>[out][in]</code>, so a <code>FastMicroGPT</code> state dict loads into it. The <code>positions</code> and <code>key_mask</code> arguments are for batched generation later in the chapter; ignore them for now.</p>
+
+<div class="code" data-lang="python">
+<div class="code-hdr"><span class="lang">python</span><span class="title">tinygpt.py</span></div>
+<pre><code>import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+BOS = 26          # microgpt: a-z are 0..25, BOS (also "end") is 26
+
+
+class TinyGPT(nn.Module):
+    """microgpt's FastMicroGPT, batched over B, with an optional KV cache.
+    Parameter names and shapes match FastMicroGPT, so its state_dict loads."""
+
+    def __init__(self, vocab_size=27, n_embd=16, block_size=16, n_head=4):
+        super().__init__()
+        self.n_embd, self.block_size, self.n_head = n_embd, block_size, n_head
+        self.head_size = n_embd // n_head
+
+        def p(rows, cols):                     # stored [out][in], like microgpt
+            return nn.Parameter(torch.randn(rows, cols) * 0.08)
+
+        self.token_embedding_table = p(vocab_size, n_embd)
+        self.position_embedding_table = p(block_size, n_embd)
+        self.query_weights = p(n_embd, n_embd)
+        self.key_weights = p(n_embd, n_embd)
+        self.value_weights = p(n_embd, n_embd)
+        self.attention_output_weights = p(n_embd, n_embd)
+        self.mlp_expand_weights = p(4 * n_embd, n_embd)
+        self.mlp_contract_weights = p(n_embd, 4 * n_embd)
+        self.language_model_head_weights = p(vocab_size, n_embd)
+
+    def forward(self, idx, cache=None, pos=0, positions=None, key_mask=None):
+        # idx: (B, T) new tokens. They sit in columns pos .. pos+T-1.
+        B, T = idx.shape
+        H, D, E = self.n_head, self.head_size, self.n_embd
+        if positions is None:                  # default: column index = position
+            positions = torch.arange(pos, pos + T, device=idx.device)
+        x = self.token_embedding_table[idx] + self.position_embedding_table[positions]
+
+        h = F.rms_norm(x, (E,), eps=1e-5)
+        q = F.linear(h, self.query_weights).view(B, T, H, D).transpose(1, 2)
+        k = F.linear(h, self.key_weights).view(B, T, H, D).transpose(1, 2)
+        v = F.linear(h, self.value_weights).view(B, T, H, D).transpose(1, 2)
+
+        if cache is not None:                  # write new k/v, read back all of them
+            cache.k[:, :, pos:pos + T] = k
+            cache.v[:, :, pos:pos + T] = v
+            k = cache.k[:, :, :pos + T]        # (B, H, pos+T, D)
+            v = cache.v[:, :, :pos + T]
+
+        S = k.shape[2]                         # number of keys we attend over
+        q_col = torch.arange(pos, pos + T, device=idx.device)[:, None]   # (T, 1)
+        k_col = torch.arange(S, device=idx.device)[None, :]              # (1, S)
+        allowed = k_col &lt;= q_col                                         # (T, S) causal
+        if key_mask is not None:               # (B, S) bool, False = padding
+            allowed = (allowed &amp; key_mask[:, None, None, :S]) | (k_col == q_col)
+
+        att = (q @ k.transpose(-2, -1)) / D**0.5                        # (B, H, T, S)
+        att = att.masked_fill(~allowed, float("-inf")).softmax(dim=-1)
+        y = (att @ v).transpose(1, 2).reshape(B, T, E)
+        x = x + F.linear(y, self.attention_output_weights)
+
+        h = F.rms_norm(x, (E,), eps=1e-5)
+        x = x + F.linear(F.relu(F.linear(h, self.mlp_expand_weights)),
+                         self.mlp_contract_weights)
+        return F.linear(x, self.language_model_head_weights)            # (B, T, V)
+
+
+class KVCache:
+    def __init__(self, model, batch_size, device="cpu"):
+        shape = (batch_size, model.n_head, model.block_size, model.head_size)
+        self.k = torch.zeros(shape, device=device)    # (B, H, T_max, D)
+        self.v = torch.zeros(shape, device=device)</code></pre>
+</div>
+
+<p>The rest of the chapter's snippets run in the same session after this file (or after <code>from tinygpt import *</code>).</p>
+
+<div class="code" data-lang="python">
+<pre><code>torch.manual_seed(0)
+model = TinyGPT().eval()
+print(sum(p.numel() for p in model.parameters()))          # 4192, same as microgpt
+cache = KVCache(model, batch_size=1)
+print(cache.k.shape, cache.k.numel() * 4 * 2, "bytes for K and V")
+# torch.Size([1, 4, 16, 4]) 2048 bytes for K and V</code></pre>
+</div>
+
+<div class="callout hood">
+<div class="callout-title">It really is your model</div>
+<p>To check the claim, I copied the <code>FastMicroGPT</code> class out of <code>run_fast_training()</code>, built one, and loaded its weights into <code>TinyGPT</code>:</p>
+<div class="code" data-lang="python">
+<pre><code>ref = FastMicroGPT()                              # from microgpt.py
+model = TinyGPT()
+model.load_state_dict(ref.state_dict())          # same names, same shapes
+ids = torch.tensor([BOS, 4, 12, 12, 0])          # &lt;BOS&gt; e m m a
+with torch.inference_mode():
+    torch.testing.assert_close(model(ids[None])[0], ref(ids))   # passes</code></pre>
+</div>
+<p>So if you trained microgpt, <code>model.load_state_dict(torch.load("microgpt_checkpoint.pt", weights_only=False)["model_state_dict"])</code> gives this file your trained weights.</p>
+</div>
+
+<h4>Prove the cache is exact</h4>
+<p>The cache is an optimisation, so it must not change a single logit. Run 16 tokens through the model in one go, then again as a 5-token prefill plus 11 one-token decode steps, and compare with <code>torch.testing.assert_close</code> (Chapter 12 explains its tolerances).</p>
+
+<div class="code" data-lang="python">
+<pre><code>torch.manual_seed(0)
+model = TinyGPT().eval()
+ids = torch.randint(0, 27, (2, 16))               # B=2 sequences of 16 tokens
+
+with torch.inference_mode():
+    full = model(ids)                             # (2, 16, 27): no cache, all at once
+
+    cache = KVCache(model, batch_size=2)
+    P = 5
+    steps = [model(ids[:, :P], cache=cache, pos=0)]          # prefill: 5 positions
+    for pos in range(P, 16):                                  # decode: 1 position each
+        steps.append(model(ids[:, pos:pos + 1], cache=cache, pos=pos))
+    cached = torch.cat(steps, dim=1)              # (2, 16, 27)
+
+print(full.shape, cached.shape)
+torch.testing.assert_close(cached, full)
+print("cached == full recompute; max abs diff:", (cached - full).abs().max().item())</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>torch.Size([2, 16, 27]) torch.Size([2, 16, 27])
+cached == full recompute; max abs diff: 5.960464477539063e-08</code></pre>
+</div>
+
+<p>The tiny difference is float rounding: the full pass computes masked scores for future keys and throws them away as <code>-inf</code>, the cached pass never computes them, so sums happen in a slightly different order.</p>
+
+<h4>What the cache costs in memory</h4>
+<p>Per token, a cache stores one key and one value vector per layer: <code>2 × layers × kv_heads × head_size × bytes</code>. For microgpt that is <code>2 × 1 × 4 × 4 × 4 = 128</code> bytes per token, 2 KiB for all 16 positions. For a Llama-3-8B-shaped model (32 layers, 8 key/value heads of 128 dims, bf16) it is <code>2 × 32 × 8 × 128 × 2 = 131,072</code> bytes, 128 KiB per token: one 8,192-token sequence holds 1 GiB of cache. On a serving GPU the cache, not the weights, is what limits how many requests fit.</p>
+
+<div class="hands-on">
+<div class="hands-on-hdr">Hands-on · do this now</div>
+<div class="hands-on-body">
+<p>1. Get a model worth sampling from. If you have <code>microgpt_checkpoint.pt</code>, load it as shown above. Otherwise this trains <code>TinyGPT</code> on 40 names for 500 batched steps (a few seconds on a laptop):</p>
+<div class="code" data-lang="python">
+<pre><code>names = ("emma olivia ava isabella sophia mia charlotte amelia harper evelyn "
+         "abigail emily elizabeth sofia ella madison scarlett victoria aria grace "
+         "chloe camila penelope riley layla lillian nora zoey mila aubrey "
+         "hannah lily addison eleanor natalie luna savannah brooklyn leah zoe").split()
+
+
+def encode(name):
+    return [BOS] + [ord(c) - ord("a") for c in name] + [BOS]
+
+
+def decode(ids):
+    return "".join(chr(i + ord("a")) for i in ids if i != BOS)
+
+
+def make_batch(names):
+    seqs = [encode(n) for n in names]
+    T = max(len(s) for s in seqs) - 1
+    x = torch.full((len(seqs), T), BOS)
+    y = torch.full((len(seqs), T), -100)            # -100: ignored by cross_entropy
+    for i, s in enumerate(seqs):
+        x[i, :len(s) - 1] = torch.tensor(s[:-1])
+        y[i, :len(s) - 1] = torch.tensor(s[1:])
+    return x, y
+
+
+torch.manual_seed(0)
+model = TinyGPT()
+opt = torch.optim.Adam(model.parameters(), lr=0.01, betas=(0.85, 0.99))
+x, y = make_batch(names)
+for step in range(500):
+    loss = F.cross_entropy(model(x).flatten(0, 1), y.flatten())
+    opt.zero_grad()
+    loss.backward()
+    opt.step()
+print(f"final training loss: {loss.item():.3f}")     # final training loss: 0.550
+model.eval()</code></pre>
+</div>
+<p>2. Write a cached generator: one prefill call for the prompt, then one decode call per token. It stops when the model emits BOS, which microgpt uses as "end", or when the 16 positions are used up.</p>
+<div class="code" data-lang="python">
+<pre><code>@torch.inference_mode()
+def generate(model, prompt="", temperature=1.0, top_k=None, top_p=None, generator=None):
+    ids = torch.tensor([[BOS] + [ord(c) - ord("a") for c in prompt]])   # (1, L)
+    cache = KVCache(model, batch_size=1)
+    logits = model(ids, cache=cache, pos=0)              # prefill: whole prompt at once
+    out = []
+    for pos in range(ids.shape[1], model.block_size + 1):
+        nxt = sample(logits[:, -1], temperature, top_k, top_p, generator)  # (1, 1)
+        if nxt.item() == BOS:                            # BOS doubles as "end"
+            break
+        out.append(nxt.item())
+        if pos &lt; model.block_size:
+            logits = model(nxt, cache=cache, pos=pos)    # decode: one position
+    return prompt + decode(out)</code></pre>
+</div>
+<p>3. Sample at several temperatures and filters. Predict first: what will <code>T = 0</code> give six times in a row?</p>
+<div class="code" data-lang="python">
+<pre><code>g = torch.Generator().manual_seed(42)
+for T in [0, 0.5, 1.0, 2.0]:
+    print(T, [generate(model, "", T, generator=g) for _ in range(6)])
+print("top_k=3", [generate(model, "", 1.0, top_k=3, generator=g) for _ in range(6)])
+print("top_p=0.9", [generate(model, "", 1.0, top_p=0.9, generator=g) for _ in range(6)])
+print("prompt 'li'", [generate(model, "li", 0.8, generator=g) for _ in range(6)])</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>0 ['elizabeth', 'elizabeth', 'elizabeth', 'elizabeth', 'elizabeth', 'elizabeth']
+0.5 ['aubrey', 'natalie', 'aria', 'lily', 'eleanor', 'mia']
+1.0 ['luna', 'emily', 'ava', 'sofia', 'hannah', 'layla']
+2.0 ['camila', 'camila', 'olivia', 'cadrion', 'cadrionnnnnne', 'ava']
+top_k=3 ['ella', 'aubrey', 'eleanor', 'sophia', 'sofia', 'savannah']
+top_p=0.9 ['addison', 'sophia', 'charlotte', 'sofia', 'hannah', 'aubrey']
+prompt 'li' ['lily', 'lillian', 'lily', 'lily', 'lily', 'lily']</code></pre>
+</div>
+<p>Greedy repeats one name forever. At <code>T = 2</code> the flattened distribution lets tail tokens through and you get <code>cadrionnnnnne</code>. Top-k and top-p at <code>T = 1</code> stay inside the plausible set. With 40 training names the model has mostly memorised them; your exact names may differ slightly with a different thread count or PyTorch version.</p>
+</div>
+</div>
+
+<h2 id="batched">Batched generation</h2>
+
+<p>A decode step for one sequence is a handful of matrix-vector products: the GPU reads every weight to do a few FLOPs per weight. Decoding <code>B</code> sequences together reads the weights once and does <code>B</code> times the work, which is why every server batches (Chapter 11 puts numbers on this). The complication: prompts have different lengths.</p>
+
+<h4>Left padding, an attention mask, and per-row positions</h4>
+<p>Pad each prompt on the <strong>left</strong> so that all prompts end in the same column. Then every row's next token goes into the same cache column at every step, and one <code>pos</code> works for the whole batch. Right padding, which Chapter 8 uses for training, would leave the pads between the prompt and the generated text.</p>
+<p>Padding needs two corrections.</p>
+<ul>
+  <li><strong>A key mask</strong>, <code>key_mask[b, c]</code> = "column <code>c</code> of row <code>b</code> holds a real token". Real queries must not attend to pad keys.</li>
+  <li><strong>Per-row positions.</strong> The column index is no longer the position: a 2-token prompt that starts in column 3 must still use position embeddings 0 and 1. <code>key_mask.cumsum(dim=1) - 1</code> counts real tokens to the left, which is exactly the position.</li>
+</ul>
+<p>One more detail in <code>TinyGPT.forward</code>: <code>| (k_col == q_col)</code> lets every query see its own column. A pad query has no real key to its left; without that line its whole row of scores is <code>-inf</code> and softmax returns NaN. The NaN would stay in pad rows that nobody reads, but NaNs have a way of spreading, and Chapter 12 shows this exact bug. Letting pads attend to themselves gives garbage that is finite and never used.</p>
+
+<h4>Stopping each row on its own</h4>
+<p>Rows finish at different steps. Keep a <code>finished</code> boolean per row; once a row has emitted BOS, force its later tokens to BOS so it stays finished, and stop the loop when every row is done.</p>
+
+<div class="code" data-lang="python">
+<pre><code>@torch.inference_mode()
+def generate_batch(model, prompts, temperature=1.0, top_k=None, top_p=None, generator=None):
+    B = len(prompts)
+    seqs = [[BOS] + [ord(c) - ord("a") for c in p] for p in prompts]
+    L = max(len(s) for s in seqs)
+    ids = torch.full((B, L), BOS)                       # pad value is never attended to
+    key_mask = torch.zeros(B, model.block_size, dtype=torch.bool)
+    for i, s in enumerate(seqs):
+        ids[i, L - len(s):] = torch.tensor(s)           # LEFT padding
+        key_mask[i, L - len(s):L] = True                # which cache columns are real
+    positions = (key_mask[:, :L].cumsum(dim=1) - 1).clamp(min=0)   # (B, L)
+
+    cache = KVCache(model, B)
+    logits = model(ids, cache=cache, pos=0, positions=positions, key_mask=key_mask)
+    last_pos = positions[:, -1:]                        # (B, 1)
+    finished = torch.zeros(B, dtype=torch.bool)
+    new_tokens = []
+    for col in range(L, model.block_size + 1):
+        nxt = sample(logits[:, -1], temperature, top_k, top_p, generator)   # (B, 1)
+        nxt = nxt.masked_fill(finished[:, None], BOS)  # finished rows only emit BOS
+        new_tokens.append(nxt)
+        finished |= nxt[:, 0] == BOS
+        if finished.all() or col == model.block_size:
+            break
+        key_mask[:, col] = True
+        last_pos = last_pos + 1
+        logits = model(nxt, cache=cache, pos=col, positions=last_pos, key_mask=key_mask)
+    rows = torch.cat(new_tokens, dim=1).tolist()
+    return [p + decode(r) for p, r in zip(prompts, rows)]</code></pre>
+</div>
+
+<p>For the prompts <code>["", "li", "char", "sa"]</code>, the prefill inputs look like this (pads are BOS here, but the value is irrelevant because the mask hides them):</p>
+<div class="code" data-lang="text">
+<pre><code>ids                          key_mask[:, :L]           positions
+[[26, 26, 26, 26, 26],       [[0, 0, 0, 0, 1],         [[0, 0, 0, 0, 0],
+ [26, 26, 26, 11,  8],        [0, 0, 1, 1, 1],          [0, 0, 0, 1, 2],
+ [26,  2,  7,  0, 17],        [1, 1, 1, 1, 1],          [0, 1, 2, 3, 4],
+ [26, 26, 26, 18,  0]]        [0, 0, 1, 1, 1]]          [0, 0, 0, 1, 2]]</code></pre>
+</div>
+
+<p>The test that matters: batching must not change any row's result. Greedy decoding makes that checkable.</p>
+<div class="code" data-lang="python">
+<pre><code>prompts = ["", "li", "char", "sa"]
+print(generate_batch(model, prompts, temperature=0))
+print([generate(model, p, temperature=0) for p in prompts])
+g = torch.Generator().manual_seed(7)
+print(generate_batch(model, prompts, temperature=0.8, generator=g))</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>['elizabeth', 'lily', 'charlotte', 'savannah']
+['elizabeth', 'lily', 'charlotte', 'savannah']
+['luna', 'lily', 'charlotte', 'savannah']</code></pre>
+</div>
+<p>I also checked the prefill logits directly: for every row, the logits at its real positions from the padded batch pass <code>assert_close</code> against running that row alone.</p>
+
+<div class="callout tip">
+<div class="callout-title">Sampled batches are not the same draws as one-at-a-time</div>
+<p>With sampling, the batched and sequential versions consume the generator in a different order, so they give different (equally valid) names. Compare batched against unbatched with greedy decoding, or compare logits, never sampled text.</p>
+</div>
+
+<h2 id="speed">What the cache buys</h2>
+
+<p>Time greedy generation with and without the cache. The uncached version is <code>generate_name</code>'s strategy: re-run the whole prefix every step.</p>
+
+<div class="code" data-lang="python">
+<pre><code>import time
+import statistics
+
+
+@torch.inference_mode()
+def greedy_uncached(model, ids, n_new):
+    for _ in range(n_new):
+        logits = model(ids)                              # the whole prefix, every step
+        ids = torch.cat([ids, logits[:, -1:].argmax(-1)], dim=1)
+    return ids
+
+
+@torch.inference_mode()
+def greedy_cached(model, ids, n_new):
+    cache = KVCache(model, ids.shape[0])
+    logits = model(ids, cache=cache, pos=0)              # prefill
+    out = [ids]
+    for i in range(n_new):
+        nxt = logits[:, -1:].argmax(-1)                  # (B, 1)
+        out.append(nxt)
+        if i &lt; n_new - 1:
+            logits = model(nxt, cache=cache, pos=ids.shape[1] + i)   # decode
+    return torch.cat(out, dim=1)
+
+
+def tokens_per_second(fn, model, ids, n_new, repeats=5):
+    fn(model, ids, n_new)                                # warm-up
+    times = []
+    for _ in range(repeats):
+        t0 = time.perf_counter()
+        fn(model, ids, n_new)
+        times.append(time.perf_counter() - t0)
+    return ids.shape[0] * n_new / statistics.median(times)
+
+
+torch.set_num_threads(1)
+torch.manual_seed(0)
+for cfg, n_new in [(dict(), 15), (dict(n_embd=256, n_head=8, block_size=1024), 1000)]:
+    m = TinyGPT(**cfg).eval()
+    ids = torch.full((1, 1), BOS)
+    assert torch.equal(greedy_uncached(m, ids, n_new), greedy_cached(m, ids, n_new))
+    slow = tokens_per_second(greedy_uncached, m, ids, n_new, repeats=3)
+    fast = tokens_per_second(greedy_cached, m, ids, n_new, repeats=3)
+    print(f"{cfg or 'microgpt size'}: {n_new} tokens  "
+          f"uncached {slow:8.0f} tok/s   cached {fast:8.0f} tok/s   x{fast / slow:.1f}")</code></pre>
+</div>
+
+<p>Measured on an Apple Silicon laptop CPU (M4 Pro, one thread). Your numbers will differ; the ratios are the point.</p>
+<div class="code" data-lang="text">
+<pre><code>microgpt size: 15 tokens  uncached    15242 tok/s   cached    18723 tok/s   x1.2
+{'n_embd': 256, 'n_head': 8, 'block_size': 1024}: 1000 tokens  uncached      113 tok/s   cached     9368 tok/s   x83.0</code></pre>
+</div>
+
+<p>A second run gave x1.1 and x76.5. At microgpt size the cache barely matters: a 16-position forward and a 1-position forward cost about the same, because the time goes to per-operation overhead, not arithmetic (Chapter 11). At 1,000 tokens with a 256-wide model, the uncached loop processes 500,500 positions to emit 1,000 tokens and the cache wins by almost two orders of magnitude. Both versions produced identical tokens, as the <code>assert</code> checks.</p>
+
+<h2 id="serving">From here to a serving engine</h2>
+
+<p>Production engines such as vLLM, SGLang and TensorRT-LLM run this same prefill-then-decode loop, with three changes worth knowing by name. First, the <strong>paged KV cache</strong> (introduced by vLLM's PagedAttention): instead of one <code>(B, H, T_max, D)</code> slab per batch, which reserves <code>T_max</code> columns for every request whether it uses them or not, the cache is a pool of fixed-size blocks of a few tokens each, and each sequence has a block table mapping its logical positions to physical blocks, like virtual memory pages. Memory is allocated as a sequence grows, fragmentation stays small, and requests with a common prompt prefix can share blocks. The attention kernel reads keys and values through the block table.</p>
+
+<p>Second, <strong>continuous batching</strong> (also called iteration-level scheduling): the batch is not fixed for the life of a request. After every decode step the scheduler removes finished sequences and admits waiting ones, so a short request never waits for the longest one in its batch. Your <code>finished</code> mask is the static version of this; Exercise 10.7 takes one step toward the dynamic one. Third, engines often split long prompts into pieces and interleave those prefill chunks with other requests' decode steps (<strong>chunked prefill</strong>, Exercise 10.6), so one long prompt does not stall everyone's next token. The kernels, schedulers and memory managers that make this fast are the subject of inference engineering; the semantics are what you just built.</p>
+
+<h2 id="exercises">Exercises</h2>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 10.1</span>
+  <span class="exercise-diff easy">easy</span>
+  <span class="exercise-title">Temperature by hand</span>
+</div>
+<div class="exercise-body">
+<p>For logits <code>[1, 0]</code>, compute the probabilities by hand at <code>T = 1</code> and <code>T = 0.25</code>. Then predict what <code>T = 0.01</code> and <code>T = 100</code> give, and check all four in PyTorch.</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<p><code>T = 1</code>: <code>e / (e + 1) = 2.718 / 3.718 ≈ 0.731</code>. <code>T = 0.25</code>: logits become <code>[4, 0]</code>, so <code>e<sup>4</sup> / (e<sup>4</sup> + 1) = 54.6 / 55.6 ≈ 0.982</code>. Small <code>T</code> approaches greedy, large <code>T</code> approaches uniform.</p>
+<div class="code" data-lang="python">
+<pre><code>logits = torch.tensor([1.0, 0.0])
+for T in [1.0, 0.25, 0.01, 100.0]:
+    print(T, F.softmax(logits / T, dim=-1))</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>1.0 tensor([0.7311, 0.2689])
+0.25 tensor([0.9820, 0.0180])
+0.01 tensor([1.0000e+00, 3.7835e-44])
+100.0 tensor([0.5025, 0.4975])</code></pre>
+</div>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 10.2</span>
+  <span class="exercise-diff easy">easy</span>
+  <span class="exercise-title">Which switch does what</span>
+</div>
+<div class="exercise-body">
+<p>For <code>net = nn.Sequential(nn.Linear(4, 4), nn.Dropout(0.5))</code> and <code>x = torch.ones(1, 4)</code>, predict for each case whether two calls give the same output and whether the output requires grad: (a) <code>net.train()</code> inside <code>inference_mode</code>; (b) <code>net.eval()</code> with grad enabled; (c) <code>net.eval()</code> inside <code>inference_mode</code>. Then run it.</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<div class="code" data-lang="python">
+<pre><code>torch.manual_seed(0)
+net = nn.Sequential(nn.Linear(4, 4), nn.Dropout(0.5))
+x = torch.ones(1, 4)
+
+net.train()
+with torch.inference_mode():
+    a, b = net(x), net(x)
+print("train + inference_mode: same output twice?", torch.equal(a, b))
+
+net.eval()
+c, d = net(x), net(x)
+print("eval, grad on: same output twice?", torch.equal(c, d), "requires_grad:", c.requires_grad)
+
+with torch.inference_mode():
+    e = net(x)
+print("eval + inference_mode:", torch.equal(c, e), e.requires_grad)</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>train + inference_mode: same output twice? False
+eval, grad on: same output twice? True requires_grad: True
+eval + inference_mode: True False</code></pre>
+</div>
+<p><code>inference_mode</code> does not stop dropout (a); <code>eval()</code> does not stop gradient tracking (b). Only both together (c) give deterministic outputs with no graph.</p>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 10.3</span>
+  <span class="exercise-diff medium">medium</span>
+  <span class="exercise-title">Implement top-p the other way round</span>
+</div>
+<div class="exercise-body">
+<p>Write <code>top_p_asc(logits, p)</code> for <code>(B, V)</code> logits that sorts <em>ascending</em> and removes the cheap tail: every token whose cumulative probability from the bottom is <code>&lt;= 1 - p</code>, but never the best token. Show on 1,000 random rows that it keeps exactly the same tokens as the descending version inside <code>sample()</code>, for <code>p</code> in 0.5, 0.9, 0.95.</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<p>A token is dropped by the descending rule when the mass above it is <code>&gt;= p</code>, which is the same as "the mass of it and everything below it is <code>&lt;= 1 - p</code>". The ascending cumsum computes exactly that second quantity.</p>
+<div class="code" data-lang="python">
+<pre><code>def top_p_desc(logits, p):                       # the version inside sample()
+    s, idx = torch.sort(logits, dim=-1, descending=True)
+    probs = F.softmax(s, dim=-1)
+    s = s.masked_fill((probs.cumsum(-1) - probs) &gt;= p, float("-inf"))
+    return torch.full_like(logits, float("-inf")).scatter(-1, idx, s)
+
+
+def top_p_asc(logits, p):                        # ascending: drop the cheap tail
+    s, idx = torch.sort(logits, dim=-1)          # smallest first
+    tail = F.softmax(s, dim=-1).cumsum(-1) &lt;= (1 - p)   # tail mass still &lt;= 1-p
+    tail[:, -1] = False                          # always keep the best token
+    s = s.masked_fill(tail, float("-inf"))
+    return torch.full_like(logits, float("-inf")).scatter(-1, idx, s)
+
+
+torch.manual_seed(0)
+logits = torch.randn(1000, 27) * 2
+for p in [0.5, 0.9, 0.95]:
+    a = torch.isfinite(top_p_desc(logits, p))
+    b = torch.isfinite(top_p_asc(logits, p))
+    print(f"p={p}: rows that disagree: {(a != b).any(dim=-1).sum().item()}, "
+          f"mean tokens kept: {a.sum(-1).float().mean().item():.2f}")</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>p=0.5: rows that disagree: 0, mean tokens kept: 2.26
+p=0.9: rows that disagree: 0, mean tokens kept: 8.66
+p=0.95: rows that disagree: 0, mean tokens kept: 11.84</code></pre>
+</div>
+<p>Note how the number of kept tokens adapts per row: that adaptivity is the reason top-p exists.</p>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 10.4</span>
+  <span class="exercise-diff medium">medium</span>
+  <span class="exercise-title">Add a repetition penalty</span>
+</div>
+<div class="exercise-body">
+<p>A <strong>repetition penalty</strong> lowers the logits of tokens that already appear in the sequence: divide a positive logit by <code>penalty</code>, multiply a negative one by it (so both move down). Write <code>repetition_penalty(logits, history, penalty)</code> for <code>(B, V)</code> logits and <code>(B, t)</code> history using <code>gather</code> and <code>scatter</code>, then add it to a generator and compare names at <code>T = 1.8</code> with penalty 1.0 and 1.5.</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<div class="code" data-lang="python">
+<pre><code>def repetition_penalty(logits, history, penalty=1.5):
+    """logits: (B, V); history: (B, t) token ids already in each row."""
+    seen = torch.gather(logits, 1, history)                  # (B, t) their logits
+    seen = torch.where(seen &gt; 0, seen / penalty, seen * penalty)   # always lower
+    return logits.scatter(1, history, seen)
+
+
+logits = torch.tensor([[2.0, 1.0, -1.0, 0.5]])
+print(repetition_penalty(logits, torch.tensor([[0, 2, 0]])))
+# tensor([[ 1.3333,  1.0000, -1.5000,  0.5000]])
+
+
+@torch.inference_mode()
+def generate_rp(model, temperature, penalty, generator):
+    ids = torch.tensor([[BOS]])
+    cache = KVCache(model, batch_size=1)
+    logits = model(ids, cache=cache, pos=0)
+    for pos in range(1, model.block_size + 1):
+        last = logits[:, -1]
+        if penalty != 1.0 and ids.shape[1] &gt; 1:
+            last = repetition_penalty(last, ids[:, 1:], penalty)   # skip the BOS
+        nxt = sample(last, temperature, generator=generator)
+        if nxt.item() == BOS:
+            break
+        ids = torch.cat([ids, nxt], dim=1)
+        if pos &lt; model.block_size:
+            logits = model(nxt, cache=cache, pos=pos)
+    return decode(ids[0].tolist())
+
+
+for penalty in [1.0, 1.5]:
+    g = torch.Generator().manual_seed(1)
+    print(penalty, [generate_rp(model, 1.8, penalty, g) for _ in range(8)])</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>1.0 ['aubrey', 'amelia', 'emma', 'sophia', 'ella', 'harper', 'amelia', 'zoey']
+1.5 ['aubrey', 'ameli', 'hannatiiu', 'han', 'luna', 'natalie', 'harper', 'liah']</code></pre>
+</div>
+<p>(This uses the trained names model from the hands-on.) The penalty hurts here: names legitimately repeat letters, so <code>amelia</code> loses its final <code>a</code> and <code>hannah</code> cannot close. Penalties exist for long text where a model loops on whole phrases; on short, repetitive domains they are a trade-off, not a free improvement. Repeated ids in <code>history</code> are fine: every duplicate writes the same value.</p>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 10.5</span>
+  <span class="exercise-diff medium">medium</span>
+  <span class="exercise-title">Measure the quadratic cost</span>
+</div>
+<div class="exercise-body">
+<p>Using the 256-wide config from the speed section, (a) count how many positions the model processes for 256 generated tokens with and without the cache, using a forward pre-hook on the model; (b) time one uncached step (a full forward) at prefix lengths 128, 256, 512, 1024.</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<p>A forward pre-hook runs before <code>forward</code> and receives its positional arguments; <code>args[0]</code> is <code>idx</code>.</p>
+<div class="code" data-lang="python">
+<pre><code>torch.set_num_threads(1)
+torch.manual_seed(0)
+big = TinyGPT(n_embd=256, n_head=8, block_size=1024).eval()
+
+positions_seen = [0]
+big.register_forward_pre_hook(lambda mod, args: positions_seen.__setitem__(
+    0, positions_seen[0] + args[0].shape[1]))
+
+ids = torch.full((1, 1), BOS)
+for fn in [greedy_uncached, greedy_cached]:
+    positions_seen[0] = 0
+    fn(big, ids, 256)
+    print(f"{fn.__name__}: {positions_seen[0]} positions for 256 tokens")
+
+with torch.inference_mode():
+    for T in [128, 256, 512, 1024]:
+        x = torch.randint(0, 27, (1, T))
+        big(x)                                      # warm-up
+        t0 = time.perf_counter()
+        for _ in range(5):
+            big(x)
+        print(f"T={T:5d}: {(time.perf_counter() - t0) / 5 * 1e3:6.1f} ms per step")</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>greedy_uncached: 32896 positions for 256 tokens
+greedy_cached: 256 positions for 256 tokens
+T=  128:    0.5 ms per step
+T=  256:    1.3 ms per step
+T=  512:    4.5 ms per step
+T= 1024:   16.4 ms per step</code></pre>
+</div>
+<p>(Apple Silicon laptop CPU, one thread.) <code>32896 = 256 × 257 / 2</code>. The per-step time grows faster than linearly because attention scores are <code>T × T</code>: doubling <code>T</code> costs 2.6x, then 3.5x, then 3.6x. Summed over the steps, uncached generation is worse than quadratic in total.</p>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 10.6</span>
+  <span class="exercise-diff hard">hard</span>
+  <span class="exercise-title">Prove chunked prefill is exact</span>
+</div>
+<div class="exercise-body">
+<p>Serving engines split long prompts into chunks and prefill them over several calls. Show that with <code>TinyGPT</code>, prefilling 16 tokens for a batch of 3 in chunks of 1, 3, 4 and 16 all give the same logits as a single uncached forward. Why does the chunk size not matter?</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<div class="code" data-lang="python">
+<pre><code>torch.manual_seed(0)
+m = TinyGPT().eval()
+ids = torch.randint(0, 27, (3, 16))
+
+with torch.inference_mode():
+    full = m(ids)
+    for chunk in [1, 3, 4, 16]:
+        cache = KVCache(m, batch_size=3)
+        parts = [m(ids[:, s:s + chunk], cache=cache, pos=s)
+                 for s in range(0, 16, chunk)]
+        torch.testing.assert_close(torch.cat(parts, dim=1), full)
+        print(f"chunk={chunk:2d}: {len(parts):2d} forward calls, logits match")</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>chunk= 1: 16 forward calls, logits match
+chunk= 3:  6 forward calls, logits match
+chunk= 4:  4 forward calls, logits match
+chunk=16:  1 forward calls, logits match</code></pre>
+</div>
+<p>Every quantity that crosses positions goes through the cache: a chunk starting at column <code>s</code> writes its keys and values, then its queries attend to columns <code>&lt;= own column</code>, all of which are already written (earlier chunks or this one). Everything else (embeddings, norms, MLP) is per-position. Chunk size changes how many calls you make, not what each position sees. Decode is the special case <code>chunk = 1</code>.</p>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 10.7</span>
+  <span class="exercise-diff hard">hard</span>
+  <span class="exercise-title">Evict finished rows from the batch</span>
+</div>
+<div class="exercise-body">
+<p><code>generate_batch</code> keeps computing finished rows until the last row stops. Write <code>generate_batch_evict</code> that removes finished rows after each step: shrink the cache, the key mask, the positions and the next tokens with a boolean index, and keep a map from live rows back to the original prompts. Print how many rows each decode step computes, and check with greedy decoding that it returns the same names as <code>generate_batch</code>.</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<div class="code" data-lang="python">
+<pre><code>@torch.inference_mode()
+def generate_batch_evict(model, prompts, temperature=1.0, generator=None):
+    B = len(prompts)
+    seqs = [[BOS] + [ord(c) - ord("a") for c in p] for p in prompts]
+    L = max(len(s) for s in seqs)
+    ids = torch.full((B, L), BOS)
+    key_mask = torch.zeros(B, model.block_size, dtype=torch.bool)
+    for i, s in enumerate(seqs):
+        ids[i, L - len(s):] = torch.tensor(s)
+        key_mask[i, L - len(s):L] = True
+    positions = (key_mask[:, :L].cumsum(dim=1) - 1).clamp(min=0)
+    cache = KVCache(model, B)
+    logits = model(ids, cache=cache, pos=0, positions=positions, key_mask=key_mask)
+    last_pos = positions[:, -1:]
+    alive = torch.arange(B)                  # original row index of each live row
+    out = [[] for _ in range(B)]
+    steps = []
+    for col in range(L, model.block_size + 1):
+        nxt = sample(logits[:, -1], temperature, generator=generator)    # (live, 1)
+        done = nxt[:, 0] == BOS
+        for r, tok in zip(alive.tolist(), nxt[:, 0].tolist()):
+            if tok != BOS:
+                out[r].append(tok)
+        keep = ~done
+        if not keep.any() or col == model.block_size:
+            break
+        # evict finished rows: shrink every per-row tensor, including the cache
+        alive, nxt, last_pos = alive[keep], nxt[keep], last_pos[keep]
+        cache.k, cache.v, key_mask = cache.k[keep], cache.v[keep], key_mask[keep]
+        steps.append(len(alive))
+        key_mask[:, col] = True
+        last_pos = last_pos + 1
+        logits = model(nxt, cache=cache, pos=col, positions=last_pos, key_mask=key_mask)
+    print("live rows per decode step:", steps)
+    return [p + decode(o) for p, o in zip(prompts, out)]
+
+
+prompts = ["", "li", "char", "sa", "e", "zo"]
+a = generate_batch(model, prompts, temperature=0)
+b = generate_batch_evict(model, prompts, temperature=0)
+print(a)
+assert a == b
+print("same names, fewer rows computed")</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>live rows per decode step: [6, 6, 4, 4, 4, 3, 2, 2, 1]
+['elizabeth', 'lily', 'charlotte', 'savannah', 'elizabeth', 'zoey']
+same names, fewer rows computed</code></pre>
+</div>
+<p>(The trained names model from the hands-on.) Instead of 9 steps × 6 rows = 54 row-steps, it computed 32. Indexing <code>cache.k[keep]</code> copies the cache, which is fine at this size; a paged cache avoids the copy by just releasing the finished sequence's blocks. Admitting <em>new</em> prompts into the freed slots is the other half of continuous batching, and needs per-row cache columns rather than one shared <code>pos</code>.</p>
+</div>
+</details>
+</div>
+</div>
+
+<h2 id="recap">Recap</h2>
+<ul>
+  <li><code>model.eval()</code> changes layer behaviour (dropout); <code>torch.inference_mode()</code> turns off autograd with the least bookkeeping. Generation wants both.</li>
+  <li>Decoding turns <code>logits[:, -1]</code> into a token: greedy <code>argmax</code>, or temperature, then top-k (<code>torch.topk</code>), then top-p (sort, <code>cumsum</code>, mask, <code>scatter</code>), then <code>torch.multinomial</code>. Pass a <code>torch.Generator</code> for reproducible draws.</li>
+  <li>Prefill processes the prompt in one call; decode emits one token per call. Re-running the prefix every step, as <code>generate_name</code> does, is quadratic work.</li>
+  <li>A KV cache preallocates <code>(B, H, T_max, D)</code> keys and values, writes the new ones at <code>pos</code>, attends over <code>[:pos+T]</code> with a mask built from column indices, and looks up position embeddings by index. It must give the same logits as full recomputation; test that with <code>assert_close</code>.</li>
+  <li>Batched generation: left-pad, mask pad keys, compute per-row positions with <code>cumsum</code>, let pad queries see themselves to avoid NaN, and stop each row with a <code>finished</code> mask.</li>
+  <li>The cache is worth 1.1x at microgpt size and about 80x for a 256-wide model generating 1,000 tokens (laptop CPU). Real engines add a paged cache, continuous batching and chunked prefill on top of the same semantics.</li>
+</ul>
+
+<div class="page-nav">
+  <a href="09-devices-precision.html"><span class="lbl">← Prev</span><span class="ttl">Devices &amp; Precision</span></a>
+  <a href="11-performance.html" class="next"><span class="lbl">Next →</span><span class="ttl">Performance &amp; Profiling</span></a>
+</div>
+
+</main>
+</div>
+<script src="../assets/site.js"></script>
+</body>
+</html>

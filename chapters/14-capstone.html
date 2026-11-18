@@ -1,0 +1,1578 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>14 · Capstone Project — PyTorch</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<button class="sidebar-toggle" aria-label="Toggle navigation">☰ Menu</button>
+<div class="layout">
+<aside class="sidebar">
+  <a href="../index.html" class="brand">PyTorch</a>
+  <span class="brand-sub">a deep dive — 2026</span>
+  <nav>
+    <ol>
+      <li><a href="01-why-pytorch.html">Why PyTorch</a></li>
+      <li><a href="02-tensors.html">Tensors</a></li>
+      <li><a href="03-tensor-math.html">Tensor Math &amp; Broadcasting</a></li>
+      <li><a href="04-autograd.html">Autograd</a></li>
+      <li><a href="05-nn-module.html">nn.Module</a></li>
+      <li><a href="06-transformer-blocks.html">Building a Transformer</a></li>
+      <li><a href="07-losses-optimizers.html">Losses &amp; Optimizers</a></li>
+      <li><a href="08-training-loop.html">The Training Loop</a></li>
+      <li><a href="09-devices-precision.html">Devices &amp; Precision</a></li>
+      <li><a href="10-inference.html">Inference &amp; Sampling</a></li>
+      <li><a href="11-performance.html">Performance &amp; Profiling</a></li>
+      <li><a href="12-debugging.html">Debugging PyTorch</a></li>
+      <li><a href="13-50-questions.html">The 50 Questions</a></li>
+      <li><a href="14-capstone.html">Capstone Project</a></li>
+    </ol>
+    <div class="extras">
+      <a href="../exercises.html">All Exercises</a>
+      <a href="../index.html">← Home</a>
+    </div>
+  </nav>
+  <div class="progress"></div>
+</aside>
+
+<main class="content">
+
+<h1>
+  <span class="chap-num">Chapter 14</span>
+  Capstone Project
+</h1>
+<p class="lede">
+  Rebuild microgpt in PyTorch, starting from an empty file, laid out the way
+  real training and inference code is: data, batching, model, training loop,
+  checkpoints, KV-cache generation, and a benchmark. Then make it fast and
+  measure it. There are seven milestones and a set of stretch goals; each
+  milestone has a check you run, and every output on this page comes from
+  actually running the reference solution.
+</p>
+
+<h2 id="goals">What you will build</h2>
+
+<p>One file, <code>gpt.py</code>, with three commands:</p>
+<ul>
+  <li><code>python gpt.py train</code>: download names.txt, train the 4,192-parameter microgpt on batches of 32 names with AdamW, evaluate on the held-out names, save a checkpoint. <code>--resume</code> continues from it.</li>
+  <li><code>python gpt.py sample</code>: load the checkpoint and generate names with temperature and top-k, using a KV cache.</li>
+  <li><code>python gpt.py bench</code>: training tokens/s, cached vs uncached generation tokens/s, and a <code>torch.profiler</code> table.</li>
+</ul>
+<p>Same model, same data split and same evaluation as <code>microgpt.py</code>, so the numbers compare directly. On an Apple Silicon (M4 Pro) laptop CPU, one thread, this is what the reference solution measured. Your numbers will differ.</p>
+<table>
+<thead><tr><th></th><th><code>microgpt.py</code> (1 epoch, 1 name per step)</th><th><code>gpt.py</code> (20,000 steps, 32 names per step)</th></tr></thead>
+<tbody>
+<tr><td>Training time</td><td>8.99 s</td><td>about 30 s</td></tr>
+<tr><td>Training throughput</td><td>about 22,800 tokens/s</td><td>about 165,000–170,000 tokens/s</td></tr>
+<tr><td>Test tokens evaluated</td><td>22,866</td><td>22,866</td></tr>
+<tr><td>Test loss</td><td>2.2219</td><td>2.0891</td></tr>
+<tr><td>Test perplexity</td><td>9.22</td><td>8.08</td></tr>
+</tbody>
+</table>
+<p>The batched run sees 640,000 names (about 22 epochs) in roughly three times the wall-clock time microgpt takes for one epoch, which is why its loss is lower. The microgpt throughput is the 205,280 training tokens in one epoch divided by its 8.99 s.</p>
+
+<h2 id="spec">The spec</h2>
+
+<h4>Model and training hyperparameters</h4>
+<table>
+<thead><tr><th>Setting</th><th>microgpt.py</th><th>gpt.py</th></tr></thead>
+<tbody>
+<tr><td>Vocabulary</td><td>27 (a–z = 0..25, BOS = 26 marks start and end)</td><td>same</td></tr>
+<tr><td>Width C, block size, heads × head size</td><td>16, 16, 4 × 4</td><td>same</td></tr>
+<tr><td>Layers, MLP hidden</td><td>1, 64, ReLU</td><td>same</td></tr>
+<tr><td>Norm</td><td>RMSNorm, eps 1e-5, no learnable weight, before attention and before the MLP</td><td>same</td></tr>
+<tr><td>Biases, weight tying</td><td>none, none</td><td>same</td></tr>
+<tr><td>Init</td><td>Normal(0, 0.08) for every matrix</td><td>same</td></tr>
+<tr><td>Batch</td><td>1 name per step</td><td>32 names per step, right-padded</td></tr>
+<tr><td>Optimizer</td><td>Adam, lr 0.01, betas (0.85, 0.99), eps 1e-8</td><td>AdamW with the same lr, betas and eps, weight decay 0.01 on matrices</td></tr>
+<tr><td>Schedule</td><td>linear decay from 0.01 to 0</td><td>same, via <code>LambdaLR</code></td></tr>
+<tr><td>Gradient clipping</td><td>none</td><td>global norm 1.0</td></tr>
+</tbody>
+</table>
+
+<h4>The interface</h4>
+<p>The acceptance checks import these names from <code>gpt.py</code>, so they are the contract. You can add anything else you like.</p>
+<table>
+<thead><tr><th>Name</th><th>What it must do</th><th>Milestone</th></tr></thead>
+<tbody>
+<tr><td><code>load_names(path, seed)</code>, <code>Tokenizer</code></td><td>download, shuffle, split; <code>encode</code> / <code>decode</code> / <code>bos</code> / <code>vocab_size</code></td><td>1</td></tr>
+<tr><td><code>IGNORE_INDEX</code>, <code>NamesDataset</code>, <code>batches</code></td><td>one name per item; <code>collate</code> pads a batch; an endless, resumable stream of batches</td><td>2</td></tr>
+<tr><td><code>GPTConfig</code>, <code>GPT</code></td><td><code>model(idx, targets=None, caches=None)</code> returns <code>(logits, loss)</code></td><td>3</td></tr>
+<tr><td><code>TrainConfig</code>, <code>make_optimizer</code>, <code>train_step</code>, <code>evaluate</code>, <code>fit</code></td><td>optimizer + schedule, one update, token-weighted test loss, the training loop</td><td>4</td></tr>
+<tr><td><code>save_checkpoint</code>, <code>load_checkpoint</code></td><td>everything needed to resume exactly</td><td>5</td></tr>
+<tr><td><code>GPT.new_caches</code>, <code>generate</code></td><td>KV cache per layer; batched sampling with temperature and top-k</td><td>6</td></tr>
+<tr><td><code>bench</code>, <code>main</code></td><td>throughput, profile, command line</td><td>7</td></tr>
+</tbody>
+</table>
+
+<h2 id="setup">Setup</h2>
+
+<div class="code terminal" data-lang="sh">
+<pre><code>$ mkdir -p ~/learning-pytorch/capstone &amp;&amp; cd ~/learning-pytorch/capstone
+$ source ../.venv/bin/activate      # the virtual environment from the introduction
+$ touch gpt.py                      # your empty file</code></pre>
+</div>
+
+<p>Save the acceptance checks next to it. Read them now: they are the spec in executable form. <code>python checks.py m3</code> runs milestone 3's check; <code>m6</code> needs the <code>ckpt.pt</code> that <code>python gpt.py train</code> writes.</p>
+
+<div class="code" data-lang="python">
+<div class="code-hdr"><span class="lang">python</span><span class="title">checks.py</span></div>
+<pre><code>"""Acceptance checks for gpt.py, one per milestone.   usage: python checks.py m1 [m2 ...]"""
+import math
+import sys
+
+import torch
+import torch.nn.functional as F
+
+from gpt import (IGNORE_INDEX, GPT, GPTConfig, NamesDataset, Tokenizer, TrainConfig, batches,
+                 evaluate, fit, generate, load_checkpoint, load_names, make_optimizer,
+                 save_checkpoint, train_step)
+
+torch.set_num_threads(1)
+train_docs, test_docs = load_names()
+tok = Tokenizer(train_docs + test_docs)
+train_ds = NamesDataset(train_docs, tok, 16)
+test_ds = NamesDataset(test_docs, tok, 16)
+
+
+def m1():
+    print(len(train_docs), len(test_docs), train_docs[:5])
+    print(tok.vocab_size, tok.bos, tok.encode("emma"))
+    assert (len(train_docs), len(test_docs), tok.vocab_size, tok.bos) == (28829, 3204, 27, 26)
+    assert tok.encode("emma") == [26, 4, 12, 12, 0, 26]
+    assert all(tok.decode(tok.encode(d)) == d for d in train_docs + test_docs)
+    print("m1 ok: split, vocab and round trip")
+
+
+def m2():
+    inputs, targets = train_ds.collate([train_ds[i] for i in range(4)])
+    print(train_docs[:4])
+    print(inputs)
+    print(targets)
+    # Loss must ignore pad positions: garbage logits there must not change it.
+    torch.manual_seed(0)
+    logits = torch.randn(*targets.shape, 27)
+    loss = F.cross_entropy(logits.view(-1, 27), targets.view(-1), ignore_index=IGNORE_INDEX)
+    pads = targets == IGNORE_INDEX
+    garbage = logits.clone()
+    garbage[pads] = 1e4
+    loss2 = F.cross_entropy(garbage.view(-1, 27), targets.view(-1), ignore_index=IGNORE_INDEX)
+    real = F.cross_entropy(logits[~pads], targets[~pads])  # mean over the real tokens only
+    print(loss.item(), loss2.item(), real.item())
+    assert loss == loss2 and torch.allclose(loss, real)
+    print("m2 ok: pads ignored")
+
+
+def m3():
+    torch.manual_seed(42)
+    model = GPT(GPTConfig())
+    for name, p in model.named_parameters():
+        print(f"{name:24s} {tuple(p.shape)}")
+    n = sum(p.numel() for p in model.parameters())
+    print("parameters:", n)
+    assert n == 4192
+    inputs, targets = next(batches(train_ds, 32, seed=0))
+    logits, loss = model(inputs, targets)
+    print(tuple(logits.shape), f"initial loss {loss.item():.4f}, ln 27 = {math.log(27):.4f}")
+    assert abs(loss.item() - math.log(27)) &lt; 0.05
+    # Right padding is harmless: a name's logits are the same alone or inside a padded batch.
+    for r in range(len(inputs)):
+        n_real = int((targets[r] != IGNORE_INDEX).sum())
+        alone, _ = model(inputs[r : r + 1, :n_real])
+        assert torch.allclose(alone[0], logits[r, :n_real], atol=1e-6)
+    print("m3 ok: 4,192 parameters, loss ~ ln 27, padding does not leak")
+
+
+def m4():
+    tc = TrainConfig(steps=1000, log_every=250)
+    lrs = []
+    torch.manual_seed(tc.seed)
+    model = GPT(GPTConfig())
+    opt, sched = make_optimizer(model, tc)
+    for s in (0, 500, 999):
+        lrs.append(round(sched.lr_lambdas[0](s) * tc.lr, 6))
+    print("lr at steps 0, 500, 999:", lrs)
+    # 1) It can overfit one fixed batch of 8 names (the model and the loss are wired correctly).
+    inputs, targets = next(batches(train_ds, 8, seed=0))
+    overfit = GPT(GPTConfig())
+    o_opt, o_sched = make_optimizer(overfit, TrainConfig(steps=300))
+    losses = [train_step(overfit, o_opt, o_sched, inputs, targets, 1.0)[0] for _ in range(300)]
+    print(f"overfit one batch: {losses[0]:.4f} -&gt; {losses[-1]:.4f}")
+    assert losses[-1] &lt; 0.5
+    # 2) A short real run beats the initial loss on held-out names.
+    fit(model, opt, sched, tc, train_ds)
+    loss512, ppl = evaluate(model, test_ds, batch_size=512)
+    loss1, _ = evaluate(model, test_ds, batch_size=1)
+    print(f"test loss {loss512:.4f} (batch 512) {loss1:.4f} (batch 1), perplexity {ppl:.2f}")
+    assert loss512 &lt; 2.4 and abs(loss512 - loss1) &lt; 1e-4  # token-weighted: batch size can't matter
+    print("m4 ok")
+
+
+def m5():
+    tc = TrainConfig(steps=100)
+    torch.manual_seed(tc.seed)
+    model = GPT(GPTConfig())
+    opt, sched = make_optimizer(model, tc)
+    it = batches(train_ds, tc.batch_size, tc.seed)
+    for _ in range(50):
+        train_step(model, opt, sched, *next(it), tc.grad_clip)
+    save_checkpoint("m5.pt", model, opt, sched, 50, tc)
+    straight = [train_step(model, opt, sched, *next(it), tc.grad_clip)[0] for _ in range(3)]
+
+    model2, opt2, sched2, step, tc2 = load_checkpoint("m5.pt")
+    it2 = batches(train_ds, tc2.batch_size, tc2.seed, start_step=step)
+    resumed = [train_step(model2, opt2, sched2, *next(it2), tc2.grad_clip)[0] for _ in range(3)]
+
+    model3 = GPT(GPTConfig())
+    model3.load_state_dict(torch.load("m5.pt")["model"])  # weights only, fresh AdamW and schedule
+    opt3, sched3 = make_optimizer(model3, tc)
+    it3 = batches(train_ds, tc.batch_size, tc.seed, start_step=50)
+    weights_only = [train_step(model3, opt3, sched3, *next(it3), tc.grad_clip)[0] for _ in range(3)]
+    print("uninterrupted:", straight)
+    print("resumed:      ", resumed)
+    print("weights only: ", weights_only)
+    assert resumed == straight and weights_only[1:] != straight[1:]
+    print("m5 ok: bit-identical resume")
+
+
+@torch.inference_mode()
+def m6():
+    model = load_checkpoint("ckpt.pt")[0]
+    ids = torch.tensor([tok.encode("christopher")[:16]])  # 13 tokens
+    full, _ = model(ids)  # all positions in one pass
+    caches = model.new_caches(1)
+    one_by_one = torch.cat([model(ids[:, t : t + 1], caches=caches)[0]
+                            for t in range(ids.shape[1])], dim=1)
+    caches = model.new_caches(1)
+    prefill, _ = model(ids[:, :5], caches=caches)  # prompt in one call, then decode
+    decode = [model(ids[:, t : t + 1], caches=caches)[0] for t in range(5, ids.shape[1])]
+    mixed = torch.cat([prefill] + decode, dim=1)
+    print("max |full - one_by_one|:", (full - one_by_one).abs().max().item())
+    print("max |full - prefill+decode|:", (full - mixed).abs().max().item())
+    assert torch.allclose(full, one_by_one, atol=1e-5) and torch.allclose(full, mixed, atol=1e-5)
+    a = generate(model, tok, n=8, temperature=0.8, top_k=10, use_cache=True, seed=1)
+    b = generate(model, tok, n=8, temperature=0.8, top_k=10, use_cache=False, seed=1)
+    print(a)
+    assert a == b
+    print("m6 ok: cached == uncached")
+
+
+if __name__ == "__main__":
+    for name in sys.argv[1:]:
+        globals()[name]()</code></pre>
+</div>
+
+<div class="callout tip">
+<div class="callout-title">Work like this</div>
+<p>Write one milestone, run its check, and only then move on. When a check fails, print shapes before you change code. If you get stuck for more than twenty minutes, open the hint list, then the solution for just that milestone. All the solutions together are the reference <code>gpt.py</code>, shown in full at the end.</p>
+</div>
+
+<h2 id="milestones">Milestones</h2>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 14.1</span>
+  <span class="exercise-diff easy">easy</span>
+  <span class="exercise-title">Milestone 1 · Data and tokenizer</span>
+</div>
+<div class="exercise-body">
+<p>Write <code>load_names(path="names.txt", seed=42)</code>: if the file is missing, download it from <code>https://raw.githubusercontent.com/karpathy/makemore/988aa59/names.txt</code> (the URL <code>microgpt.py</code> uses), read one name per line skipping blank lines, shuffle with the seed, and return <code>(train, test)</code> split 90/10. Then write <code>Tokenizer(docs)</code>: sorted unique characters get ids 0..25, <code>bos</code> is the next id (26), <code>vocab_size</code> is 27, <code>encode</code> puts BOS at both ends, <code>decode</code> drops every BOS.</p>
+<h4>Acceptance check</h4>
+<div class="code terminal" data-lang="sh">
+<pre><code>$ python checks.py m1
+28829 3204 ['yuheng', 'diondre', 'xavien', 'jori', 'juanluis']
+27 26 [26, 4, 12, 12, 0, 26]
+m1 ok: split, vocab and round trip</code></pre>
+</div>
+<h4>Hints</h4>
+<ul>
+  <li><code>random.Random(42).shuffle(docs)</code> produces the same order as microgpt's <code>random.seed(42); random.shuffle(docs)</code>, without touching the global generator. The first names should be yuheng, diondre, xavien, as in microgpt's printout.</li>
+  <li>Build the vocabulary from train and test together, so a character that appears only in the test split still has an id.</li>
+  <li>BOS is not a character: keep it out of <code>stoi</code>.</li>
+</ul>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<div class="code" data-lang="python">
+<div class="code-hdr"><span class="lang">python</span><span class="title">gpt.py: imports and milestone 1</span></div>
+<pre><code>import argparse
+import itertools
+import math
+import os
+import random
+import time
+import urllib.request
+from dataclasses import asdict, dataclass
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
+
+NAMES_URL = "https://raw.githubusercontent.com/karpathy/makemore/988aa59/names.txt"
+IGNORE_INDEX = -100  # cross_entropy skips targets with this value
+
+
+# --- 1. data and tokenizer ---------------------------------------------------
+def load_names(path="names.txt", seed=42):
+    """Download once, shuffle with a fixed seed, split 90/10 (the same split as microgpt.py)."""
+    if not os.path.exists(path):
+        urllib.request.urlretrieve(NAMES_URL, path)
+    with open(path) as f:
+        docs = [line.strip() for line in f if line.strip()]
+    random.Random(seed).shuffle(docs)
+    split = int(0.9 * len(docs))
+    return docs[:split], docs[split:]
+
+
+class Tokenizer:
+    """One id per character; BOS (the last id) marks both the start and the end of a name."""
+
+    def __init__(self, docs):
+        chars = sorted(set("".join(docs)))
+        self.stoi = {c: i for i, c in enumerate(chars)}
+        self.itos = {i: c for c, i in self.stoi.items()}
+        self.bos = len(chars)
+        self.vocab_size = len(chars) + 1
+
+    def encode(self, doc):
+        return [self.bos] + [self.stoi[c] for c in doc] + [self.bos]
+
+    def decode(self, ids):
+        return "".join(self.itos[i] for i in ids if i != self.bos)</code></pre>
+</div>
+<p>This is microgpt's <code>encode</code> and <code>decode</code> wrapped in a class, so the vocabulary travels with the object instead of living in module globals.</p>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 14.2</span>
+  <span class="exercise-diff medium">medium</span>
+  <span class="exercise-title">Milestone 2 · Dataset, collate and a resumable batch stream</span>
+</div>
+<div class="exercise-body">
+<p><code>NamesDataset(docs, tok, block_size)</code> returns one name as a 1-D <code>LongTensor</code> of token ids, truncated to <code>block_size + 1</code> tokens (at most <code>block_size</code> predictions, like microgpt's <code>make_training_pair</code>). Its <code>collate(batch)</code> turns a list of those into <code>(inputs, targets)</code>, both <code>(B, T)</code> where T is the longest name in the batch plus one: inputs are the ids without the last token, right-padded with BOS; targets are the ids shifted by one, right-padded with <code>IGNORE_INDEX = -100</code>.</p>
+<p>Then <code>batches(ds, batch_size, seed, start_step=0)</code>: an endless iterator over shuffled batches that drops the last partial batch of each epoch. Seed the shuffle per epoch so the stream is a pure function of <code>(seed, step)</code>; milestone 5 needs that to resume exactly.</p>
+<h4>Acceptance check</h4>
+<p>The check prints a padded batch, then shows that the loss is unchanged when the logits at pad positions are replaced by garbage, and that it equals the mean over real tokens only.</p>
+<div class="code terminal" data-lang="sh">
+<pre><code>$ python checks.py m2
+['yuheng', 'diondre', 'xavien', 'jori']
+tensor([[26, 24, 20,  7,  4, 13,  6, 26],
+        [26,  3,  8, 14, 13,  3, 17,  4],
+        [26, 23,  0, 21,  8,  4, 13, 26],
+        [26,  9, 14, 17,  8, 26, 26, 26]])
+tensor([[  24,   20,    7,    4,   13,    6,   26, -100],
+        [   3,    8,   14,   13,    3,   17,    4,   26],
+        [  23,    0,   21,    8,    4,   13,   26, -100],
+        [   9,   14,   17,    8,   26, -100, -100, -100]])
+3.8098034858703613 3.8098034858703613 3.8098034858703613
+m2 ok: pads ignored</code></pre>
+</div>
+<h4>Hints</h4>
+<ul>
+  <li>Pad the <em>inputs</em> with a real token id. An embedding lookup of -100 is an index error; the value doesn't matter because its target is ignored and, being at the end, no real position can attend to it.</li>
+  <li><code>torch.full((B, T), value, dtype=torch.long)</code>, then copy each name into its row.</li>
+  <li><code>DataLoader(ds, batch_size, shuffle=True, drop_last=True, generator=g, collate_fn=ds.collate)</code> with <code>g = torch.Generator().manual_seed(seed + epoch)</code>; <code>itertools.islice</code> skips the batches already done in the current epoch.</li>
+  <li>Leave <code>num_workers</code> at 0. The whole dataset is a 228 KB list in memory; worker processes would cost more than they save (<a href="13-50-questions.html#q27">q27</a>).</li>
+</ul>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<div class="code" data-lang="python">
+<div class="code-hdr"><span class="lang">python</span><span class="title">gpt.py: milestone 2</span></div>
+<pre><code># --- 2. batching -------------------------------------------------------------
+class NamesDataset(Dataset):
+    def __init__(self, docs, tok, block_size):
+        self.docs, self.tok, self.block_size = docs, tok, block_size
+
+    def __len__(self):
+        return len(self.docs)
+
+    def __getitem__(self, i):
+        ids = self.tok.encode(self.docs[i])[: self.block_size + 1]  # at most block_size predictions
+        return torch.tensor(ids, dtype=torch.long)
+
+    def collate(self, batch):
+        """Right-pad to the longest name: pad inputs are BOS, pad targets are IGNORE_INDEX."""
+        T = max(len(ids) for ids in batch) - 1
+        inputs = torch.full((len(batch), T), self.tok.bos, dtype=torch.long)
+        targets = torch.full((len(batch), T), IGNORE_INDEX, dtype=torch.long)
+        for row, ids in enumerate(batch):
+            inputs[row, : len(ids) - 1] = ids[:-1]
+            targets[row, : len(ids) - 1] = ids[1:]
+        return inputs, targets
+
+
+def batches(ds, batch_size, seed, start_step=0):
+    """Endless (inputs, targets) stream whose order depends only on (seed, epoch), so a run
+    resumed at start_step sees exactly the batches the uninterrupted run would have seen."""
+    per_epoch = len(ds) // batch_size
+    epoch, skip = divmod(start_step, per_epoch)
+    while True:
+        g = torch.Generator().manual_seed(seed + epoch)
+        loader = DataLoader(ds, batch_size, shuffle=True, drop_last=True,
+                            generator=g, collate_fn=ds.collate)
+        yield from itertools.islice(loader, skip, None)
+        epoch, skip = epoch + 1, 0</code></pre>
+</div>
+<p>The longest name in names.txt has 15 letters, so with BOS at both ends it is 17 tokens and 16 predictions: nothing is actually truncated here, but the dataset should not depend on that. Note how the last row (jori, 6 tokens) has 5 real targets followed by three -100s.</p>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 14.3</span>
+  <span class="exercise-diff medium">medium</span>
+  <span class="exercise-title">Milestone 3 · The GPT module</span>
+</div>
+<div class="exercise-body">
+<p>Write <code>GPTConfig</code> with microgpt's numbers and a <code>GPT(nn.Module)</code> that takes <code>idx</code> of shape <code>(B, T)</code> and returns <code>(logits, loss)</code>, logits <code>(B, T, 27)</code>, loss <code>None</code> unless targets are given. Use <code>nn.Embedding</code> for tokens and positions, <code>nn.Linear(..., bias=False)</code> for every matrix, <code>nn.RMSNorm(16, eps=1e-5, elementwise_affine=False)</code>, ReLU, and attention on <code>(B, H, T, D)</code> tensors with a causal mask buffer. Initialise every parameter from Normal(0, 0.08), as microgpt's <code>make_matrix</code> does.</p>
+<p>The <code>forward</code> also takes <code>caches=None</code>; you will use it in milestone 6. For now just accept the argument.</p>
+<h4>Acceptance check</h4>
+<p>The parameter count must be exactly 4,192, the loss on a random batch must be close to <code>ln 27</code>, and a name's logits must be identical whether it is run alone or inside a padded batch.</p>
+<div class="code terminal" data-lang="sh">
+<pre><code>$ python checks.py m3
+tok_emb.weight           (27, 16)
+pos_emb.weight           (16, 16)
+blocks.0.attn.wq.weight  (16, 16)
+blocks.0.attn.wk.weight  (16, 16)
+blocks.0.attn.wv.weight  (16, 16)
+blocks.0.attn.wo.weight  (16, 16)
+blocks.0.fc1.weight      (64, 16)
+blocks.0.fc2.weight      (16, 64)
+lm_head.weight           (27, 16)
+parameters: 4192
+(32, 9, 27) initial loss 3.2970, ln 27 = 3.2958
+m3 ok: 4,192 parameters, loss ~ ln 27, padding does not leak</code></pre>
+</div>
+<h4>Why 4,192 exactly, and why ln 27</h4>
+<p>The count matches microgpt because the module has the same nine matrices: two embedding tables (27×16 and 16×16), four 16×16 attention matrices, the MLP's 64×16 and 16×64, and the 27×16 head: 432 + 256 + 1,024 + 2,048 + 432 = 4,192. <code>nn.Linear</code> stores its weight as <code>[out, in]</code>, the same layout as microgpt's weight lists, so even the shapes line up. It only matches because of two options: with PyTorch's defaults (<code>bias=True</code> on each <code>nn.Linear</code>, and a learnable weight in each <code>nn.RMSNorm</code>) the same architecture has <strong>4,395</strong> parameters: 171 biases (4 × 16 + 64 + 16 + 27) and 32 norm weights.</p>
+<p>The initial loss is about <code>ln 27 = 3.2958</code> because weights of size 0.08 give logits close to 0, so the softmax is nearly uniform over 27 tokens and every target gets probability about 1/27. A first loss far from ln(vocab) means a bug in the init or the loss.</p>
+<h4>Hints</h4>
+<ul>
+  <li>Heads: <code>w(x).view(B, T, H, D).transpose(1, 2)</code>. Back: <code>y.transpose(1, 2).reshape(B, T, C)</code> (<a href="13-50-questions.html#q34">q34</a>).</li>
+  <li><code>register_buffer("mask", torch.tril(torch.ones(block, block, dtype=torch.bool)), persistent=False)</code>, then <code>masked_fill(~mask[:T, :T], float("-inf"))</code> before the softmax.</li>
+  <li><code>F.cross_entropy(logits.view(-1, V), targets.view(-1), ignore_index=IGNORE_INDEX)</code>.</li>
+  <li><code>for p in self.parameters(): nn.init.normal_(p, 0.0, 0.08)</code> at the end of <code>__init__</code>.</li>
+</ul>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<div class="code" data-lang="python">
+<div class="code-hdr"><span class="lang">python</span><span class="title">gpt.py: GPTConfig and milestone 3</span></div>
+<pre><code>@dataclass
+class GPTConfig:
+    vocab_size: int = 27
+    block_size: int = 16
+    n_layer: int = 1
+    n_embd: int = 16
+    n_head: int = 4
+    mlp_hidden: int = 64
+    sdpa: bool = False  # use F.scaled_dot_product_attention instead of explicit math
+
+
+# --- 3. model ----------------------------------------------------------------
+class KVCache:
+    """Preallocated keys and values for one layer, (B, H, block_size, D), filled left to right."""
+
+    def __init__(self, batch_size, cfg, device=None):
+        shape = (batch_size, cfg.n_head, cfg.block_size, cfg.n_embd // cfg.n_head)
+        self.k = torch.zeros(shape, device=device)
+        self.v = torch.zeros(shape, device=device)
+        self.pos = 0
+
+    def append(self, k, v):
+        T = k.shape[2]
+        self.k[:, :, self.pos : self.pos + T] = k
+        self.v[:, :, self.pos : self.pos + T] = v
+        self.pos += T
+        return self.k[:, :, : self.pos], self.v[:, :, : self.pos]
+
+
+class CausalSelfAttention(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.n_head, self.head_size, self.sdpa = cfg.n_head, cfg.n_embd // cfg.n_head, cfg.sdpa
+        self.wq = nn.Linear(cfg.n_embd, cfg.n_embd, bias=False)
+        self.wk = nn.Linear(cfg.n_embd, cfg.n_embd, bias=False)
+        self.wv = nn.Linear(cfg.n_embd, cfg.n_embd, bias=False)
+        self.wo = nn.Linear(cfg.n_embd, cfg.n_embd, bias=False)
+        mask = torch.tril(torch.ones(cfg.block_size, cfg.block_size, dtype=torch.bool))
+        self.register_buffer("mask", mask, persistent=False)  # True = may attend
+
+    def forward(self, x, cache=None):
+        B, T, C = x.shape
+        q, k, v = (w(x).view(B, T, self.n_head, self.head_size).transpose(1, 2)
+                   for w in (self.wq, self.wk, self.wv))  # each (B, H, T, D)
+        start = 0
+        if cache is not None:
+            start = cache.pos
+            k, v = cache.append(k, v)  # every key/value so far: (B, H, start + T, D)
+        mask = self.mask[start : start + T, : k.shape[2]]  # rows: new queries, cols: all keys
+        if self.sdpa:
+            y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+        else:
+            att = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_size)  # (B, H, T, S)
+            att = att.masked_fill(~mask, float("-inf"))
+            y = F.softmax(att, dim=-1) @ v  # (B, H, T, D)
+        return self.wo(y.transpose(1, 2).reshape(B, T, C))
+
+
+class Block(nn.Module):
+    """microgpt's block: x + attn(rms_norm(x)), then x + mlp(rms_norm(x)); no norm weights."""
+
+    def __init__(self, cfg):
+        super().__init__()
+        self.norm1 = nn.RMSNorm(cfg.n_embd, eps=1e-5, elementwise_affine=False)
+        self.attn = CausalSelfAttention(cfg)
+        self.norm2 = nn.RMSNorm(cfg.n_embd, eps=1e-5, elementwise_affine=False)
+        self.fc1 = nn.Linear(cfg.n_embd, cfg.mlp_hidden, bias=False)
+        self.fc2 = nn.Linear(cfg.mlp_hidden, cfg.n_embd, bias=False)
+
+    def forward(self, x, cache=None):
+        x = x + self.attn(self.norm1(x), cache)
+        return x + self.fc2(F.relu(self.fc1(self.norm2(x))))
+
+
+class GPT(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg = cfg
+        self.tok_emb = nn.Embedding(cfg.vocab_size, cfg.n_embd)
+        self.pos_emb = nn.Embedding(cfg.block_size, cfg.n_embd)
+        self.blocks = nn.ModuleList(Block(cfg) for _ in range(cfg.n_layer))
+        self.lm_head = nn.Linear(cfg.n_embd, cfg.vocab_size, bias=False)
+        for p in self.parameters():
+            nn.init.normal_(p, mean=0.0, std=0.08)  # microgpt's make_matrix init
+
+    @property
+    def device(self):
+        return self.lm_head.weight.device
+
+    def forward(self, idx, targets=None, caches=None):
+        B, T = idx.shape
+        start = 0 if caches is None else caches[0].pos
+        x = self.tok_emb(idx) + self.pos_emb(torch.arange(start, start + T, device=idx.device))
+        for i, block in enumerate(self.blocks):
+            x = block(x, None if caches is None else caches[i])
+        logits = self.lm_head(x)  # (B, T, V)
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1),
+                                   ignore_index=IGNORE_INDEX)
+        return logits, loss
+
+    def new_caches(self, batch_size):
+        return [KVCache(batch_size, self.cfg, self.device) for _ in self.blocks]</code></pre>
+</div>
+<p>Compare <code>CausalSelfAttention.forward</code> with microgpt's <code>FastMicroGPT.forward</code>: it is the same computation with a batch dimension in front. The <code>KVCache</code> class and the <code>cache</code> branches are milestone 6; the <code>sdpa</code> flag is a stretch goal. Both are harmless with their defaults.</p>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 14.4</span>
+  <span class="exercise-diff medium">medium</span>
+  <span class="exercise-title">Milestone 4 · Training and evaluation</span>
+</div>
+<div class="exercise-body">
+<p>Write <code>TrainConfig</code>, then:</p>
+<ul>
+  <li><code>make_optimizer(model, tc)</code>: AdamW with microgpt's lr, betas and eps, weight decay on the 2-D parameters only, and a <code>LambdaLR</code> whose factor falls linearly from 1 to 0 over <code>tc.steps</code>, which is microgpt's <code>0.01 * (1 - progress)</code>.</li>
+  <li><code>train_step(...)</code>: forward, zero grads, backward, clip to global norm 1.0, optimizer step, scheduler step. Return the loss and the pre-clip gradient norm as Python floats.</li>
+  <li><code>evaluate(model, ds)</code>: under <code>inference_mode</code>, the <strong>token-weighted</strong> loss over the whole split (sum of every token's loss divided by the number of real tokens) and its perplexity, <code>exp(loss)</code>.</li>
+  <li><code>fit(...)</code>: the loop, logging the mean loss of each window, the gradient norm, the LR and tokens/s.</li>
+</ul>
+<p>Token-weighted matters because names have different lengths. Averaging per-batch means would weight a token in a batch of short names more than one in a batch of long names, and the result would change with the evaluation batch size. microgpt's <code>evaluate_model</code> sums token losses and divides by total predictions; do the same and you get the same 22,866 test tokens.</p>
+<h4>Acceptance check</h4>
+<p>Three things: the schedule hits the right values; the model can overfit one fixed batch of 8 names (the classic proof that model, loss and optimizer are wired together); and a short real run lands below 2.4 on the test names with the same loss at evaluation batch size 512 and 1.</p>
+<div class="code terminal" data-lang="sh">
+<pre><code>$ python checks.py m4
+lr at steps 0, 500, 999: [0.01, 0.005, 1e-05]
+overfit one batch: 3.2765 -&gt; 0.2974
+step   250/1000 | loss 2.4008 | grad norm 0.526 | lr 0.00751 | 173,278 tok/s
+step   500/1000 | loss 2.2667 | grad norm 0.647 | lr 0.00501 | 173,184 tok/s
+step   750/1000 | loss 2.2344 | grad norm 0.757 | lr 0.00251 | 173,542 tok/s
+step  1000/1000 | loss 2.2060 | grad norm 0.668 | lr 0.00001 | 173,525 tok/s
+test loss 2.1963 (batch 512) 2.1963 (batch 1), perplexity 8.99
+m4 ok</code></pre>
+</div>
+<p>Then the real run. This is the full output on the laptop CPU; it took about 32 s of wall-clock time including start-up and both evaluations.</p>
+<div class="code terminal" data-lang="sh">
+<pre><code>$ python gpt.py train
+train names: 28829 | test names: 3204 | vocab: 27
+parameters: 4,192
+test loss before training: 3.2957 (ln 27 = 3.2958)
+step  2000/20000 | loss 2.2520 | grad norm 0.562 | lr 0.00900 | 164,982 tok/s
+step  4000/20000 | loss 2.1795 | grad norm 0.535 | lr 0.00800 | 165,667 tok/s
+step  6000/20000 | loss 2.1567 | grad norm 0.723 | lr 0.00700 | 165,216 tok/s
+step  8000/20000 | loss 2.1427 | grad norm 0.598 | lr 0.00600 | 167,445 tok/s
+step 10000/20000 | loss 2.1284 | grad norm 0.601 | lr 0.00500 | 168,810 tok/s
+step 12000/20000 | loss 2.1179 | grad norm 0.601 | lr 0.00400 | 168,771 tok/s
+step 14000/20000 | loss 2.1076 | grad norm 0.600 | lr 0.00300 | 168,763 tok/s
+step 16000/20000 | loss 2.0946 | grad norm 0.663 | lr 0.00200 | 169,584 tok/s
+step 18000/20000 | loss 2.0856 | grad norm 0.684 | lr 0.00100 | 170,198 tok/s
+step 20000/20000 | loss 2.0734 | grad norm 0.686 | lr 0.00000 | 170,518 tok/s
+test loss 2.0891 | test perplexity 8.08
+saved ckpt.pt</code></pre>
+</div>
+<h4>Hints</h4>
+<ul>
+  <li>Two param groups: <code>p.dim() &gt;= 2</code> gets weight decay, everything else 0. Every parameter here is a matrix, but norm weights and biases (if you add them) should not be decayed.</li>
+  <li>Read the learning rate before <code>optimizer.step()</code> if you want to log the one that was used; <code>sched.step()</code> goes after <code>optimizer.step()</code> (<a href="13-50-questions.html#q25">q25</a>).</li>
+  <li>In <code>evaluate</code>, use <code>reduction="sum"</code> and count <code>targets != IGNORE_INDEX</code>.</li>
+  <li>Call <code>model.train()</code> in <code>train_step</code> and <code>model.eval()</code> in <code>evaluate</code>. They change nothing for this model (no dropout), but the habit will save you on the next one.</li>
+</ul>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<div class="code" data-lang="python">
+<div class="code-hdr"><span class="lang">python</span><span class="title">gpt.py: TrainConfig and milestone 4</span></div>
+<pre><code>@dataclass
+class TrainConfig:
+    steps: int = 20000
+    batch_size: int = 32
+    lr: float = 0.01
+    betas: tuple = (0.85, 0.99)
+    eps: float = 1e-8
+    weight_decay: float = 0.01
+    grad_clip: float = 1.0
+    seed: int = 42
+    log_every: int = 2000
+
+
+# --- 4. training and evaluation ----------------------------------------------
+def make_optimizer(model, tc):
+    """AdamW with microgpt's betas, decay on matrices only, LR linearly decayed to 0."""
+    params = list(model.parameters())
+    groups = [{"params": [p for p in params if p.dim() &gt;= 2], "weight_decay": tc.weight_decay},
+              {"params": [p for p in params if p.dim() &lt; 2], "weight_decay": 0.0}]
+    groups = [g for g in groups if g["params"]]
+    opt = torch.optim.AdamW(groups, lr=tc.lr, betas=tc.betas, eps=tc.eps)
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda step: max(0.0, 1.0 - step / tc.steps))
+    return opt, sched
+
+
+def train_step(model, opt, sched, inputs, targets, grad_clip):
+    model.train()
+    _, loss = model(inputs.to(model.device), targets.to(model.device))
+    opt.zero_grad(set_to_none=True)
+    loss.backward()
+    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+    opt.step()
+    sched.step()
+    return loss.item(), grad_norm.item()
+
+
+@torch.inference_mode()
+def evaluate(model, ds, batch_size=512):
+    """Token-weighted loss over a whole split: (sum of every token's loss) / (number of tokens)."""
+    model.eval()
+    total, count = 0.0, 0
+    for inputs, targets in DataLoader(ds, batch_size, collate_fn=ds.collate):
+        logits, _ = model(inputs.to(model.device))
+        targets = targets.to(model.device)
+        total += F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1),
+                                 ignore_index=IGNORE_INDEX, reduction="sum").item()
+        count += (targets != IGNORE_INDEX).sum().item()
+    return total / count, math.exp(total / count)
+
+
+def fit(model, opt, sched, tc, train_ds, step=0):
+    """Train from `step` to tc.steps, logging the mean loss of each window and tokens/s."""
+    it = batches(train_ds, tc.batch_size, tc.seed, start_step=step)
+    window, tokens, t0 = [], 0, time.perf_counter()
+    while step &lt; tc.steps:
+        inputs, targets = next(it)
+        lr = opt.param_groups[0]["lr"]
+        loss, grad_norm = train_step(model, opt, sched, inputs, targets, tc.grad_clip)
+        window.append(loss)
+        tokens += (targets != IGNORE_INDEX).sum().item()
+        step += 1
+        if step % tc.log_every == 0 or step == tc.steps:
+            print(f"step {step:5d}/{tc.steps} | loss {sum(window) / len(window):.4f} | "
+                  f"grad norm {grad_norm:.3f} | lr {lr:.5f} | "
+                  f"{tokens / (time.perf_counter() - t0):,.0f} tok/s")
+            window = []
+    return step</code></pre>
+</div>
+<p><code>train_step</code> calls <code>.item()</code> twice per step. On a CPU that costs nothing; on a GPU each one is a sync (<a href="13-50-questions.html#q45">q45</a>), and for a model this small you would keep the running loss on the device and read it every few hundred steps.</p>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 14.5</span>
+  <span class="exercise-diff medium">medium</span>
+  <span class="exercise-title">Milestone 5 · Checkpoint and exact resume</span>
+</div>
+<div class="exercise-body">
+<p><code>save_checkpoint(path, model, opt, sched, step, tc)</code> writes the model, optimizer and scheduler state dicts, the step, and both configs, atomically. <code>load_checkpoint(path, device="cpu")</code> rebuilds the model from the saved config, rebuilds the optimizer and scheduler, loads all three states and returns <code>(model, opt, sched, step, tc)</code>. Wire up <code>python gpt.py train --resume</code>.</p>
+<p>"Resume" means the run continues <em>exactly</em> as if it had never stopped. That needs three things restored: the weights; the optimizer state (Adam's <code>m</code>, <code>v</code> and step count per parameter, the state your <code>apply_adam</code> kept in <code>adam_first_moments</code> and <code>adam_second_moments</code>); and the position in the LR schedule and in the data, which is why <code>batches</code> takes <code>start_step</code>.</p>
+<h4>Acceptance check</h4>
+<p>Train 50 steps, save, take 3 more steps. Then load the checkpoint in a fresh model and take the same 3 steps. The losses must be bit-for-bit equal. A third run that loads only the weights (fresh AdamW, fresh schedule) matches on the first step, because that loss is computed before any update, and diverges after.</p>
+<div class="code terminal" data-lang="sh">
+<pre><code>$ python checks.py m5
+uninterrupted: [2.374741315841675, 2.4643585681915283, 2.4163503646850586]
+resumed:       [2.374741315841675, 2.4643585681915283, 2.4163503646850586]
+weights only:  [2.374741315841675, 2.456618547439575, 2.4442105293273926]
+m5 ok: bit-identical resume</code></pre>
+</div>
+<h4>Hints</h4>
+<ul>
+  <li><code>torch.load</code> defaults to <code>weights_only=True</code> (<a href="13-50-questions.html#q28">q28</a>): tensors, dicts, lists, tuples, strings and numbers load fine, but a pickled dataclass instance raises <code>UnpicklingError</code>. Store configs with <code>dataclasses.asdict</code> and rebuild them with <code>GPTConfig(**d)</code>.</li>
+  <li>Save to <code>path + ".tmp"</code> and <code>os.replace</code> it into place: a crash mid-write then never destroys the previous checkpoint.</li>
+  <li>The <code>LambdaLR</code> lambda itself isn't saved (it can't be pickled); rebuilding the scheduler with the same lambda and loading its state restores <code>last_epoch</code>, which is all it needs.</li>
+</ul>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<div class="code" data-lang="python">
+<div class="code-hdr"><span class="lang">python</span><span class="title">gpt.py: milestone 5</span></div>
+<pre><code># --- 5. checkpoints ----------------------------------------------------------
+def save_checkpoint(path, model, opt, sched, step, tc):
+    state = {"model": model.state_dict(), "optimizer": opt.state_dict(),
+             "scheduler": sched.state_dict(), "step": step,
+             "model_config": asdict(model.cfg), "train_config": asdict(tc)}
+    torch.save(state, path + ".tmp")
+    os.replace(path + ".tmp", path)  # atomic: a crash never leaves a half-written checkpoint
+
+
+def load_checkpoint(path, device="cpu"):
+    ckpt = torch.load(path, map_location=device)  # weights_only=True: tensors and plain data only
+    model = GPT(GPTConfig(**ckpt["model_config"])).to(device)
+    model.load_state_dict(ckpt["model"])
+    tc = TrainConfig(**ckpt["train_config"])
+    opt, sched = make_optimizer(model, tc)
+    opt.load_state_dict(ckpt["optimizer"])
+    sched.load_state_dict(ckpt["scheduler"])
+    return model, opt, sched, ckpt["step"], tc</code></pre>
+</div>
+<p>Bit-identical resume works here because everything after the checkpoint is deterministic on a CPU: no dropout, no sampling, and a data order computed from <code>(seed, step)</code>. With dropout you would also save and restore <code>torch.get_rng_state()</code>; on a GPU, see the determinism caveats in <a href="13-50-questions.html#q29">q29</a>.</p>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 14.6</span>
+  <span class="exercise-diff hard">hard</span>
+  <span class="exercise-title">Milestone 6 · Generation with a KV cache</span>
+</div>
+<div class="exercise-body">
+<p>microgpt's scalar <code>gpt_step</code> kept a <code>key_cache</code> and <code>value_cache</code> list and appended one key and value per position. Do the same with tensors:</p>
+<ul>
+  <li><code>KVCache</code>: preallocated <code>(B, H, block_size, D)</code> buffers for keys and values plus a write position <code>pos</code>. <code>append(k, v)</code> writes the new T positions and returns everything written so far.</li>
+  <li>In attention, when a cache is passed: append the new keys and values, then let the T new queries attend to all <code>start + T</code> keys. The mask rows are the new queries' positions, <code>mask[start:start+T, :start+T]</code>.</li>
+  <li>In <code>GPT.forward</code>: position ids start at <code>caches[0].pos</code>, not 0. Add <code>new_caches(batch_size)</code>, one cache per layer.</li>
+  <li><code>generate(model, tok, n, prefix, temperature, top_k, use_cache, seed)</code>: sample <code>n</code> names as one batch. The first forward is the <em>prefill</em> (BOS plus the prefix, all at once); after that, the cached path feeds only the newest token, the uncached path re-feeds the whole sequence. Divide by temperature, apply top-k, sample, stop when every row has produced BOS, cut each row at its first BOS.</li>
+</ul>
+<h4>Acceptance check</h4>
+<p>Running "christopher" through the model in one pass, one token at a time through the cache, and as a 5-token prefill followed by single-token steps must give the same logits; and cached and uncached sampling with the same seed must give the same names. This uses the checkpoint from milestone 4.</p>
+<div class="code terminal" data-lang="sh">
+<pre><code>$ python checks.py m6
+max |full - one_by_one|: 1.6689300537109375e-06
+max |full - prefill+decode|: 1.9073486328125e-06
+['amaki', 'krinlynn', 'kayram', 'arily', 'keilley', 'ariana', 'derric', 'aire']
+m6 ok: cached == uncached</code></pre>
+</div>
+<p>The differences are about 1e-6, not 0: the one-pass and the cached computation do the same math with different matrix shapes, so the float additions happen in a different order. That is why the check uses <code>allclose</code>, and why the sampled names still agree. Sampling from the trained model:</p>
+<div class="code terminal" data-lang="sh">
+<pre><code>$ python gpt.py sample --n 10
+train names: 28829 | test names: 3204 | vocab: 27
+alymane
+karis
+gunzen
+havie
+eccharae
+emona
+zee
+wosper
+ladaah
+aeli
+$ python gpt.py sample --n 8 --prefix ma --top-k 10
+train names: 28829 | test names: 3204 | vocab: 27
+maylen
+makari
+mattale
+marai
+mariya
+marshila
+mancy
+manah</code></pre>
+</div>
+<h4>Hints</h4>
+<ul>
+  <li>How many tokens can you generate? Position ids only go up to <code>block_size - 1</code>, so the cache is full at 16 tokens. With a prompt of length P you get <code>block_size - P + 1</code> sampled tokens (the last one is sampled, never fed back). That is the same limit as microgpt's <code>generate_name</code>.</li>
+  <li>For a single decode step T = 1 and the mask row is all True, so the mask does nothing; it matters in the prefill.</li>
+  <li>Keep sampling on the CPU with one seeded <code>torch.Generator</code>; then cached and uncached runs draw the same random numbers and you can compare their outputs directly.</li>
+  <li>Decorate <code>generate</code> with <code>@torch.inference_mode()</code> and call <code>model.eval()</code> (<a href="13-50-questions.html#q13">q13</a>).</li>
+</ul>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<div class="code" data-lang="python">
+<div class="code-hdr"><span class="lang">python</span><span class="title">gpt.py: milestone 6 (KVCache and the cache branches are in milestone 3's code)</span></div>
+<pre><code># --- 6. generation with a KV cache -------------------------------------------
+@torch.inference_mode()
+def generate(model, tok, n=10, prefix="", temperature=1.0, top_k=None,
+             use_cache=True, seed=None, stop_early=True):
+    """Sample n names as one batch. The first forward is the prefill (the whole prompt); after it
+    the cached path feeds only the newest token. Rows that already ended keep sampling until all
+    rows have; decoding cuts each row at its first BOS."""
+    model.eval()
+    g = None if seed is None else torch.Generator().manual_seed(seed)
+    prompt = [tok.bos] + [tok.stoi[c] for c in prefix]
+    idx = torch.tensor([prompt] * n, device=model.device)
+    caches = model.new_caches(n) if use_cache else None
+    x = idx
+    for _ in range(model.cfg.block_size - len(prompt) + 1):
+        logits, _ = model(x if use_cache else idx, caches=caches)
+        logits = logits[:, -1, :] / temperature
+        if top_k is not None:
+            kth = torch.topk(logits, top_k).values[:, -1:]
+            logits = logits.masked_fill(logits &lt; kth, float("-inf"))
+        probs = F.softmax(logits, dim=-1).cpu()  # sample on CPU: one seeded generator, any device
+        x = torch.multinomial(probs, 1, generator=g).to(idx.device)
+        idx = torch.cat([idx, x], dim=1)
+        if stop_early and (idx[:, len(prompt):] == tok.bos).any(dim=1).all():
+            break
+    names = []
+    for row in idx.tolist():
+        new = row[len(prompt):]
+        end = new.index(tok.bos) if tok.bos in new else len(new)
+        names.append(tok.decode(row[: len(prompt)] + new[:end]))
+    return names</code></pre>
+</div>
+<p>Rows that finish early keep sampling until every row is done; the extra tokens are cut off by the decode loop. Real serving engines remove finished sequences from the batch and insert new requests in their place (continuous batching); here the batch is tiny and fixed, so wasting a few steps is simpler.</p>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 14.7</span>
+  <span class="exercise-diff hard">hard</span>
+  <span class="exercise-title">Milestone 7 · Measure it</span>
+</div>
+<div class="exercise-body">
+<p>Write <code>bench(model, train_ds, tc)</code> and the command line. Measure:</p>
+<ul>
+  <li>training throughput in real (non-pad) tokens per second, after a warm-up;</li>
+  <li>generation throughput (batch × steps per second) for batch 1 and batch 256, with and without the cache, running all 16 steps (<code>stop_early=False</code>) so both paths do a fixed amount of work;</li>
+  <li>a <code>torch.profiler</code> table of 20 training steps, sorted by self CPU time.</li>
+</ul>
+<h4>Acceptance check</h4>
+<p><code>python gpt.py bench</code> prints all three, and you can explain the top rows of the table. This is the real output, measured on an Apple Silicon (M4 Pro) laptop CPU with one thread; your numbers will differ.</p>
+<div class="code terminal" data-lang="sh">
+<pre><code>$ python gpt.py bench
+train names: 28829 | test names: 3204 | vocab: 27
+train      177,390 tokens/s  batch 32
+generate    12,368 tokens/s  batch   1  uncached
+generate    12,736 tokens/s  batch   1  cached
+generate   206,553 tokens/s  batch 256  uncached
+generate   979,199 tokens/s  batch 256  cached
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg    # of Calls  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                              aten::bmm        22.72%       7.966ms        46.32%      16.237ms     135.306us           120  
+                                           aten::select        17.76%       6.226ms        23.51%       8.241ms       0.245us         33616  
+enumerate(DataLoader)#_SingleProcessDataLoaderIter._...        11.37%       3.985ms        16.88%       5.917ms     295.875us            20  
+                                       aten::as_strided         6.60%       2.315ms         6.60%       2.315ms       0.061us         37692  
+                              Optimizer.step#AdamW.step         4.55%       1.597ms         8.56%       3.001ms     150.029us            20  
+                                            aten::copy_         3.49%       1.222ms         3.49%       1.222ms       0.453us          2700  
+                                               aten::mm         2.75%     965.608us         2.82%     988.614us       2.354us           420  
+                                         aten::_softmax         2.43%     850.289us         2.43%     850.289us      42.514us            20  
+                                            aten::slice         2.21%     776.283us         2.63%     921.752us       0.366us          2516  
+                                     aten::resolve_conj         1.46%     511.101us         1.46%     511.101us       0.019us         26308  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 35.055ms</code></pre>
+</div>
+<h4>Reading the numbers</h4>
+<ul>
+  <li><strong>Training</strong>: about 177,000 tokens/s against microgpt's 22,800, roughly 7.8x, from batching alone: one Python-level step now processes 32 names.</li>
+  <li><strong>Generation at batch 1</strong>: cached and uncached are almost the same. Each step is a dozen tiny ops on a 16-wide model, so per-op overhead dominates, and re-running up to 16 positions instead of 1 adds almost nothing.</li>
+  <li><strong>Generation at batch 256</strong>: the cache is 4.7x faster. Uncached, each batch re-processes 256 × (1 + 2 + … + 16) = 34,816 positions; cached, 256 × 16 = 4,096. With 8.5x less work and enough rows to make work matter, the cache wins. This is the whole argument for KV caches, at toy scale.</li>
+  <li><strong>The profile</strong>: 20 steps took 35 ms of CPU time, about 1.75 ms per step. <code>aten::bmm</code> is the attention matmuls: 120 calls, 6 per step (2 in forward, 4 in backward). <code>aten::select</code> has 33,616 calls of 0.25 µs each: on this CPU build a batched matmul over the 32 × 4 = 128 (batch, head) matrices is executed matrix by matrix, and each one shows up as <code>select</code> calls and the <code>as_strided</code> calls beneath them. Profiled on its own, the score matmul at T = 16, <code>(128, 16, 4) @ (128, 4, 16)</code>, records 384 <code>select</code>s (3 per matrix), while the smaller <code>(128, 9, 4) @ (128, 4, 9)</code> records none. <code>enumerate(DataLoader)</code> is your Python <code>collate</code> at 11%.</li>
+</ul>
+<p>The lesson: <strong>this model is overhead-bound, not compute-bound</strong>. The time goes on per-op dispatch, view bookkeeping and Python, not arithmetic. That is also why one thread beats eight here, and why a GPU would not help (stretch goals below): the fix for overhead is fewer, bigger ops (fused attention, compilation, larger batches), not more FLOPs.</p>
+<h4>Optional: torch.compile</h4>
+<p><code>python gpt.py bench --compile</code> wraps the model in <code>torch.compile</code> (Inductor generates C++ for the CPU). Three interleaved measurements of training throughput gave:</p>
+<div class="code" data-lang="text">
+<pre><code>rep 0: eager   173,154  compiled   197,306 tokens/s
+rep 1: eager   176,880  compiled   203,494 tokens/s
+rep 2: eager   178,682  compiled   204,015 tokens/s</code></pre>
+</div>
+<p>About 15% faster training. Generation, though, printed <code>torch._dynamo hit config.recompile_limit (8)</code> with the reason <code>tensor 'idx' size mismatch at index 0. expected 1, actual 256</code>: every new input shape (batch 1 vs 256, a growing sequence in the uncached path, a moving cache position) triggers a recompile until Dynamo gives up and falls back to eager. Compile the training step, or give the compiler stable shapes (pad, or <code>dynamic=True</code>), before compiling a decode loop.</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<div class="code" data-lang="python">
+<div class="code-hdr"><span class="lang">python</span><span class="title">gpt.py: milestone 7 and the command line</span></div>
+<pre><code># --- 7. measurement ----------------------------------------------------------
+def bench(model, train_ds, tc):
+    opt, sched = make_optimizer(model, tc)
+    it = batches(train_ds, tc.batch_size, tc.seed)
+    for _ in range(20):  # warm-up
+        train_step(model, opt, sched, *next(it), tc.grad_clip)
+    tokens, t0 = 0, time.perf_counter()
+    for _ in range(300):
+        inputs, targets = next(it)
+        train_step(model, opt, sched, inputs, targets, tc.grad_clip)
+        tokens += (targets != IGNORE_INDEX).sum().item()
+    print(f"train    {tokens / (time.perf_counter() - t0):9,.0f} tokens/s  batch {tc.batch_size}")
+    for n, reps in ((1, 50), (256, 10)):
+        for use_cache in (False, True):
+            run = lambda: generate(model, train_ds.tok, n=n, use_cache=use_cache, seed=0,
+                                   stop_early=False)
+            run()  # warm-up
+            t0 = time.perf_counter()
+            for _ in range(reps):
+                run()
+            rate = reps * n * model.cfg.block_size / (time.perf_counter() - t0)
+            kind = "cached" if use_cache else "uncached"
+            print(f"generate {rate:9,.0f} tokens/s  batch {n:3d}  {kind}")
+    from torch.profiler import ProfilerActivity, profile
+    with profile(activities=[ProfilerActivity.CPU]) as prof:
+        for _ in range(20):
+            train_step(model, opt, sched, *next(it), tc.grad_clip)
+    print(prof.key_averages().table(sort_by="self_cpu_time_total", row_limit=10))
+
+
+# --- command line ------------------------------------------------------------
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("cmd", choices=["train", "sample", "bench"])
+    ap.add_argument("--steps", type=int, default=TrainConfig.steps)
+    ap.add_argument("--batch-size", type=int, default=TrainConfig.batch_size)
+    ap.add_argument("--resume", action="store_true")
+    ap.add_argument("--ckpt", default="ckpt.pt")
+    ap.add_argument("--n", type=int, default=10)
+    ap.add_argument("--prefix", default="")
+    ap.add_argument("--temperature", type=float, default=0.8)
+    ap.add_argument("--top-k", type=int, default=None)
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--device", default="cpu")  # cpu, mps or cuda
+    ap.add_argument("--threads", type=int, default=1)  # tiny ops: one thread is fastest
+    ap.add_argument("--compile", action="store_true")
+    args = ap.parse_args()
+    torch.set_num_threads(args.threads)
+
+    train_docs, test_docs = load_names()
+    tok = Tokenizer(train_docs + test_docs)
+    cfg = GPTConfig(vocab_size=tok.vocab_size)
+    train_ds = NamesDataset(train_docs, tok, cfg.block_size)
+    test_ds = NamesDataset(test_docs, tok, cfg.block_size)
+    print(f"train names: {len(train_docs)} | test names: {len(test_docs)} | "
+          f"vocab: {tok.vocab_size}")
+
+    if args.cmd == "train":
+        if args.resume:
+            model, opt, sched, step, tc = load_checkpoint(args.ckpt, args.device)
+            print(f"resumed from {args.ckpt} at step {step}")
+        else:
+            tc = TrainConfig(steps=args.steps, batch_size=args.batch_size, seed=args.seed)
+            torch.manual_seed(tc.seed)
+            model, step = GPT(cfg).to(args.device), 0
+            opt, sched = make_optimizer(model, tc)
+        print(f"parameters: {sum(p.numel() for p in model.parameters()):,}")
+        print(f"test loss before training: {evaluate(model, test_ds)[0]:.4f} "
+              f"(ln 27 = {math.log(27):.4f})")
+        step = fit(model, opt, sched, tc, train_ds, step)
+        test_loss, ppl = evaluate(model, test_ds)
+        print(f"test loss {test_loss:.4f} | test perplexity {ppl:.2f}")
+        save_checkpoint(args.ckpt, model, opt, sched, step, tc)
+        print(f"saved {args.ckpt}")
+    elif args.cmd == "sample":
+        model = load_checkpoint(args.ckpt, args.device)[0]
+        for name in generate(model, tok, n=args.n, prefix=args.prefix, temperature=args.temperature,
+                             top_k=args.top_k, seed=args.seed):
+            print(name)
+    else:
+        have_ckpt = os.path.exists(args.ckpt)
+        model = load_checkpoint(args.ckpt, args.device)[0] if have_ckpt else GPT(cfg)
+        if args.compile:
+            model = torch.compile(model)  # attribute access (cfg, device, ...) passes through
+        bench(model, train_ds, TrainConfig(batch_size=args.batch_size))
+
+
+if __name__ == "__main__":
+    main()</code></pre>
+</div>
+<p><code>bench</code> reads the clock with <code>time.perf_counter()</code> and no synchronisation, which is correct on a CPU only. On CUDA, call <code>torch.cuda.synchronize()</code> before each clock read or use CUDA events (<a href="13-50-questions.html#q44">q44</a>); here the <code>.item()</code> inside <code>train_step</code> happens to synchronise every step anyway.</p>
+</div>
+</details>
+</div>
+</div>
+
+<h2 id="stretch">Stretch goals</h2>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 14.8</span>
+  <span class="exercise-diff hard">hard</span>
+  <span class="exercise-title">Stretch · Precision, fused attention, devices, MQA, a bigger model</span>
+</div>
+<div class="exercise-body">
+<p>Pick any of these. For each, predict the result before you measure it.</p>
+<ol>
+  <li><strong>bf16 autocast.</strong> Run the forward pass under <code>torch.autocast(device_type, dtype=torch.bfloat16)</code> and the backward outside it. Does it get faster on your CPU? Does the loss change?</li>
+  <li><strong>Fused attention.</strong> Set <code>GPTConfig(sdpa=True)</code> so attention calls <code>F.scaled_dot_product_attention</code>. Check the logits match, then measure. Remember that its boolean mask means True = attend (<a href="13-50-questions.html#q33">q33</a>).</li>
+  <li><strong>Other devices.</strong> <code>--device mps</code> on a Mac or <code>--device cuda</code> on an NVIDIA GPU, and <code>--threads 8</code> on the CPU.</li>
+  <li><strong>Multi-query attention.</strong> One key head and one value head shared by all 4 query heads. Count the parameters, size the KV cache, prove cached = uncached, train it.</li>
+  <li><strong>A bigger model.</strong> 4 layers, width 64, MLP 256. How many parameters? Which device wins now? How low does the test loss go?</li>
+</ol>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<p>bf16 needs a separate training step, because <code>backward()</code> should run outside the autocast context:</p>
+<div class="code" data-lang="python">
+<pre><code>def train_step_bf16(model, opt, sched, inputs, targets, grad_clip):
+    model.train()
+    with torch.autocast(device_type=model.device.type, dtype=torch.bfloat16):
+        _, loss = model(inputs.to(model.device), targets.to(model.device))
+    opt.zero_grad(set_to_none=True)
+    loss.backward()  # outside autocast: backward reuses the forward's dtypes
+    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+    opt.step()
+    sched.step()
+    return loss.item(), grad_norm.item()</code></pre>
+</div>
+<p>Multi-query attention changes <code>wk</code> and <code>wv</code> to project to one head (<code>C -&gt; D</code>) and lets broadcasting share that head across the 4 query heads. The cache now holds 1 head instead of 4:</p>
+<div class="code" data-lang="python">
+<pre><code>class MQAttention(CausalSelfAttention):
+    """Multi-query attention: every query head shares ONE key head and ONE value head."""
+
+    def __init__(self, cfg):
+        super().__init__(cfg)
+        self.wk = nn.Linear(cfg.n_embd, self.head_size, bias=False)  # (C -&gt; D), not (C -&gt; C)
+        self.wv = nn.Linear(cfg.n_embd, self.head_size, bias=False)
+
+    def forward(self, x, cache=None):
+        B, T, C = x.shape
+        q = self.wq(x).view(B, T, self.n_head, self.head_size).transpose(1, 2)  # (B, H, T, D)
+        k = self.wk(x).view(B, T, 1, self.head_size).transpose(1, 2)  # (B, 1, T, D)
+        v = self.wv(x).view(B, T, 1, self.head_size).transpose(1, 2)
+        start = 0
+        if cache is not None:
+            start = cache.pos
+            k, v = cache.append(k, v)
+        mask = self.mask[start : start + T, : k.shape[2]]
+        att = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_size)  # (B, 1, T, S) broadcasts to H
+        att = att.masked_fill(~mask, float("-inf"))
+        y = F.softmax(att, dim=-1) @ v
+        return self.wo(y.transpose(1, 2).reshape(B, T, C))
+
+
+class MQAGPT(GPT):
+    def __init__(self, cfg):
+        super().__init__(cfg)
+        for block in self.blocks:
+            block.attn = MQAttention(cfg)
+        for p in self.parameters():
+            nn.init.normal_(p, mean=0.0, std=0.08)
+
+    def new_caches(self, batch_size):
+        d = self.cfg.n_embd // self.cfg.n_head
+        one_head = GPTConfig(**{**self.cfg.__dict__, "n_head": 1, "n_embd": d})  # (B, 1, T, D)
+        return [KVCache(batch_size, one_head, self.device) for _ in self.blocks]</code></pre>
+</div>
+<p>Measured on the same Apple Silicon (M4 Pro) laptop, training throughput in tokens/s at batch 32, one CPU thread unless stated. Treat the numbers as a snapshot of one machine, not general truths.</p>
+<table>
+<thead><tr><th>Variant</th><th>Result</th></tr></thead>
+<tbody>
+<tr><td>Fused attention (<code>sdpa=True</code>)</td><td>logits match to 6e-8; 257,817 / 263,191 / 266,065 tokens/s vs 173,705 / 173,731 / 179,251 for the explicit version: <strong>about 1.5x faster</strong></td></tr>
+<tr><td><code>torch.compile</code></td><td>197,306 / 203,494 / 204,015 vs 173,154 / 176,880 / 178,682 eager: about 1.15x</td></tr>
+<tr><td>bf16 autocast (CPU)</td><td>115,697 / 116,651 vs 176,726 / 175,100 in fp32: <strong>slower</strong>; test loss after 3,000 steps 2.1388 vs 2.1382</td></tr>
+<tr><td>8 CPU threads (<code>--threads 8</code>)</td><td>158,625 vs 178,558 with 1 thread</td></tr>
+<tr><td>Apple GPU (<code>--device mps</code>)</td><td>22,991: about 7.8x slower than one CPU thread</td></tr>
+<tr><td>Multi-query attention</td><td>3,808 parameters (<code>wk</code>, <code>wv</code> shrink from 16×16 to 4×16); KV cache 128 floats per sequence per layer instead of 512; cached vs one-pass logits differ by 3e-8; test loss after 20,000 steps 2.1041 vs 2.0891</td></tr>
+<tr><td>Bigger model (4 layers, C 64, MLP 256)</td><td>201,088 parameters; 41,417 tokens/s on 1 CPU thread, 33,590 on 8, 12,770 on MPS. 20,000 steps on 1 thread took 114 s: test loss <strong>1.9810</strong> (perplexity 7.25) vs 2.0891, with the last training window at 1.8440, so it has started to overfit</td></tr>
+</tbody>
+</table>
+<p>What they say together: at this size nothing that adds parallel hardware helps. Eight threads and the Apple GPU are both slower, because each op is too small to split and every MPS step pays kernel-launch latency plus a host sync for <code>.item()</code>. bf16 is slower on this CPU and moves the loss only in the fourth decimal place. What does help is <strong>fewer, fused ops</strong>: SDPA replaces the bmm, mask, softmax, bmm sequence (and its per-matrix bookkeeping) with one kernel and is the biggest single win here; compile is next. Multi-query attention costs a little quality (2.1041 vs 2.0891) for a 4x smaller cache, the trade that grouped-query attention tunes in real models. Even the 201k-parameter model is still too small for the GPU to beat one CPU core at batch 32.</p>
+<p>None of this was measured on a CUDA GPU. On one, the same model would still be launch-bound; to see the GPU win you need wide layers, long sequences and big batches, and there bf16 autocast runs the matmuls on tensor cores. If you have a CUDA machine, run <code>python gpt.py bench --device cuda</code> with the bigger config and compare.</p>
+</div>
+</details>
+</div>
+</div>
+
+<h2 id="full-solution">The full reference solution</h2>
+
+<p>All the milestone solutions together, in file order: about 400 lines with comments and blank lines, about 350 without. It is a complete, if small, training and inference codebase.</p>
+
+<details class="solution">
+<summary>Show the full gpt.py</summary>
+<div>
+<div class="code" data-lang="python">
+<div class="code-hdr"><span class="lang">python</span><span class="title">gpt.py</span></div>
+<pre><code>"""gpt.py: microgpt rebuilt in PyTorch, laid out like a real training/inference codebase.
+
+    python gpt.py train  [--steps 20000] [--batch-size 32] [--resume] [--device cpu]
+    python gpt.py sample [--n 10] [--prefix ma] [--temperature 0.8] [--top-k 10]
+    python gpt.py bench  [--compile]
+"""
+import argparse
+import itertools
+import math
+import os
+import random
+import time
+import urllib.request
+from dataclasses import asdict, dataclass
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
+
+NAMES_URL = "https://raw.githubusercontent.com/karpathy/makemore/988aa59/names.txt"
+IGNORE_INDEX = -100  # cross_entropy skips targets with this value
+
+
+@dataclass
+class GPTConfig:
+    vocab_size: int = 27
+    block_size: int = 16
+    n_layer: int = 1
+    n_embd: int = 16
+    n_head: int = 4
+    mlp_hidden: int = 64
+    sdpa: bool = False  # use F.scaled_dot_product_attention instead of explicit math
+
+
+@dataclass
+class TrainConfig:
+    steps: int = 20000
+    batch_size: int = 32
+    lr: float = 0.01
+    betas: tuple = (0.85, 0.99)
+    eps: float = 1e-8
+    weight_decay: float = 0.01
+    grad_clip: float = 1.0
+    seed: int = 42
+    log_every: int = 2000
+
+
+# --- 1. data and tokenizer ---------------------------------------------------
+def load_names(path="names.txt", seed=42):
+    """Download once, shuffle with a fixed seed, split 90/10 (the same split as microgpt.py)."""
+    if not os.path.exists(path):
+        urllib.request.urlretrieve(NAMES_URL, path)
+    with open(path) as f:
+        docs = [line.strip() for line in f if line.strip()]
+    random.Random(seed).shuffle(docs)
+    split = int(0.9 * len(docs))
+    return docs[:split], docs[split:]
+
+
+class Tokenizer:
+    """One id per character; BOS (the last id) marks both the start and the end of a name."""
+
+    def __init__(self, docs):
+        chars = sorted(set("".join(docs)))
+        self.stoi = {c: i for i, c in enumerate(chars)}
+        self.itos = {i: c for c, i in self.stoi.items()}
+        self.bos = len(chars)
+        self.vocab_size = len(chars) + 1
+
+    def encode(self, doc):
+        return [self.bos] + [self.stoi[c] for c in doc] + [self.bos]
+
+    def decode(self, ids):
+        return "".join(self.itos[i] for i in ids if i != self.bos)
+
+
+# --- 2. batching -------------------------------------------------------------
+class NamesDataset(Dataset):
+    def __init__(self, docs, tok, block_size):
+        self.docs, self.tok, self.block_size = docs, tok, block_size
+
+    def __len__(self):
+        return len(self.docs)
+
+    def __getitem__(self, i):
+        ids = self.tok.encode(self.docs[i])[: self.block_size + 1]  # at most block_size predictions
+        return torch.tensor(ids, dtype=torch.long)
+
+    def collate(self, batch):
+        """Right-pad to the longest name: pad inputs are BOS, pad targets are IGNORE_INDEX."""
+        T = max(len(ids) for ids in batch) - 1
+        inputs = torch.full((len(batch), T), self.tok.bos, dtype=torch.long)
+        targets = torch.full((len(batch), T), IGNORE_INDEX, dtype=torch.long)
+        for row, ids in enumerate(batch):
+            inputs[row, : len(ids) - 1] = ids[:-1]
+            targets[row, : len(ids) - 1] = ids[1:]
+        return inputs, targets
+
+
+def batches(ds, batch_size, seed, start_step=0):
+    """Endless (inputs, targets) stream whose order depends only on (seed, epoch), so a run
+    resumed at start_step sees exactly the batches the uninterrupted run would have seen."""
+    per_epoch = len(ds) // batch_size
+    epoch, skip = divmod(start_step, per_epoch)
+    while True:
+        g = torch.Generator().manual_seed(seed + epoch)
+        loader = DataLoader(ds, batch_size, shuffle=True, drop_last=True,
+                            generator=g, collate_fn=ds.collate)
+        yield from itertools.islice(loader, skip, None)
+        epoch, skip = epoch + 1, 0
+
+
+# --- 3. model ----------------------------------------------------------------
+class KVCache:
+    """Preallocated keys and values for one layer, (B, H, block_size, D), filled left to right."""
+
+    def __init__(self, batch_size, cfg, device=None):
+        shape = (batch_size, cfg.n_head, cfg.block_size, cfg.n_embd // cfg.n_head)
+        self.k = torch.zeros(shape, device=device)
+        self.v = torch.zeros(shape, device=device)
+        self.pos = 0
+
+    def append(self, k, v):
+        T = k.shape[2]
+        self.k[:, :, self.pos : self.pos + T] = k
+        self.v[:, :, self.pos : self.pos + T] = v
+        self.pos += T
+        return self.k[:, :, : self.pos], self.v[:, :, : self.pos]
+
+
+class CausalSelfAttention(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.n_head, self.head_size, self.sdpa = cfg.n_head, cfg.n_embd // cfg.n_head, cfg.sdpa
+        self.wq = nn.Linear(cfg.n_embd, cfg.n_embd, bias=False)
+        self.wk = nn.Linear(cfg.n_embd, cfg.n_embd, bias=False)
+        self.wv = nn.Linear(cfg.n_embd, cfg.n_embd, bias=False)
+        self.wo = nn.Linear(cfg.n_embd, cfg.n_embd, bias=False)
+        mask = torch.tril(torch.ones(cfg.block_size, cfg.block_size, dtype=torch.bool))
+        self.register_buffer("mask", mask, persistent=False)  # True = may attend
+
+    def forward(self, x, cache=None):
+        B, T, C = x.shape
+        q, k, v = (w(x).view(B, T, self.n_head, self.head_size).transpose(1, 2)
+                   for w in (self.wq, self.wk, self.wv))  # each (B, H, T, D)
+        start = 0
+        if cache is not None:
+            start = cache.pos
+            k, v = cache.append(k, v)  # every key/value so far: (B, H, start + T, D)
+        mask = self.mask[start : start + T, : k.shape[2]]  # rows: new queries, cols: all keys
+        if self.sdpa:
+            y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+        else:
+            att = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_size)  # (B, H, T, S)
+            att = att.masked_fill(~mask, float("-inf"))
+            y = F.softmax(att, dim=-1) @ v  # (B, H, T, D)
+        return self.wo(y.transpose(1, 2).reshape(B, T, C))
+
+
+class Block(nn.Module):
+    """microgpt's block: x + attn(rms_norm(x)), then x + mlp(rms_norm(x)); no norm weights."""
+
+    def __init__(self, cfg):
+        super().__init__()
+        self.norm1 = nn.RMSNorm(cfg.n_embd, eps=1e-5, elementwise_affine=False)
+        self.attn = CausalSelfAttention(cfg)
+        self.norm2 = nn.RMSNorm(cfg.n_embd, eps=1e-5, elementwise_affine=False)
+        self.fc1 = nn.Linear(cfg.n_embd, cfg.mlp_hidden, bias=False)
+        self.fc2 = nn.Linear(cfg.mlp_hidden, cfg.n_embd, bias=False)
+
+    def forward(self, x, cache=None):
+        x = x + self.attn(self.norm1(x), cache)
+        return x + self.fc2(F.relu(self.fc1(self.norm2(x))))
+
+
+class GPT(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg = cfg
+        self.tok_emb = nn.Embedding(cfg.vocab_size, cfg.n_embd)
+        self.pos_emb = nn.Embedding(cfg.block_size, cfg.n_embd)
+        self.blocks = nn.ModuleList(Block(cfg) for _ in range(cfg.n_layer))
+        self.lm_head = nn.Linear(cfg.n_embd, cfg.vocab_size, bias=False)
+        for p in self.parameters():
+            nn.init.normal_(p, mean=0.0, std=0.08)  # microgpt's make_matrix init
+
+    @property
+    def device(self):
+        return self.lm_head.weight.device
+
+    def forward(self, idx, targets=None, caches=None):
+        B, T = idx.shape
+        start = 0 if caches is None else caches[0].pos
+        x = self.tok_emb(idx) + self.pos_emb(torch.arange(start, start + T, device=idx.device))
+        for i, block in enumerate(self.blocks):
+            x = block(x, None if caches is None else caches[i])
+        logits = self.lm_head(x)  # (B, T, V)
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1),
+                                   ignore_index=IGNORE_INDEX)
+        return logits, loss
+
+    def new_caches(self, batch_size):
+        return [KVCache(batch_size, self.cfg, self.device) for _ in self.blocks]
+
+
+# --- 4. training and evaluation ----------------------------------------------
+def make_optimizer(model, tc):
+    """AdamW with microgpt's betas, decay on matrices only, LR linearly decayed to 0."""
+    params = list(model.parameters())
+    groups = [{"params": [p for p in params if p.dim() &gt;= 2], "weight_decay": tc.weight_decay},
+              {"params": [p for p in params if p.dim() &lt; 2], "weight_decay": 0.0}]
+    groups = [g for g in groups if g["params"]]
+    opt = torch.optim.AdamW(groups, lr=tc.lr, betas=tc.betas, eps=tc.eps)
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda step: max(0.0, 1.0 - step / tc.steps))
+    return opt, sched
+
+
+def train_step(model, opt, sched, inputs, targets, grad_clip):
+    model.train()
+    _, loss = model(inputs.to(model.device), targets.to(model.device))
+    opt.zero_grad(set_to_none=True)
+    loss.backward()
+    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+    opt.step()
+    sched.step()
+    return loss.item(), grad_norm.item()
+
+
+@torch.inference_mode()
+def evaluate(model, ds, batch_size=512):
+    """Token-weighted loss over a whole split: (sum of every token's loss) / (number of tokens)."""
+    model.eval()
+    total, count = 0.0, 0
+    for inputs, targets in DataLoader(ds, batch_size, collate_fn=ds.collate):
+        logits, _ = model(inputs.to(model.device))
+        targets = targets.to(model.device)
+        total += F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1),
+                                 ignore_index=IGNORE_INDEX, reduction="sum").item()
+        count += (targets != IGNORE_INDEX).sum().item()
+    return total / count, math.exp(total / count)
+
+
+def fit(model, opt, sched, tc, train_ds, step=0):
+    """Train from `step` to tc.steps, logging the mean loss of each window and tokens/s."""
+    it = batches(train_ds, tc.batch_size, tc.seed, start_step=step)
+    window, tokens, t0 = [], 0, time.perf_counter()
+    while step &lt; tc.steps:
+        inputs, targets = next(it)
+        lr = opt.param_groups[0]["lr"]
+        loss, grad_norm = train_step(model, opt, sched, inputs, targets, tc.grad_clip)
+        window.append(loss)
+        tokens += (targets != IGNORE_INDEX).sum().item()
+        step += 1
+        if step % tc.log_every == 0 or step == tc.steps:
+            print(f"step {step:5d}/{tc.steps} | loss {sum(window) / len(window):.4f} | "
+                  f"grad norm {grad_norm:.3f} | lr {lr:.5f} | "
+                  f"{tokens / (time.perf_counter() - t0):,.0f} tok/s")
+            window = []
+    return step
+
+
+# --- 5. checkpoints ----------------------------------------------------------
+def save_checkpoint(path, model, opt, sched, step, tc):
+    state = {"model": model.state_dict(), "optimizer": opt.state_dict(),
+             "scheduler": sched.state_dict(), "step": step,
+             "model_config": asdict(model.cfg), "train_config": asdict(tc)}
+    torch.save(state, path + ".tmp")
+    os.replace(path + ".tmp", path)  # atomic: a crash never leaves a half-written checkpoint
+
+
+def load_checkpoint(path, device="cpu"):
+    ckpt = torch.load(path, map_location=device)  # weights_only=True: tensors and plain data only
+    model = GPT(GPTConfig(**ckpt["model_config"])).to(device)
+    model.load_state_dict(ckpt["model"])
+    tc = TrainConfig(**ckpt["train_config"])
+    opt, sched = make_optimizer(model, tc)
+    opt.load_state_dict(ckpt["optimizer"])
+    sched.load_state_dict(ckpt["scheduler"])
+    return model, opt, sched, ckpt["step"], tc
+
+
+# --- 6. generation with a KV cache -------------------------------------------
+@torch.inference_mode()
+def generate(model, tok, n=10, prefix="", temperature=1.0, top_k=None,
+             use_cache=True, seed=None, stop_early=True):
+    """Sample n names as one batch. The first forward is the prefill (the whole prompt); after it
+    the cached path feeds only the newest token. Rows that already ended keep sampling until all
+    rows have; decoding cuts each row at its first BOS."""
+    model.eval()
+    g = None if seed is None else torch.Generator().manual_seed(seed)
+    prompt = [tok.bos] + [tok.stoi[c] for c in prefix]
+    idx = torch.tensor([prompt] * n, device=model.device)
+    caches = model.new_caches(n) if use_cache else None
+    x = idx
+    for _ in range(model.cfg.block_size - len(prompt) + 1):
+        logits, _ = model(x if use_cache else idx, caches=caches)
+        logits = logits[:, -1, :] / temperature
+        if top_k is not None:
+            kth = torch.topk(logits, top_k).values[:, -1:]
+            logits = logits.masked_fill(logits &lt; kth, float("-inf"))
+        probs = F.softmax(logits, dim=-1).cpu()  # sample on CPU: one seeded generator, any device
+        x = torch.multinomial(probs, 1, generator=g).to(idx.device)
+        idx = torch.cat([idx, x], dim=1)
+        if stop_early and (idx[:, len(prompt):] == tok.bos).any(dim=1).all():
+            break
+    names = []
+    for row in idx.tolist():
+        new = row[len(prompt):]
+        end = new.index(tok.bos) if tok.bos in new else len(new)
+        names.append(tok.decode(row[: len(prompt)] + new[:end]))
+    return names
+
+
+# --- 7. measurement ----------------------------------------------------------
+def bench(model, train_ds, tc):
+    opt, sched = make_optimizer(model, tc)
+    it = batches(train_ds, tc.batch_size, tc.seed)
+    for _ in range(20):  # warm-up
+        train_step(model, opt, sched, *next(it), tc.grad_clip)
+    tokens, t0 = 0, time.perf_counter()
+    for _ in range(300):
+        inputs, targets = next(it)
+        train_step(model, opt, sched, inputs, targets, tc.grad_clip)
+        tokens += (targets != IGNORE_INDEX).sum().item()
+    print(f"train    {tokens / (time.perf_counter() - t0):9,.0f} tokens/s  batch {tc.batch_size}")
+    for n, reps in ((1, 50), (256, 10)):
+        for use_cache in (False, True):
+            run = lambda: generate(model, train_ds.tok, n=n, use_cache=use_cache, seed=0,
+                                   stop_early=False)
+            run()  # warm-up
+            t0 = time.perf_counter()
+            for _ in range(reps):
+                run()
+            rate = reps * n * model.cfg.block_size / (time.perf_counter() - t0)
+            kind = "cached" if use_cache else "uncached"
+            print(f"generate {rate:9,.0f} tokens/s  batch {n:3d}  {kind}")
+    from torch.profiler import ProfilerActivity, profile
+    with profile(activities=[ProfilerActivity.CPU]) as prof:
+        for _ in range(20):
+            train_step(model, opt, sched, *next(it), tc.grad_clip)
+    print(prof.key_averages().table(sort_by="self_cpu_time_total", row_limit=10))
+
+
+# --- command line ------------------------------------------------------------
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("cmd", choices=["train", "sample", "bench"])
+    ap.add_argument("--steps", type=int, default=TrainConfig.steps)
+    ap.add_argument("--batch-size", type=int, default=TrainConfig.batch_size)
+    ap.add_argument("--resume", action="store_true")
+    ap.add_argument("--ckpt", default="ckpt.pt")
+    ap.add_argument("--n", type=int, default=10)
+    ap.add_argument("--prefix", default="")
+    ap.add_argument("--temperature", type=float, default=0.8)
+    ap.add_argument("--top-k", type=int, default=None)
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--device", default="cpu")  # cpu, mps or cuda
+    ap.add_argument("--threads", type=int, default=1)  # tiny ops: one thread is fastest
+    ap.add_argument("--compile", action="store_true")
+    args = ap.parse_args()
+    torch.set_num_threads(args.threads)
+
+    train_docs, test_docs = load_names()
+    tok = Tokenizer(train_docs + test_docs)
+    cfg = GPTConfig(vocab_size=tok.vocab_size)
+    train_ds = NamesDataset(train_docs, tok, cfg.block_size)
+    test_ds = NamesDataset(test_docs, tok, cfg.block_size)
+    print(f"train names: {len(train_docs)} | test names: {len(test_docs)} | "
+          f"vocab: {tok.vocab_size}")
+
+    if args.cmd == "train":
+        if args.resume:
+            model, opt, sched, step, tc = load_checkpoint(args.ckpt, args.device)
+            print(f"resumed from {args.ckpt} at step {step}")
+        else:
+            tc = TrainConfig(steps=args.steps, batch_size=args.batch_size, seed=args.seed)
+            torch.manual_seed(tc.seed)
+            model, step = GPT(cfg).to(args.device), 0
+            opt, sched = make_optimizer(model, tc)
+        print(f"parameters: {sum(p.numel() for p in model.parameters()):,}")
+        print(f"test loss before training: {evaluate(model, test_ds)[0]:.4f} "
+              f"(ln 27 = {math.log(27):.4f})")
+        step = fit(model, opt, sched, tc, train_ds, step)
+        test_loss, ppl = evaluate(model, test_ds)
+        print(f"test loss {test_loss:.4f} | test perplexity {ppl:.2f}")
+        save_checkpoint(args.ckpt, model, opt, sched, step, tc)
+        print(f"saved {args.ckpt}")
+    elif args.cmd == "sample":
+        model = load_checkpoint(args.ckpt, args.device)[0]
+        for name in generate(model, tok, n=args.n, prefix=args.prefix, temperature=args.temperature,
+                             top_k=args.top_k, seed=args.seed):
+            print(name)
+    else:
+        have_ckpt = os.path.exists(args.ckpt)
+        model = load_checkpoint(args.ckpt, args.device)[0] if have_ckpt else GPT(cfg)
+        if args.compile:
+            model = torch.compile(model)  # attribute access (cfg, device, ...) passes through
+        bench(model, train_ds, TrainConfig(batch_size=args.batch_size))
+
+
+if __name__ == "__main__":
+    main()</code></pre>
+</div>
+</div>
+</details>
+
+<h2 id="recap">What this project used</h2>
+
+<table>
+<thead><tr><th>Chapter</th><th>Where it appears</th></tr></thead>
+<tbody>
+<tr><td>2 · Tensors</td><td><code>view</code> + <code>transpose</code> to split heads, <code>reshape</code> to merge them, slices of the cache</td></tr>
+<tr><td>3 · Tensor math</td><td>batched <code>q @ k.transpose(-2, -1)</code>, the mask broadcast over (B, H), reductions over <code>dim=-1</code></td></tr>
+<tr><td>4 · Autograd</td><td>one <code>loss.backward()</code> replaces microgpt's <code>Value.backward()</code>; <code>inference_mode</code> for evaluation and sampling</td></tr>
+<tr><td>5 · nn.Module</td><td>parameters vs the non-persistent mask buffer, <code>state_dict</code>, <code>train()</code> / <code>eval()</code></td></tr>
+<tr><td>6 · Building a transformer</td><td>RMSNorm, causal attention, MLP, the residual stream, optional SDPA</td></tr>
+<tr><td>7 · Losses &amp; optimizers</td><td><code>cross_entropy</code> on logits with <code>ignore_index</code>, AdamW with param groups, <code>LambdaLR</code>, clipping</td></tr>
+<tr><td>8 · The training loop</td><td><code>Dataset</code>, <code>collate</code>, a resumable batch stream, token-weighted evaluation, exact resume</td></tr>
+<tr><td>9 · Devices &amp; precision</td><td><code>--device</code>, bf16 autocast</td></tr>
+<tr><td>10 · Inference &amp; sampling</td><td>prefill and decode, the KV cache, temperature, top-k, batched generation</td></tr>
+<tr><td>11 · Performance &amp; profiling</td><td>tokens/s, warm-up, <code>torch.profiler</code>, <code>torch.compile</code>, overhead-bound vs compute-bound</td></tr>
+<tr><td>12 · Debugging</td><td>initial loss = ln(vocab), overfitting one batch, the padding-leak check, cached = uncached</td></tr>
+</tbody>
+</table>
+
+<h2 id="what-next">Where to go from here</h2>
+
+<ul>
+  <li><strong>Read nanoGPT.</strong> Karpathy's <a href="https://github.com/karpathy/nanoGPT">nanoGPT</a> has the same shape as your <code>gpt.py</code>, scaled to GPT-2 with multi-GPU training. You can now read all of it.</li>
+  <li><strong>Make the cache paged.</strong> Your <code>KVCache</code> reserves <code>block_size</code> slots per sequence up front. vLLM's PagedAttention allocates the cache in fixed-size blocks on demand, which is what lets a server pack many sequences of different lengths into GPU memory.</li>
+  <li><strong>Continuous batching.</strong> Change <code>generate</code> so finished rows are replaced by new requests instead of idling. That one change is most of what makes a serving engine's throughput.</li>
+  <li><strong>Write the attention kernel yourself.</strong> Replace the SDPA call with a fused attention kernel in Triton, check it against your explicit version with <code>allclose</code>, then profile both on a CUDA GPU.</li>
+  <li><strong>Profile on a GPU.</strong> Take the bigger config to a CUDA machine, run <code>torch.profiler</code> with <code>ProfilerActivity.CUDA</code>, and open the trace in Perfetto or Nsight Systems. Find the launch gaps, then remove them with CUDA graphs (<code>torch.compile(mode="reduce-overhead")</code>).</li>
+</ul>
+
+<p>
+  You started with a <code>Value</code> class that knew how to add, multiply and
+  propagate a gradient through one number at a time. You now have the same
+  model as a batched, checkpointed, cached and profiled PyTorch program, and
+  you know where its time goes. Every inference engine you will read is this
+  file, with more layers, bigger tensors and better kernels.
+</p>
+
+<div class="page-nav">
+  <a href="13-50-questions.html"><span class="lbl">← Prev</span><span class="ttl">The 50 Questions</span></a>
+  <a href="../index.html" class="next"><span class="lbl">Home →</span><span class="ttl">Back to the start</span></a>
+</div>
+
+</main>
+</div>
+<script src="../assets/site.js"></script>
+</body>
+</html>

@@ -1,0 +1,856 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>13 · The 50 Questions — PyTorch</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<button class="sidebar-toggle" aria-label="Toggle navigation">☰ Menu</button>
+<div class="layout">
+<aside class="sidebar">
+  <a href="../index.html" class="brand">PyTorch</a>
+  <span class="brand-sub">a deep dive — 2026</span>
+  <nav>
+    <ol>
+      <li><a href="01-why-pytorch.html">Why PyTorch</a></li>
+      <li><a href="02-tensors.html">Tensors</a></li>
+      <li><a href="03-tensor-math.html">Tensor Math &amp; Broadcasting</a></li>
+      <li><a href="04-autograd.html">Autograd</a></li>
+      <li><a href="05-nn-module.html">nn.Module</a></li>
+      <li><a href="06-transformer-blocks.html">Building a Transformer</a></li>
+      <li><a href="07-losses-optimizers.html">Losses &amp; Optimizers</a></li>
+      <li><a href="08-training-loop.html">The Training Loop</a></li>
+      <li><a href="09-devices-precision.html">Devices &amp; Precision</a></li>
+      <li><a href="10-inference.html">Inference &amp; Sampling</a></li>
+      <li><a href="11-performance.html">Performance &amp; Profiling</a></li>
+      <li><a href="12-debugging.html">Debugging PyTorch</a></li>
+      <li><a href="13-50-questions.html">The 50 Questions</a></li>
+      <li><a href="14-capstone.html">Capstone Project</a></li>
+    </ol>
+    <div class="extras">
+      <a href="../exercises.html">All Exercises</a>
+      <a href="../index.html">← Home</a>
+    </div>
+  </nav>
+  <div class="progress"></div>
+</aside>
+
+<main class="content">
+
+<h1>
+  <span class="chap-num">Chapter 13</span>
+  The 50 Questions
+</h1>
+<p class="lede">
+  Fifty questions you will meet in interviews, in code review, and at 2 AM
+  when the loss turns into <code>nan</code>. Each answer is short and gives the
+  model behind it, not just the API call. Where the honest answer is code,
+  there is a snippet, and every snippet was run against PyTorch 2.8.
+</p>
+
+<div class="callout tip">
+<div class="callout-title">How to use this chapter</div>
+<p>Answer each question out loud before you read the answer. If you got the first sentence but not the "why", go back to the chapter it came from. Snippets assume <code>import torch</code>, <code>import torch.nn as nn</code>, <code>import torch.nn.functional as F</code>, <code>import numpy as np</code> and <code>import random</code>.</p>
+<ul>
+  <li><a href="#tensors">Tensors &amp; broadcasting</a> (1–10)</li>
+  <li><a href="#autograd">Autograd</a> (11–20)</li>
+  <li><a href="#modules-training">nn.Module &amp; training</a> (21–30)</li>
+  <li><a href="#transformers">Transformers in PyTorch</a> (31–40)</li>
+  <li><a href="#inference-perf">Inference, performance &amp; precision</a> (41–50)</li>
+</ul>
+</div>
+
+<h2 id="tensors">Tensors &amp; broadcasting (1–10)</h2>
+
+<div class="qa">
+<div class="qa-q" id="q1">What is a tensor, physically?</div>
+<p>A flat block of memory (the <strong>storage</strong>) plus metadata that says how to read it: shape, stride, storage offset, dtype and device. The stride is how many elements to skip in storage to move one step along each dimension, exactly the <code>base + i*stride0 + j*stride1</code> you would write for a C array. Transpose, slicing, <code>view</code> and <code>expand</code> only rewrite the metadata and share the storage, which is why they cost nothing.</p>
+<div class="code" data-lang="python">
+<pre><code>x = torch.arange(6.).reshape(2, 3)
+print(x.shape, x.stride(), x.dtype, x.device)
+# torch.Size([2, 3]) (3, 1) torch.float32 cpu
+t = x.t()
+print(t.shape, t.stride(), t.data_ptr() == x.data_ptr())
+# torch.Size([3, 2]) (1, 3) True</code></pre>
+</div>
+</div>
+
+<div class="qa">
+<div class="qa-q" id="q2"><code>view</code> vs <code>reshape</code>?</div>
+<p><code>view</code> never copies: it returns a tensor on the same storage, and raises if the new shape can't be expressed with strides over the existing layout. <code>reshape</code> returns a view when it can and silently copies when it can't. Use <code>view</code> when you are relying on "no copy" and want an error if that assumption breaks; use <code>reshape</code> when you don't care.</p>
+<div class="code" data-lang="python">
+<pre><code>x = torch.arange(6).reshape(2, 3)
+t = x.t()                  # strides (1, 3): no longer row-major
+t.view(6)
+# RuntimeError: view size is not compatible with input tensor's size and stride (at least one dimension spans across two contiguous subspaces). Use .reshape(...) instead.
+r = t.reshape(6)           # works, by copying
+print(r, r.data_ptr() == x.data_ptr())
+# tensor([0, 3, 1, 4, 2, 5]) False</code></pre>
+</div>
+</div>
+
+<div class="qa">
+<div class="qa-q" id="q3">What does <code>contiguous()</code> do, and when do you need it?</div>
+<p>A tensor is contiguous when its elements sit in storage in row-major order with no gaps. <code>transpose</code>, <code>permute</code> and <code>expand</code> return non-contiguous views; <code>.contiguous()</code> copies into a fresh row-major buffer (and returns <code>self</code> if it already is). You need it before <code>.view()</code> on such a tensor, and some custom kernels require it. The classic spot is merging attention heads back into <code>(B, T, C)</code>; microgpt's <code>.transpose(0, 1).reshape(...)</code> does the same copy implicitly.</p>
+<div class="code" data-lang="python">
+<pre><code>y = torch.randn(2, 4, 5, 4)            # (B, H, T, D)
+yt = y.transpose(1, 2)                 # (B, T, H, D), a view
+print(yt.is_contiguous())              # False
+out = yt.contiguous().view(2, 5, 16)   # (B, T, C)
+print(out.shape)                       # torch.Size([2, 5, 16])</code></pre>
+</div>
+</div>
+
+<div class="qa">
+<div class="qa-q" id="q4">State the broadcasting rules.</div>
+<p>Line the shapes up from the right. Two sizes are compatible if they are equal or one of them is 1; a missing dimension counts as 1. The result takes the larger size in each position, and size-1 dimensions are stretched without copying (stride 0). Adding a per-channel vector of shape <code>(C,)</code> to <code>(B, T, C)</code> works for this reason.</p>
+<div class="code" data-lang="python">
+<pre><code>print((torch.ones(4, 1) + torch.arange(3.)).shape)      # torch.Size([4, 3])
+print((torch.zeros(2, 5, 16) * torch.ones(16)).shape)   # torch.Size([2, 5, 16])
+torch.ones(2, 3) + torch.ones(2)
+# RuntimeError: The size of tensor a (3) must match the size of tensor b (2) at non-singleton dimension 1</code></pre>
+</div>
+</div>
+
+<div class="qa">
+<div class="qa-q" id="q5">Show a broadcasting bug that raises no error.</div>
+<p>A <code>(N, 1)</code> prediction against an <code>(N,)</code> target broadcasts to <code>(N, N)</code>: every prediction is compared with every target. Below, the predictions are perfect and the loss still comes out as 2.5. <code>mse_loss</code> at least emits a <code>UserWarning</code>; most elementwise code doesn't. Assert shapes at module boundaries and squeeze explicitly.</p>
+<div class="code" data-lang="python">
+<pre><code>pred = torch.arange(4.).unsqueeze(1)   # (4, 1): perfect values, wrong shape
+target = torch.arange(4.)              # (4,)
+print((pred - target).shape)           # torch.Size([4, 4])
+print(F.mse_loss(pred, target))        # tensor(2.5000)  plus a UserWarning
+print(F.mse_loss(pred.squeeze(-1), target))   # tensor(0.)</code></pre>
+</div>
+</div>
+
+<div class="qa">
+<div class="qa-q" id="q6">Why is <code>x.T @ y</code> shaped <code>(D, K)</code>?</div>
+<p>For 2-D operands, <code>(n, k) @ (k, m) -&gt; (n, m)</code>: the inner sizes must match and disappear. With <code>x</code> of shape <code>(N, D)</code> and <code>y</code> of shape <code>(N, K)</code>, the shared axis is the N samples, so you transpose <code>x</code> to put it in the middle: <code>(D, N) @ (N, K) -&gt; (D, K)</code>. That is the weight gradient of a linear layer, summed over the batch. With more than two dimensions, <code>@</code> treats all leading dimensions as batch dimensions (broadcast) and multiplies the last two; use <code>.mT</code> or <code>.transpose(-2, -1)</code> there, because <code>.T</code> on a non-2-D tensor is deprecated.</p>
+<div class="code" data-lang="python">
+<pre><code>x, y = torch.randn(100, 16), torch.randn(100, 27)
+print((x.T @ y).shape)                    # torch.Size([16, 27])
+h = torch.randn(8, 16, 16)                # (B, T, C)
+W = torch.randn(27, 16)                   # (out, in), like microgpt's head weights
+print((h @ W.T).shape)                    # torch.Size([8, 16, 27])
+q = torch.randn(8, 4, 16, 4)              # (B, H, T, D)
+print((q @ q.transpose(-2, -1)).shape)    # torch.Size([8, 4, 16, 16])</code></pre>
+</div>
+</div>
+
+<div class="qa">
+<div class="qa-q" id="q7">What do <code>dim</code> and <code>keepdim</code> mean in a reduction?</div>
+<p><code>dim</code> names the axis that is reduced away; it disappears from the shape. <code>keepdim=True</code> leaves a size-1 axis in its place so the result broadcasts back against the input. That is how you normalise rows, and it is why softmax over the vocabulary is <code>softmax(dim=-1)</code>.</p>
+<div class="code" data-lang="python">
+<pre><code>m = torch.tensor([[1., 2., 3.], [4., 5., 6.]])
+print(m.sum(dim=0))                    # tensor([5., 7., 9.])
+print(m.sum(dim=1))                    # tensor([ 6., 15.])
+print(m / m.sum(dim=1, keepdim=True))
+# tensor([[0.1667, 0.3333, 0.5000],
+#         [0.2667, 0.3333, 0.4000]])
+m / m.sum(dim=1)                       # (2, 3) / (2,): wrong axis lines up
+# RuntimeError: The size of tensor a (3) must match the size of tensor b (2) at non-singleton dimension 1</code></pre>
+</div>
+</div>
+
+<div class="qa">
+<div class="qa-q" id="q8">How do you pick the target's log-probability out of each row?</div>
+<p>microgpt's <code>negative_log_likelihood</code> did <code>probabilities[target_id]</code> for one position. For a batch, index with two integer tensors, one for the rows and one for the columns, or use <code>gather</code>. <code>F.cross_entropy</code> does exactly this, plus the log-softmax and the mean.</p>
+<div class="code" data-lang="python">
+<pre><code>torch.manual_seed(0)
+logits = torch.randn(3, 5)
+targets = torch.tensor([4, 0, 2])
+logp = logits.log_softmax(dim=-1)
+picked = logp[torch.arange(3), targets]       # one element per row
+print(picked)                                 # tensor([-3.1168, -3.0493, -2.5657])
+print(torch.equal(picked, logp.gather(1, targets.unsqueeze(1)).squeeze(1)))   # True
+print(-picked.mean(), F.cross_entropy(logits, targets))   # tensor(2.9106) tensor(2.9106)</code></pre>
+</div>
+</div>
+
+<div class="qa">
+<div class="qa-q" id="q9">When do two tensors share memory?</div>
+<p>Views share storage with their base: slices, <code>view</code>, <code>transpose</code>, <code>expand</code>, <code>detach</code>. So do <code>torch.from_numpy</code> and <code>.numpy()</code> on CPU. An in-place op (<code>+=</code>, anything ending in <code>_</code>) on a view writes through to the base, while <code>v = v + 5</code> makes a new tensor. Use <code>.clone()</code> when you need an independent copy.</p>
+<div class="code" data-lang="python">
+<pre><code>x = torch.zeros(3)
+v = x[1:]
+v += 5                       # in place, through the view
+print(x)                     # tensor([0., 5., 5.])
+n = np.zeros(3, dtype=np.float32)
+torch.from_numpy(n)[0] = 7
+print(n)                     # [7. 0. 0.]</code></pre>
+</div>
+</div>
+
+<div class="qa">
+<div class="qa-q" id="q10">What dtype do you get, and what is type promotion?</div>
+<p>Integer literals give <code>int64</code>; float literals give the default float dtype, <code>float32</code>; NumPy float arrays arrive as <code>float64</code>. True division of integers gives a float, <code>//</code> stays integer. Two tensors of different dtypes promote to the wider one, but a Python scalar does not widen a tensor's float dtype. The common real bug is a <code>float64</code> tensor from NumPy meeting <code>float32</code> weights: <code>nn.Linear</code> raises <code>mat1 and mat2 must have the same dtype, but got Double and Float</code>.</p>
+<div class="code" data-lang="python">
+<pre><code>i = torch.tensor([1, 2, 3])
+print(i.dtype, (i / 2).dtype, i // 2)
+# torch.int64 torch.float32 tensor([0, 1, 1])
+f = torch.tensor([1.0])
+print(f.dtype, (f + torch.tensor([1.0], dtype=torch.float64)).dtype, (f + 2.5).dtype)
+# torch.float32 torch.float64 torch.float32
+print(torch.from_numpy(np.array([1.0])).dtype)                  # torch.float64
+print((torch.tensor([1.0], dtype=torch.float16) * 3.0).dtype)   # torch.float16</code></pre>
+</div>
+</div>
+
+<h2 id="autograd">Autograd (11–20)</h2>
+
+<div class="qa">
+<div class="qa-q" id="q11">What is a leaf tensor, and why is <code>.grad</code> sometimes <code>None</code>?</div>
+<p>A leaf is a tensor that no tracked op produced: one you created with <code>requires_grad=True</code>, or any <code>nn.Parameter</code>. <code>backward()</code> stores <code>.grad</code> only on leaves; intermediate gradients are computed, used and thrown away (call <code>.retain_grad()</code> to keep one). Your <code>Value</code> class kept a <code>.grad</code> on every node; PyTorch keeps only the leaves to save memory. Watch out: <code>.to()</code> is an op, so the result of <code>torch.randn(2, requires_grad=True).to(torch.float64)</code> is not a leaf and never gets a <code>.grad</code>. Create tensors directly with the dtype and device you want.</p>
+<div class="code" data-lang="python">
+<pre><code>w = torch.tensor([2.0, 3.0], requires_grad=True)
+y = w * 3
+print(w.is_leaf, y.is_leaf)       # True False
+y.sum().backward()
+print(w.grad)                     # tensor([3., 3.])
+print(y.grad)                     # None, with a UserWarning about non-leaf .grad
+d = torch.randn(2, requires_grad=True).to(torch.float64)
+print(d.is_leaf)                  # False</code></pre>
+</div>
+</div>
+
+<div class="qa">
+<div class="qa-q" id="q12">Why do gradients accumulate, and why <code>zero_grad()</code>?</div>
+<p><code>backward()</code> adds into <code>.grad</code>; it never overwrites. That is the same <code>+=</code> your <code>Value.backward()</code> did, and the reason microgpt reset every <code>parameter.grad = 0.0</code> before each step. It is deliberate: a parameter used in several places sums its contributions, and you can run backward on several micro-batches before one optimizer step (gradient accumulation). Forget to clear and each step uses the sum of all past gradients. <code>optimizer.zero_grad()</code> sets them to <code>None</code> by default (<code>set_to_none=True</code>), which skips a memset.</p>
+<div class="code" data-lang="python">
+<pre><code>w = torch.tensor(1.0, requires_grad=True)
+for _ in range(3):
+    (w * 2).backward()
+    print(w.grad)          # tensor(2.), then tensor(4.), then tensor(6.)</code></pre>
+</div>
+</div>
+
+<div class="qa">
+<div class="qa-q" id="q13"><code>no_grad</code> vs <code>inference_mode</code> vs <code>detach</code>?</div>
+<p><code>torch.no_grad()</code> is a context in which ops are not recorded; the outputs are ordinary tensors you can later feed into autograd as constants. Use it for evaluation, EMA updates and manual weight edits. <code>torch.inference_mode()</code> is a stricter, faster version that also skips version counting and view tracking; its outputs are "inference tensors" that autograd refuses to use later. microgpt's <code>evaluate_model</code> and <code>generate_name</code> use it, which is right for pure serving. <code>x.detach()</code> acts on one tensor: same storage, cut from the graph. Use it to stop gradients along one path, and remember in-place edits to it change the original.</p>
+<div class="code" data-lang="python">
+<pre><code>w = torch.ones(2, requires_grad=True)
+with torch.no_grad():
+    a = w * 2
+with torch.inference_mode():
+    b = w * 2
+print(a.requires_grad, a.is_inference())   # False False
+print(b.requires_grad, b.is_inference())   # False True
+(w * b).sum().backward()
+# RuntimeError: Inference tensors cannot be saved for backward. To work around you can make a clone to get a normal tensor and use it in autograd.</code></pre>
+</div>
+</div>
+
+<div class="qa">
+<div class="qa-q" id="q14">What does <code>loss.backward()</code> actually do?</div>
+<p>The forward pass records a graph: every result tensor has a <code>grad_fn</code> pointing at the backward node of the op that made it. <code>backward()</code> walks that graph in reverse topological order from the loss, and each node applies its local derivative to the incoming gradient (the chain rule), accumulating into the leaves' <code>.grad</code>. It is your <code>Value.backward()</code> with <code>build_topological_order</code>, except that a node is a whole-tensor op (one node for a 16x16 matmul instead of 256 multiplies), its backward is a compiled kernel, and the graph is freed afterwards. It needs a scalar to start from, or an explicit gradient tensor.</p>
+<div class="code" data-lang="python">
+<pre><code>x = torch.tensor([1.0, 2.0], requires_grad=True)
+y = x ** 2
+print(y.grad_fn.name())           # PowBackward0
+y.backward()
+# RuntimeError: grad can be implicitly created only for scalar outputs
+y.backward(torch.ones_like(y))    # same as y.sum().backward()
+print(x.grad)                     # tensor([2., 4.])</code></pre>
+</div>
+</div>
+
+<div class="qa">
+<div class="qa-q" id="q15">What causes "Trying to backward through the graph a second time"?</div>
+<p>After <code>backward()</code>, autograd frees the intermediate values it saved during forward, to get the memory back. A second backward through the same graph has nothing left to use. In real code this is almost always a bug: a tensor from the previous iteration (a hidden state, a cache, a running <code>total_loss = total_loss + loss</code>) is still connected to the old graph. Detach the carried state or recompute it. <code>retain_graph=True</code> is only for when you really need two backward passes, and it costs memory.</p>
+<div class="code" data-lang="python">
+<pre><code>x = torch.tensor(2.0, requires_grad=True)
+y = x.exp()
+y.backward()
+y.backward()
+# RuntimeError: Trying to backward through the graph a second time (or directly access saved tensors after they have already been freed). ...</code></pre>
+</div>
+</div>
+
+<div class="qa">
+<div class="qa-q" id="q16">Why does an in-place op break backward?</div>
+<p>Many backward formulas need values saved from forward: sigmoid's derivative is <code>s * (1 - s)</code>, computed from its output. Every tensor carries a version counter that each in-place op bumps; at backward time autograd checks that the saved tensors still have the version it recorded and raises if not. Fix it with the out-of-place form (<code>y = y + 1</code>) or a <code>clone()</code>.</p>
+<div class="code" data-lang="python">
+<pre><code>x = torch.randn(3, requires_grad=True)
+y = x.sigmoid()
+y.add_(1)                # in place: y is now at version 1
+y.sum().backward()
+# RuntimeError: one of the variables needed for gradient computation has been modified by an inplace operation: [torch.FloatTensor [3]], which is output 0 of SigmoidBackward0, is at version 1; expected version 0 instead. Hint: ...</code></pre>
+</div>
+</div>
+
+<div class="qa">
+<div class="qa-q" id="q17">How do you freeze part of a model?</div>
+<p>Call <code>requires_grad_(False)</code> on those parameters. Autograd then skips their gradients (saving compute and memory) and their <code>.grad</code> stays <code>None</code>, so the optimizer leaves them alone. Pass only the trainable ones to the optimizer so it doesn't allocate Adam state for frozen weights. Freezing is not <code>eval()</code>: that changes dropout and batch-norm behaviour, <code>requires_grad</code> controls gradients. This is how you fine-tune a head on a frozen backbone, or train LoRA adapters.</p>
+<div class="code" data-lang="python">
+<pre><code>torch.manual_seed(0)
+m = nn.Sequential(nn.Linear(16, 64), nn.ReLU(), nn.Linear(64, 27))
+for p in m[0].parameters():
+    p.requires_grad_(False)
+print(sum(p.numel() for p in m.parameters()))                      # 2843
+print(sum(p.numel() for p in m.parameters() if p.requires_grad))   # 1755
+opt = torch.optim.AdamW([p for p in m.parameters() if p.requires_grad], lr=1e-3)</code></pre>
+</div>
+</div>
+
+<div class="qa">
+<div class="qa-q" id="q18">How do you check that a gradient is correct?</div>
+<p><code>torch.autograd.gradcheck</code> compares autograd's analytic Jacobian against finite differences. Give it <code>float64</code> inputs: in <code>float32</code> the finite differences are so noisy that it reports <code>GradcheckError: Jacobian mismatch</code> on correct code. Use it for every custom <code>autograd.Function</code> or hand-written backward. For a whole model, compare against a reference implementation instead, for example microgpt's scalar engine on the same weights.</p>
+<div class="code" data-lang="python">
+<pre><code>def rms_norm(x):
+    return x * (x.pow(2).mean(-1, keepdim=True) + 1e-5).rsqrt()
+
+torch.manual_seed(0)
+inp = torch.randn(3, 16, dtype=torch.float64, requires_grad=True)
+print(torch.autograd.gradcheck(rms_norm, (inp,)))   # True</code></pre>
+</div>
+</div>
+
+<div class="qa">
+<div class="qa-q" id="q19">How do you get gradients with respect to the inputs, or second derivatives?</div>
+<p><code>torch.autograd.grad(outputs, inputs)</code> returns the gradients instead of accumulating them into <code>.grad</code>, so it doesn't disturb parameter gradients. Pass <code>create_graph=True</code> to make the returned gradient differentiable itself, which gives you second derivatives (gradient penalties, meta-learning). Typical uses: saliency (which input embeddings mattered), adversarial inputs, physics-style losses.</p>
+<div class="code" data-lang="python">
+<pre><code>x = torch.tensor(2.0, requires_grad=True)
+y = x ** 3
+(dy,) = torch.autograd.grad(y, x, create_graph=True)   # 3x^2
+(d2y,) = torch.autograd.grad(dy, x)                    # 6x
+print(dy, d2y, x.grad)
+# tensor(12., grad_fn=&lt;MulBackward0&gt;) tensor(12.) None</code></pre>
+</div>
+</div>
+
+<div class="qa">
+<div class="qa-q" id="q20">When do you write a custom <code>autograd.Function</code>?</div>
+<p>When the gradient you want is not the true derivative (straight-through estimators for quantisation), when you call a fused Triton or CUDA kernel that comes with its own backward, or when you want to recompute instead of saving activations. You subclass <code>torch.autograd.Function</code> with static <code>forward(ctx, ...)</code> and <code>backward(ctx, grad_out)</code>, stashing tensors with <code>ctx.save_for_backward</code>. It is the tensor-level version of building a <code>Value</code> with its <code>local_gradients</code>. Always gradcheck it.</p>
+<div class="code" data-lang="python">
+<pre><code>class MyReLU(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x):
+        ctx.save_for_backward(x)
+        return x.clamp(min=0)
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        (x,) = ctx.saved_tensors
+        return grad_out * (x &gt; 0).to(grad_out.dtype)
+
+x = torch.tensor([-1.0, 0.5, 2.0], requires_grad=True)
+MyReLU.apply(x).sum().backward()
+print(x.grad)          # tensor([0., 1., 1.])</code></pre>
+</div>
+</div>
+
+<h2 id="modules-training">nn.Module &amp; training (21–30)</h2>
+
+<div class="qa">
+<div class="qa-q" id="q21">Parameters vs buffers vs plain tensor attributes?</div>
+<p>All three are tensors stored on a module; they differ in what the module does with them.</p>
+<table>
+<thead><tr><th>Kind</th><th>In <code>parameters()</code> (trained)</th><th>In <code>state_dict</code></th><th>Moved by <code>.to()</code></th></tr></thead>
+<tbody>
+<tr><td><code>nn.Parameter</code></td><td>yes</td><td>yes</td><td>yes</td></tr>
+<tr><td><code>register_buffer(...)</code></td><td>no</td><td>yes</td><td>yes</td></tr>
+<tr><td><code>register_buffer(..., persistent=False)</code></td><td>no</td><td>no</td><td>yes</td></tr>
+<tr><td>plain <code>self.x = torch.tensor(...)</code></td><td>no</td><td>no</td><td>no</td></tr>
+</tbody>
+</table>
+<p>microgpt's causal mask is a non-persistent buffer: it follows the model to the device but isn't saved, because it can be rebuilt from <code>block_size</code>. A plain tensor attribute is the bug: it stays on the CPU when the model moves to the GPU.</p>
+<div class="code" data-lang="python">
+<pre><code>class Attn(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.wq = nn.Parameter(torch.randn(16, 16))
+        self.register_buffer("mask", torch.ones(16, 16).tril().bool(), persistent=False)
+        self.register_buffer("step", torch.zeros((), dtype=torch.long))
+        self.scale = torch.tensor(0.5)            # invisible to the module
+
+m = Attn().to(torch.float64)
+print([n for n, _ in m.named_parameters()])     # ['wq']
+print([n for n, _ in m.named_buffers()])        # ['mask', 'step']
+print(list(m.state_dict().keys()))              # ['wq', 'step']
+print(m.wq.dtype, m.mask.dtype, m.scale.dtype)  # torch.float64 torch.bool torch.float32</code></pre>
+</div>
+</div>
+
+<div class="qa">
+<div class="qa-q" id="q22">What does <code>model.eval()</code> change, and what doesn't it?</div>
+<p>It sets <code>self.training = False</code> on the module and every child; that's all. Modules that read the flag change behaviour: <code>Dropout</code> becomes the identity, <code>BatchNorm</code> uses its running statistics and stops updating them. It does <strong>not</strong> turn off autograd (the graph is still built and activations still kept) and doesn't touch <code>requires_grad</code>, so pair it with <code>torch.inference_mode()</code>. microgpt has no dropout or batch norm, so <code>eval()</code> changes nothing numerically there; call it anyway.</p>
+<div class="code" data-lang="python">
+<pre><code>torch.manual_seed(0)
+net = nn.Sequential(nn.Linear(4, 4), nn.Dropout(p=0.5))
+x = torch.ones(1, 4)
+print(net(x))       # training mode: random zeros, survivors scaled by 2
+# tensor([[-0.6347,  1.2561, -1.0009, -0.0000]], grad_fn=&lt;MulBackward0&gt;)
+net.eval()
+out = net(x)
+print(out)          # dropout is now the identity
+# tensor([[-0.3173,  0.6281, -0.5004, -1.2141]], grad_fn=&lt;AddmmBackward0&gt;)
+print(out.requires_grad)   # True: eval() did not turn off autograd</code></pre>
+</div>
+</div>
+
+<div class="qa">
+<div class="qa-q" id="q23">Why does <code>F.cross_entropy</code> take logits, not probabilities?</div>
+<p>It computes <code>log_softmax</code> and the negative log-likelihood in one step, and <code>log_softmax</code> is evaluated as <code>x - logsumexp(x)</code> with the max subtracted first, so it never overflows or takes <code>log(0)</code>. Doing softmax then log yourself gives <code>inf</code> for large logits. Passing probabilities applies softmax twice: the loss is wrong, gradients are squashed, and nothing errors. Shapes: logits <code>(N, C)</code> float, targets <code>(N,)</code> int64 class indices.</p>
+<div class="code" data-lang="python">
+<pre><code>logits = torch.tensor([[1000.0, 0.0]])
+target = torch.tensor([1])
+print(-logits.softmax(-1).log()[0, 1])     # tensor(inf)
+print(F.cross_entropy(logits, target))     # tensor(1000.)
+logits = torch.tensor([[2.0, 1.0, 0.1]])
+target = torch.tensor([0])
+print(F.cross_entropy(logits, target))                 # tensor(0.4170)
+print(F.cross_entropy(logits.softmax(-1), target))     # tensor(0.8021): double softmax</code></pre>
+</div>
+</div>
+
+<div class="qa">
+<div class="qa-q" id="q24">Adam vs AdamW?</div>
+<p>Same moment estimates and update as your <code>apply_adam</code>; they differ only in weight decay. <code>Adam(weight_decay=wd)</code> adds <code>wd * p</code> to the gradient, and that term then gets divided by <code>sqrt(v)</code> like the rest, so the decay depends on gradient history; a weight with no loss gradient is decayed by about <code>lr</code> per step whatever <code>wd</code> is. <code>AdamW</code> decouples it: <code>p -= lr * wd * p</code>, then the normal Adam step. AdamW is the transformer default. Their default <code>weight_decay</code> also differs: 0.01 for AdamW, 0 for Adam.</p>
+<div class="code" data-lang="python">
+<pre><code>for cls in (torch.optim.Adam, torch.optim.AdamW):
+    p = nn.Parameter(torch.tensor([1.0]))
+    opt = cls([p], lr=0.01, weight_decay=0.1)
+    for _ in range(10):
+        p.grad = torch.zeros(1)        # no loss gradient: only decay acts
+        opt.step()
+    print(cls.__name__, p.data)
+# Adam tensor([0.9003])
+# AdamW tensor([0.9900])</code></pre>
+</div>
+</div>
+
+<div class="qa">
+<div class="qa-q" id="q25">What is the correct order of a training step?</div>
+<p>Forward, loss, clear grads, backward, clip, optimizer step, scheduler step. <code>zero_grad</code> can go anywhere before <code>backward</code>. Common slips: stepping the scheduler before the optimizer (PyTorch warns "Detected call of `lr_scheduler.step()` before `optimizer.step()`" and you skip the first LR value), clipping after <code>step()</code> (too late), and calling <code>loss.item()</code> every step on a GPU (a sync, see <a href="#q45">q45</a>). microgpt's loop has the same order, with the schedule written by hand.</p>
+<div class="code" data-lang="python">
+<pre><code>for x, y in loader:
+    logits = model(x)                                         # 1. forward
+    loss = F.cross_entropy(logits.view(-1, V), y.view(-1))    # 2. loss
+    optimizer.zero_grad(set_to_none=True)                     # 3. clear old grads
+    loss.backward()                                           # 4. fill .grad
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)   # 5. optional clip
+    optimizer.step()                                          # 6. update weights
+    scheduler.step()                                          # 7. next learning rate</code></pre>
+</div>
+</div>
+
+<div class="qa">
+<div class="qa-q" id="q26">What exactly does <code>clip_grad_norm_</code> do?</div>
+<p>It computes one global L2 norm over all the parameters' gradients, as if concatenated into a single vector. If that norm exceeds <code>max_norm</code>, it multiplies every gradient by <code>max_norm / total_norm</code>: the direction is kept, only the length is capped. It returns the norm <em>before</em> clipping; log it, because spikes in the gradient norm are usually the first sign of an unstable run.</p>
+<div class="code" data-lang="python">
+<pre><code>lin = nn.Linear(2, 2, bias=False)
+with torch.no_grad():
+    lin.weight.fill_(1.0)
+lin(torch.full((1, 2), 10.0)).sum().backward()
+print(lin.weight.grad)    # all four entries 10: global norm sqrt(4 * 100) = 20
+total = torch.nn.utils.clip_grad_norm_(lin.parameters(), max_norm=1.0)
+print(total)              # tensor(20.)
+print(lin.weight.grad)    # all four entries 10 * 1/20 = 0.5</code></pre>
+</div>
+</div>
+
+<div class="qa">
+<div class="qa-q" id="q27">How do <code>DataLoader</code> workers work, and how many should you use?</div>
+<p>With <code>num_workers=0</code> (the default), <code>__getitem__</code> and <code>collate_fn</code> run in the training process between steps. With N &gt; 0 the loader starts N worker processes that each build whole batches, round robin, and keep 2 batches each in flight (<code>prefetch_factor</code>), so the accelerator doesn't wait for data. Increase workers until data time disappears from the profile; add <code>pin_memory=True</code> when feeding a CUDA GPU and <code>persistent_workers=True</code> to avoid restarting them every epoch. On macOS and Windows the workers are spawned, so the dataset must be picklable and the script needs an <code>if __name__ == "__main__":</code> guard. For small in-memory data such as names.txt, 0 workers is fastest: process start-up and inter-process copies cost more than the work.</p>
+<div class="code" data-lang="python">
+<pre><code>from torch.utils.data import Dataset, DataLoader, get_worker_info
+
+class Squares(Dataset):
+    def __len__(self):
+        return 8
+    def __getitem__(self, i):
+        info = get_worker_info()           # None in the main process
+        return torch.tensor([i * i, -1 if info is None else info.id])
+
+if __name__ == "__main__":
+    loader = DataLoader(Squares(), batch_size=2, num_workers=2, persistent_workers=True)
+    for batch in loader:
+        print(batch[:, 0].tolist(), "from worker", batch[0, 1].item())
+# [0, 1] from worker 0
+# [4, 9] from worker 1
+# [16, 25] from worker 0
+# [36, 49] from worker 1</code></pre>
+</div>
+</div>
+
+<div class="qa">
+<div class="qa-q" id="q28">How do you checkpoint a training run so it can resume?</div>
+<p>Save <code>state_dict</code>s, not module objects: model, optimizer (Adam's <code>m</code>, <code>v</code> and step count per parameter), scheduler, the step number, RNG states and the config. To restore, build the same objects and call <code>load_state_dict</code> on each. Since PyTorch 2.6, <code>torch.load</code> defaults to <code>weights_only=True</code>: tensors, dicts, lists, strings and numbers load, arbitrary pickled objects (such as a whole saved <code>nn.Module</code>) raise <code>UnpicklingError</code>, which protects you from malicious checkpoint files. microgpt's checkpoint holds only such plain data, so it would load without its <code>weights_only=False</code>.</p>
+<div class="code" data-lang="python">
+<pre><code>torch.save({"model": model.state_dict(), "optimizer": opt.state_dict(),
+            "scheduler": sched.state_dict(), "step": step,
+            "torch_rng": torch.get_rng_state()}, "ckpt.pt")
+
+ckpt = torch.load("ckpt.pt", map_location="cpu")    # weights_only=True by default
+model.load_state_dict(ckpt["model"])
+opt.load_state_dict(ckpt["optimizer"])
+sched.load_state_dict(ckpt["scheduler"])
+torch.set_rng_state(ckpt["torch_rng"])</code></pre>
+</div>
+</div>
+
+<div class="qa">
+<div class="qa-q" id="q29">How do you make training reproducible?</div>
+<p>Seed every generator (<code>random</code>, NumPy, <code>torch.manual_seed</code>, which covers CPU and all CUDA devices), make the data order deterministic (a seeded <code>generator=</code> for the <code>DataLoader</code>), and call <code>torch.use_deterministic_algorithms(True)</code>, which picks deterministic kernels or raises if an op has none. On CUDA also set <code>CUBLAS_WORKSPACE_CONFIG=:4096:8</code> and <code>torch.backends.cudnn.benchmark = False</code>. Even then, bitwise equality is only promised on the same hardware, library versions and settings: a different GPU, batch size or thread count changes the order of float additions.</p>
+<div class="code" data-lang="python">
+<pre><code>def run(seed):
+    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
+    m = nn.Linear(8, 1)
+    opt = torch.optim.SGD(m.parameters(), lr=0.1)
+    for _ in range(5):
+        loss = m(torch.randn(4, 8)).pow(2).mean()
+        opt.zero_grad(); loss.backward(); opt.step()
+    return loss.item()
+
+torch.use_deterministic_algorithms(True)
+print(run(0) == run(0))     # True</code></pre>
+</div>
+</div>
+
+<div class="qa">
+<div class="qa-q" id="q30">The loss is <code>nan</code>. How do you debug it?</div>
+<p>First find the first step where it happens (<code>assert torch.isfinite(loss)</code>). Then check that batch: bad data, or every target masked out, which makes a mean over zero tokens and is itself <code>nan</code>. Look at the gradient-norm history: a climb before the <code>nan</code> means LR too high, so add warmup or clipping. Then look for unsafe math: <code>log(0)</code>, a division by a norm without <code>eps</code>, <code>sqrt</code> at 0 in backward, <code>exp</code> overflow, fp16 values above 65504. Finally, <code>torch.autograd.detect_anomaly()</code> names the op whose backward produced the <code>nan</code> and prints its forward traceback. It is slow, so use it only for debugging.</p>
+<div class="code" data-lang="python">
+<pre><code>x = torch.tensor(0.0, requires_grad=True)
+(x.sqrt() * 0).backward()
+print(x.grad)          # tensor(nan): 0 * inf in the chain rule
+x.grad = None
+with torch.autograd.detect_anomaly():
+    (x.sqrt() * 0).backward()
+# RuntimeError: Function 'SqrtBackward0' returned nan values in its 0th output.</code></pre>
+</div>
+</div>
+
+<h2 id="transformers">Transformers in PyTorch (31–40)</h2>
+
+<div class="qa">
+<div class="qa-q" id="q31">Why scale attention scores by √d?</div>
+<p>If the components of <code>q</code> and <code>k</code> have unit variance and are independent, <code>q · k</code> is a sum of <code>d</code> unit-variance products: variance <code>d</code>, standard deviation <code>√d</code>. For <code>d = 64</code> the scores have std 8, softmax saturates to nearly one-hot, and gradients through it vanish. Dividing by <code>√d</code> brings the std back to 1. microgpt does <code>attention_logits / head_size**0.5</code>, a divide by 2 for its 4-wide heads.</p>
+<div class="code" data-lang="python">
+<pre><code>torch.manual_seed(0)
+d = 64
+q, k = torch.randn(10000, d), torch.randn(10000, d)
+s = (q * k).sum(-1)
+print(f"{s.std():.2f} {(s / d**0.5).std():.2f}")     # 8.00 1.00
+torch.manual_seed(0)
+q1, K = torch.randn(1, d), torch.randn(16, d)
+raw = q1 @ K.T
+print(f"{raw.softmax(-1).max():.3f} {(raw / d**0.5).softmax(-1).max():.3f}")   # 0.995 0.222</code></pre>
+</div>
+</div>
+
+<div class="qa">
+<div class="qa-q" id="q32">How do you build and apply a causal mask?</div>
+<p>Position <code>t</code> may attend to positions <code>0..t</code>. Build a lower-triangular boolean matrix (True = allowed) and set the disallowed scores to <code>-inf</code> <em>before</em> softmax, so they get weight exactly 0 and every row still sums to 1. microgpt stores the inverse, <code>triu(diagonal=1)</code> meaning "blocked", and calls <code>masked_fill(mask, -inf)</code>; it's the same thing. Register it once as a buffer of size <code>block_size</code> and slice <code>[:T, :T]</code>.</p>
+<div class="code" data-lang="python">
+<pre><code>T = 4
+mask = torch.tril(torch.ones(T, T, dtype=torch.bool))
+print(mask)
+# tensor([[ True, False, False, False],
+#         [ True,  True, False, False],
+#         [ True,  True,  True, False],
+#         [ True,  True,  True,  True]])
+torch.manual_seed(0)
+w = torch.randn(T, T).masked_fill(~mask, float("-inf")).softmax(dim=-1)
+print(w)
+# tensor([[1.0000, 0.0000, 0.0000, 0.0000],
+#         [0.5391, 0.4609, 0.0000, 0.0000],
+#         [0.4478, 0.0917, 0.4604, 0.0000],
+#         [0.1340, 0.4099, 0.3632, 0.0928]])</code></pre>
+</div>
+</div>
+
+<div class="qa">
+<div class="qa-q" id="q33">What is <code>F.scaled_dot_product_attention</code>, and why use it?</div>
+<p>One call that computes <code>softmax(q kᵀ / √d + mask) v</code> on <code>(B, H, T, D)</code> inputs and dispatches to the best kernel available: FlashAttention or memory-efficient attention on CUDA (neither materialises the <code>T x T</code> score matrix), a fused kernel on CPU, or a plain math fallback. Use <code>is_causal=True</code> for decoder self-attention. The trap: a boolean <code>attn_mask</code> means True = <em>may attend</em>, the opposite of <code>masked_fill</code>'s True = blocked.</p>
+<div class="code" data-lang="python">
+<pre><code>torch.manual_seed(0)
+B, H, T, D = 2, 4, 16, 4
+q, k, v = (torch.randn(B, H, T, D) for _ in range(3))
+mask = torch.tril(torch.ones(T, T, dtype=torch.bool))
+att = (q @ k.transpose(-2, -1)) / D**0.5
+manual = att.masked_fill(~mask, float("-inf")).softmax(-1) @ v
+fused = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+print((manual - fused).abs().max())     # tensor(2.3842e-07)</code></pre>
+</div>
+</div>
+
+<div class="qa">
+<div class="qa-q" id="q34">Walk through the shapes in multi-head attention.</div>
+<p>Project <code>(B, T, C)</code> to q, k, v, each <code>(B, T, C)</code>. Split C into H heads of size <code>D = C / H</code> with <code>view(B, T, H, D)</code>, then <code>transpose(1, 2)</code> to <code>(B, H, T, D)</code> so the heads become a batch dimension. Scores are <code>(B, H, T, T)</code>, the weighted values <code>(B, H, T, D)</code>; transpose back and merge to <code>(B, T, C)</code>. microgpt does the same with no B: <code>view(T, H, D).transpose(0, 1)</code>.</p>
+<div class="code" data-lang="python">
+<pre><code>B, T, C, H = 2, 5, 16, 4
+D = C // H
+x = torch.randn(B, T, C)
+q = nn.Linear(C, C, bias=False)(x)
+print(q.shape)                                    # torch.Size([2, 5, 16])
+qh = q.view(B, T, H, D).transpose(1, 2)
+print(qh.shape)                                   # torch.Size([2, 4, 5, 4])
+scores = qh @ qh.transpose(-2, -1)
+print(scores.shape)                               # torch.Size([2, 4, 5, 5])
+y = (scores.softmax(-1) @ qh).transpose(1, 2).reshape(B, T, C)
+print(y.shape)                                    # torch.Size([2, 5, 16])</code></pre>
+</div>
+</div>
+
+<div class="qa">
+<div class="qa-q" id="q35">RMSNorm vs LayerNorm?</div>
+<p>LayerNorm computes <code>(x - mean) / sqrt(var + eps) * weight + bias</code>. RMSNorm computes <code>x / sqrt(mean(x²) + eps) * weight</code>: no mean subtraction, no bias, one reduction instead of two, and in practice it trains as well; LLaMA-family models use it. Your <code>rms_norm</code> is <code>F.rms_norm</code> with no weight. <code>nn.RMSNorm</code> (PyTorch 2.4+) adds a learnable per-channel weight unless you pass <code>elementwise_affine=False</code>.</p>
+<div class="code" data-lang="python">
+<pre><code>x = torch.tensor([[3.0, 4.0]])
+print(F.rms_norm(x, (2,), eps=1e-5))     # tensor([[0.8485, 1.1314]])
+print(nn.LayerNorm(2)(x))                # tensor([[-1.0000,  1.0000]], grad_fn=&lt;NativeLayerNormBackward0&gt;)
+print([n for n, _ in nn.RMSNorm(16).named_parameters()])     # ['weight']
+print([n for n, _ in nn.LayerNorm(16).named_parameters()])   # ['weight', 'bias']</code></pre>
+</div>
+</div>
+
+<div class="qa">
+<div class="qa-q" id="q36">What does <code>nn.Embedding</code> compute?</div>
+<p>Mathematically <code>one_hot(ids) @ W</code>; in practice it is row indexing, O(C) per token instead of O(V·C). Its gradient is nonzero only for rows that were looked up, and a row used twice gets the sum. microgpt's <code>token_embedding_table[token_ids]</code> is the same lookup on a raw <code>Parameter</code>.</p>
+<div class="code" data-lang="python">
+<pre><code>torch.manual_seed(0)
+emb = nn.Embedding(27, 16)
+ids = torch.tensor([26, 0, 26])
+print(torch.allclose(emb(ids), F.one_hot(ids, 27).float() @ emb.weight))   # True
+emb(ids).sum().backward()
+print(emb.weight.grad[26, :3], emb.weight.grad[0, :3])
+# tensor([2., 2., 2.]) tensor([1., 1., 1.])</code></pre>
+</div>
+</div>
+
+<div class="qa">
+<div class="qa-q" id="q37">What is weight tying, and how do you do it?</div>
+<p>The token embedding is <code>(V, C)</code> and the output head's weight is also <code>(V, C)</code>, since <code>nn.Linear</code> stores <code>[out, in]</code>. Tying makes them one <code>Parameter</code>: it saves V·C parameters (a lot when V is 128k) and often helps small models. <code>parameters()</code> de-duplicates shared tensors, so the count and the optimizer see it once; <code>state_dict</code> still lists both names. microgpt doesn't tie; tying would remove 432 of its 4,192 parameters.</p>
+<div class="code" data-lang="python">
+<pre><code>class Tiny(nn.Module):
+    def __init__(self, tie):
+        super().__init__()
+        self.tok = nn.Embedding(27, 16)
+        self.head = nn.Linear(16, 27, bias=False)
+        if tie:
+            self.head.weight = self.tok.weight
+
+print(sum(p.numel() for p in Tiny(False).parameters()))   # 864
+print(sum(p.numel() for p in Tiny(True).parameters()))    # 432
+print(list(Tiny(True).state_dict().keys()))               # ['tok.weight', 'head.weight']</code></pre>
+</div>
+</div>
+
+<div class="qa">
+<div class="qa-q" id="q38">How many parameters does a transformer block have?</div>
+<p>About <code>12·d²</code> for width <code>d</code> with a 4x MLP: attention has q, k, v and output projections (<code>4d²</code>), the MLP has <code>d·4d + 4d·d = 8d²</code>. Biases and norm weights add a little: <code>nn.Linear(16, 16)</code> has 272 parameters, 256 with <code>bias=False</code>. Then add embeddings (<code>V·d</code>, plus <code>block_size·d</code> for learned positions) and an untied head (<code>V·d</code>). microgpt: <code>12·16² = 3,072</code> in the block plus <code>27·16 + 16·16 + 27·16 = 1,120</code> gives 4,192. With <code>d = 4096</code> and 32 layers, <code>12·32·4096²</code> ≈ 6.44B, which is most of a "7B" model.</p>
+<div class="code" data-lang="python">
+<pre><code>print(sum(p.numel() for p in nn.Linear(16, 16).parameters()))               # 272
+print(sum(p.numel() for p in nn.Linear(16, 16, bias=False).parameters()))   # 256
+C, V, T = 16, 27, 16
+print(12 * C * C, V * C + T * C + V * C, 12 * C * C + V * C + T * C + V * C)   # 3072 1120 4192</code></pre>
+</div>
+</div>
+
+<div class="qa">
+<div class="qa-q" id="q39">Why are targets the inputs shifted by one, and what shape does <code>cross_entropy</code> want?</div>
+<p>In a causal language model the logits at position <code>t</code> predict token <code>t + 1</code>, so <code>inputs = ids[:-1]</code> and <code>targets = ids[1:]</code>, which is microgpt's <code>make_training_pair</code>. <code>F.cross_entropy</code> wants the class dimension second: <code>(N, C)</code> with targets <code>(N,)</code>, or <code>(N, C, d1)</code> with targets <code>(N, d1)</code>. For <code>(B, T, V)</code> logits, flatten to <code>(B·T, V)</code> or transpose to <code>(B, V, T)</code>. Passing <code>(B, T, V)</code> directly raises an error, or, if T happens to equal V, silently computes nonsense.</p>
+<div class="code" data-lang="python">
+<pre><code>ids = torch.tensor([26, 4, 12, 12, 0, 26])          # BOS e m m a BOS
+print(ids[:-1].tolist(), ids[1:].tolist())          # [26, 4, 12, 12, 0] [4, 12, 12, 0, 26]
+torch.manual_seed(0)
+B, T, V = 2, 5, 27
+logits, targets = torch.randn(B, T, V), torch.randint(0, V, (B, T))
+print(F.cross_entropy(logits.view(-1, V), targets.view(-1)))   # tensor(3.9079)
+print(F.cross_entropy(logits.transpose(1, 2), targets))       # tensor(3.9079)
+F.cross_entropy(logits, targets)
+# RuntimeError: Expected target size [2, 27], got [2, 5]</code></pre>
+</div>
+</div>
+
+<div class="qa">
+<div class="qa-q" id="q40">How do you batch sequences of different lengths?</div>
+<p>Pad to the longest sequence in the batch. Right-pad the inputs with any valid token id and set the padded <em>targets</em> to <code>ignore_index</code> (-100 by default): <code>cross_entropy</code> skips them and averages over real tokens only. With a causal mask, right padding cannot affect real positions (they never look ahead), so training needs no extra attention mask. Left padding, common in batched generation so every prompt ends at the same column, does need a key-padding mask and shifted position ids. Across batches, sum the loss and divide by the real-token count instead of averaging batch means.</p>
+<div class="code" data-lang="python">
+<pre><code>torch.manual_seed(0)
+logits = torch.randn(2, 4, 27)
+targets = torch.tensor([[4, 12, 0, 26],
+                        [1, 26, -100, -100]])        # second row padded
+loss = F.cross_entropy(logits.view(-1, 27), targets.view(-1))
+keep = targets.view(-1) != -100
+manual = F.cross_entropy(logits.view(-1, 27)[keep], targets.view(-1)[keep])
+print(loss, manual, keep.sum().item())               # tensor(3.7283) tensor(3.7283) 6</code></pre>
+</div>
+</div>
+
+<h2 id="inference-perf">Inference, performance &amp; precision (41–50)</h2>
+
+<div class="qa">
+<div class="qa-q" id="q41">How much memory does the KV cache take?</div>
+<p><code>2 (K and V) × n_layers × n_kv_heads × head_dim × seq_len × batch × bytes_per_element</code>. For a Llama-2-7B shape (32 layers, 32 KV heads, head_dim 128, fp16) that is 0.5 MiB per token, so a 4,096-token sequence holds 2 GiB of cache. Grouped-query attention with 8 KV heads cuts it to 0.5 GiB. In serving, the KV cache, not the weights, is what limits batch size times context length. microgpt's whole cache is 2,048 bytes.</p>
+<div class="code" data-lang="python">
+<pre><code>def kv_cache_bytes(n_layers, n_kv_heads, head_dim, seq_len, batch, bytes_per_elem):
+    return 2 * n_layers * n_kv_heads * head_dim * seq_len * batch * bytes_per_elem
+
+print(kv_cache_bytes(32, 32, 128, 1, 1, 2) / 2**20)       # 0.5     (MiB per token)
+print(kv_cache_bytes(32, 32, 128, 4096, 1, 2) / 2**30)    # 2.0     (GiB)
+print(kv_cache_bytes(32, 8, 128, 4096, 1, 2) / 2**30)     # 0.5     (GiB, 8 KV heads)
+print(kv_cache_bytes(1, 4, 4, 16, 1, 4))                  # 2048    (bytes, microgpt fp32)</code></pre>
+</div>
+</div>
+
+<div class="qa">
+<div class="qa-q" id="q42">Explain temperature, top-k and top-p.</div>
+<p>Temperature divides the logits before softmax: below 1 sharpens toward the argmax, above 1 flattens, and the limit at 0 is greedy decoding. Top-k keeps the k highest-scoring tokens; top-p (nucleus) keeps the smallest set of top tokens whose cumulative probability reaches p. Everything else gets <code>-inf</code> and the survivors are renormalised. The usual order is temperature, then top-k, then top-p, then sample. microgpt's <code>generate_name</code> uses temperature only.</p>
+<div class="code" data-lang="python">
+<pre><code>def sample_next(logits, temperature=1.0, top_k=None, top_p=None, generator=None):
+    logits = logits / temperature
+    if top_k is not None:
+        kth = torch.topk(logits, top_k).values[..., -1, None]
+        logits = logits.masked_fill(logits &lt; kth, float("-inf"))
+    if top_p is not None:
+        sorted_logits, idx = torch.sort(logits, descending=True)
+        probs = sorted_logits.softmax(-1)
+        drop = probs.cumsum(-1) - probs &gt;= top_p          # mass before this token already enough
+        sorted_logits = sorted_logits.masked_fill(drop, float("-inf"))
+        logits = torch.full_like(logits, float("-inf")).scatter(-1, idx, sorted_logits)
+    probs = logits.softmax(-1)
+    return torch.multinomial(probs, 1, generator=generator), probs
+
+logits = torch.tensor([2.0, 1.0, 0.5, 0.0, -1.0])
+for t in (0.5, 1.0, 2.0):
+    print(t, (logits / t).softmax(-1).numpy().round(3))
+# 0.5 [0.829 0.112 0.041 0.015 0.002]
+# 1.0 [0.563 0.207 0.126 0.076 0.028]
+# 2.0 [0.375 0.227 0.177 0.138 0.084]
+print(sample_next(logits, top_k=2)[1].numpy().round(3))     # [0.731 0.269 0.    0.    0.   ]
+print(sample_next(logits, top_p=0.8)[1].numpy().round(3))   # [0.629 0.231 0.14  0.    0.   ]</code></pre>
+</div>
+</div>
+
+<div class="qa">
+<div class="qa-q" id="q43">Why is decode memory-bound and prefill compute-bound?</div>
+<p>Arithmetic intensity is FLOPs per byte moved from memory. Decoding one token at batch 1 multiplies each weight matrix by a single vector: each 2-byte fp16 weight is read once and used for 2 FLOPs (a multiply and an add), about 1 FLOP/byte. An H100 SXM's spec sheet gives about 989 TFLOPS dense BF16 and 3.35 TB/s of HBM bandwidth, a ridge point near 295 FLOP/byte, so decode sits two orders of magnitude below it and its time is bytes divided by bandwidth: a 7B fp16 model (14 GB) is capped near 3.35e12 / 14e9 ≈ 239 tokens/s at batch 1, however fast the tensor cores are. Prefill pushes T prompt tokens through each weight at once (matrix times matrix), so intensity grows with T and becomes compute-bound. Batching decode requests is the main lever: B sequences share one read of the weights, until KV-cache reads dominate.</p>
+</div>
+
+<div class="qa">
+<div class="qa-q" id="q44">How do you time GPU code correctly?</div>
+<p>CUDA kernel launches are asynchronous: the Python call returns when the kernel is queued, not when it has finished. Wrapping a GPU op in <code>time.perf_counter()</code> measures launch overhead unless you call <code>torch.cuda.synchronize()</code> before reading the clock each time. Warm up first (the first calls pay for context creation, cuBLAS heuristics, autotuning and compilation), repeat, and report the median. CUDA events or <code>torch.utils.benchmark.Timer</code> (which synchronises and warms up for you) do this properly. The event version below needs a CUDA GPU; the <code>Timer</code> version also runs on CPU.</p>
+<div class="code" data-lang="python">
+<pre><code>x = torch.randn(4096, 4096, device="cuda")
+for _ in range(3):                         # warm-up
+    x @ x
+torch.cuda.synchronize()
+start = torch.cuda.Event(enable_timing=True)
+end = torch.cuda.Event(enable_timing=True)
+start.record()
+for _ in range(10):
+    x @ x
+end.record()
+torch.cuda.synchronize()                   # wait until 'end' has really happened
+print(start.elapsed_time(end) / 10, "ms per matmul")
+
+import torch.utils.benchmark as benchmark
+print(benchmark.Timer(stmt="x @ x", globals={"x": x}).blocked_autorange(min_run_time=1.0))</code></pre>
+</div>
+</div>
+
+<div class="qa">
+<div class="qa-q" id="q45">What is a hidden sync, and which calls cause one?</div>
+<p>A sync is any point where the CPU has to wait for the GPU to finish queued work, which kills the overlap that keeps the GPU busy. The hidden ones: <code>.item()</code>, <code>.tolist()</code>, <code>.cpu()</code> and <code>.numpy()</code>, <code>print(tensor)</code>, <code>if loss &gt; 0:</code> on a CUDA tensor, <code>torch.nonzero</code> and boolean-mask indexing <code>x[mask]</code> (the output size depends on the data), and blocking device-to-host copies. Find them with <code>torch.cuda.set_sync_debug_mode("warn")</code> or as <code>cudaStreamSynchronize</code> and device-to-host memcpy entries in the profiler. The usual fix is to keep running metrics on the GPU and read them every N steps. This needs a CUDA GPU to observe.</p>
+<div class="code" data-lang="python">
+<pre><code>torch.cuda.set_sync_debug_mode("warn")         # warn on every synchronising call
+running = torch.zeros((), device="cuda")
+for step, (x, y) in enumerate(loader):
+    loss = train_step(x, y)
+    running += loss.detach()                   # stays on the GPU: no sync
+    if step % 100 == 99:
+        print(step, (running / 100).item())    # one sync per 100 steps
+        running.zero_()</code></pre>
+</div>
+</div>
+
+<div class="qa">
+<div class="qa-q" id="q46">What is a <code>torch.compile</code> graph break, and how do you find one?</div>
+<p><code>torch.compile</code> uses TorchDynamo to trace your Python bytecode into FX graphs, then a backend (Inductor by default) fuses ops and generates kernels. When Dynamo meets something it can't put in a graph (a <code>print</code>, a branch on tensor data such as <code>if x.sum() &gt; 0</code>, <code>.item()</code> fed to Python, an unsupported library call) it ends the graph, runs that piece as normal Python and starts a new graph. Each break loses fusion, adds overhead, and can trigger recompiles. Find them with <code>torch._dynamo.explain</code>, with <code>TORCH_LOGS="graph_breaks"</code>, or make them errors with <code>fullgraph=True</code>.</p>
+<div class="code" data-lang="python">
+<pre><code>import torch._dynamo as dynamo
+
+def f(x):
+    y = x.sin()
+    print("hi")            # Python side effect: can't go in a graph
+    return y.cos()
+
+ex = dynamo.explain(f)(torch.randn(4))         # runs f once, so "hi" is printed
+print(ex.graph_count, ex.graph_break_count)    # 2 1
+print(ex.break_reasons[0].reason.splitlines()[0])
+# Failed to trace builtin operator</code></pre>
+</div>
+</div>
+
+<div class="qa">
+<div class="qa-q" id="q47">fp16 vs bf16?</div>
+<p>Both are 16 bits. fp16 has 5 exponent and 10 mantissa bits: max 65504, smallest normal about 6.1e-5, so activations overflow and gradients underflow unless you scale the loss. bf16 has 8 exponent and 7 mantissa bits: the same range as fp32 (max about 3.39e38) but only 2–3 significant decimal digits (eps 0.0078). Range matters more than precision for training, so bf16 is the default on GPUs that support it (Ampere and newer); fp16 is more precise for values inside its range.</p>
+<div class="code" data-lang="python">
+<pre><code>for dt in (torch.float16, torch.bfloat16):
+    fi = torch.finfo(dt)
+    print(dt, fi.max, fi.eps, fi.tiny)
+# torch.float16 65504.0 0.0009765625 6.103515625e-05
+# torch.bfloat16 3.3895313892515355e+38 0.0078125 1.1754943508222875e-38
+print(torch.tensor(70000.0).to(torch.float16))       # tensor(inf, dtype=torch.float16)
+print(torch.tensor(70000.0).to(torch.bfloat16))      # tensor(70144., dtype=torch.bfloat16)
+print(torch.tensor(1 + 1 / 256).to(torch.bfloat16))  # tensor(1., dtype=torch.bfloat16)
+print(torch.tensor(1 + 1 / 256).to(torch.float16))   # tensor(1.0039, dtype=torch.float16)</code></pre>
+</div>
+</div>
+
+<div class="qa">
+<div class="qa-q" id="q48">What does <code>GradScaler</code> do, and when do you need it?</div>
+<p>In fp16, small gradients flush to zero: <code>1e-8</code> becomes exactly 0. <code>GradScaler</code> multiplies the loss by a scale S (default 65536) before backward so gradients are S times larger and representable, then divides them back before the optimizer step. If any gradient is <code>inf</code> or <code>nan</code>, it skips that step and halves S; after 2,000 clean steps it doubles S. Call <code>scaler.unscale_(optimizer)</code> before clipping so the clip sees true norms. You need it for fp16 training only, not bf16 or fp32. The loop below needs a CUDA GPU.</p>
+<div class="code" data-lang="python">
+<pre><code>print(torch.tensor(1e-8).to(torch.float16))            # tensor(0., dtype=torch.float16)
+print(torch.tensor(1e-8 * 65536).to(torch.float16))    # tensor(0.0007, dtype=torch.float16)
+
+scaler = torch.amp.GradScaler("cuda")
+for x, y in loader:
+    optimizer.zero_grad(set_to_none=True)
+    with torch.autocast(device_type="cuda", dtype=torch.float16):
+        loss = F.cross_entropy(model(x).view(-1, V), y.view(-1))
+    scaler.scale(loss).backward()          # backward on loss * S
+    scaler.unscale_(optimizer)             # true-scale grads, so clipping is correct
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    scaler.step(optimizer)                 # skipped if any grad is inf/nan
+    scaler.update()                        # adjust S</code></pre>
+</div>
+</div>
+
+<div class="qa">
+<div class="qa-q" id="q49">How much memory per parameter does training take?</div>
+<p>Plain fp32 training with Adam: weights 4 bytes + gradients 4 + Adam's <code>m</code> 4 + <code>v</code> 4 = <strong>16 bytes per parameter</strong>. Mixed precision with 16-bit working weights and an fp32 master copy is also 16: 2 + 2 + 4 + 4 + 4 (the ZeRO paper's "2 + 2 + 12"). A 7B model therefore needs about 112 GB for weights and optimizer state before any activations, against 14 GB to serve it in bf16. Activations grow with batch × sequence × layers × width; gradient checkpointing trades them for recompute. microgpt: 4,192 × 16 = 67,072 bytes.</p>
+</div>
+
+<div class="qa">
+<div class="qa-q" id="q50">What does <code>torch.autocast</code> actually change?</div>
+<p>Inside <code>torch.autocast(device_type, dtype)</code>, each op picks its own dtype: matmuls, linears and convolutions run in the low-precision dtype (that's where tensor cores pay off), while precision-sensitive ops such as losses and large reductions run in fp32. The weights stay fp32; autocast casts copies on the fly, so it is not <code>model.half()</code>. Backward automatically uses the same dtypes as forward, so don't put <code>backward()</code> inside the context. The per-op lists differ by device: on CUDA, <code>softmax</code> and <code>log_softmax</code> run in fp32, while on CPU (below) they stay bf16.</p>
+<div class="code" data-lang="python">
+<pre><code>torch.manual_seed(0)
+lin = nn.Linear(16, 27)
+x = torch.randn(4, 16)
+with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+    out = lin(x)
+    sm = F.softmax(out, dim=-1)
+    ce = F.cross_entropy(out, torch.zeros(4, dtype=torch.long))
+print(lin.weight.dtype, out.dtype, sm.dtype, ce.dtype)
+# torch.float32 torch.bfloat16 torch.bfloat16 torch.float32</code></pre>
+</div>
+</div>
+
+<div class="page-nav">
+  <a href="12-debugging.html"><span class="lbl">← Prev</span><span class="ttl">Debugging PyTorch</span></a>
+  <a href="14-capstone.html" class="next"><span class="lbl">Next →</span><span class="ttl">Capstone Project</span></a>
+</div>
+
+</main>
+</div>
+<script src="../assets/site.js"></script>
+</body>
+</html>

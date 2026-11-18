@@ -1,0 +1,1117 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>12 · Debugging PyTorch — PyTorch</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<button class="sidebar-toggle" aria-label="Toggle navigation">☰ Menu</button>
+<div class="layout">
+<aside class="sidebar">
+  <a href="../index.html" class="brand">PyTorch</a>
+  <span class="brand-sub">a deep dive — 2026</span>
+  <nav>
+    <ol>
+      <li><a href="01-why-pytorch.html">Why PyTorch</a></li>
+      <li><a href="02-tensors.html">Tensors</a></li>
+      <li><a href="03-tensor-math.html">Tensor Math &amp; Broadcasting</a></li>
+      <li><a href="04-autograd.html">Autograd</a></li>
+      <li><a href="05-nn-module.html">nn.Module</a></li>
+      <li><a href="06-transformer-blocks.html">Building a Transformer</a></li>
+      <li><a href="07-losses-optimizers.html">Losses &amp; Optimizers</a></li>
+      <li><a href="08-training-loop.html">The Training Loop</a></li>
+      <li><a href="09-devices-precision.html">Devices &amp; Precision</a></li>
+      <li><a href="10-inference.html">Inference &amp; Sampling</a></li>
+      <li><a href="11-performance.html">Performance &amp; Profiling</a></li>
+      <li><a href="12-debugging.html">Debugging PyTorch</a></li>
+      <li><a href="13-50-questions.html">The 50 Questions</a></li>
+      <li><a href="14-capstone.html">Capstone Project</a></li>
+    </ol>
+    <div class="extras">
+      <a href="../exercises.html">All Exercises</a>
+      <a href="../index.html">← Home</a>
+    </div>
+  </nav>
+  <div class="progress"></div>
+</aside>
+
+<main class="content">
+
+<h1>
+  <span class="chap-num">Chapter 12</span>
+  Debugging PyTorch
+</h1>
+<p class="lede">
+  PyTorch bugs come in two kinds: the ones that crash with a message you
+  have to decode, and the ones that run and quietly produce wrong numbers.
+  The second kind is worse. This chapter reads real error messages, shows
+  the silent bugs that cost people days, tracks down NaNs, gives a
+  checklist for a loss that won't go down, and ends with the strongest
+  tool you have: testing the tensor code against a reference, including
+  a scalar one in the style of <code>microgpt_scalar.py</code>.
+</p>
+
+<h2 id="reading-errors">Reading the error</h2>
+
+<p>PyTorch errors are long, but the useful part is short: the last line of the traceback names the operation (often as "while checking arguments for <em>op</em>") and the offending shapes, devices or dtypes. Read it before you read the stack. Each example below shows the real first line of the message from PyTorch 2.8 and the fix.</p>
+
+<h4>Shape mismatch in a matmul</h4>
+<div class="code" data-lang="python">
+<pre><code>import torch
+import torch.nn.functional as F
+
+x = torch.randn(4, 16)                # (B, E_in)
+W = torch.randn(64, 16)               # [out][in], like microgpt
+x @ W
+# RuntimeError: mat1 and mat2 shapes cannot be multiplied (4x16 and 64x16)</code></pre>
+</div>
+<p><code>mat1 @ mat2</code> needs <code>mat1</code>'s last dimension to equal <code>mat2</code>'s first: here 16 against 64. microgpt stores weights <code>[out][in]</code>, so the product is <code>x @ W.T</code>, which is what <code>F.linear(x, W)</code> computes. Both give <code>(4, 64)</code>. If you see the same message from <code>F.linear</code>, the weight was stored <code>[in][out]</code>.</p>
+
+<h4>Device mismatch</h4>
+<p>Every tensor in one op must live on the same device. The wording depends on the op, so learn to recognise all of these (from the <code>mps</code> backend on a Mac):</p>
+<div class="code" data-lang="python">
+<pre><code>emb = torch.nn.Embedding(27, 16).to("mps")
+x.to("mps") @ W.T
+# RuntimeError: Tensor for argument #2 'mat2' is on CPU, but expected it to be on GPU
+#   (while checking arguments for mm)
+F.linear(x, W.to("mps"))
+# RuntimeError: Tensor for argument input is on cpu but expected on mps
+emb(torch.tensor([1, 2, 3]))
+# RuntimeError: Placeholder storage has not been allocated on MPS device!
+torch.randn(3, device="mps") + torch.randn(3)
+# RuntimeError: Expected all tensors to be on the same device, but found at least
+#   two devices, mps:0 and cpu!</code></pre>
+</div>
+<p>The third one is famously unhelpful: it means "an input of an MPS op is on the CPU", here the token ids fed to an embedding that was moved to <code>mps</code>. The last one is the generic check, and on an NVIDIA machine it names <code>cuda:0</code> instead of <code>mps:0</code>. The fix is always the same: pick one <code>device</code>, move the model with <code>model.to(device)</code>, and create or move every input with <code>device=device</code>, as microgpt's <code>make_training_pair</code> does.</p>
+
+<h4>Dtype mismatch</h4>
+<div class="code" data-lang="python">
+<pre><code>ids = torch.tensor([[1, 2, 3]])                  # int64 ("Long") token ids
+ids @ torch.randn(3, 4)
+# RuntimeError: expected m1 and m2 to have the same dtype, but got: long long != float
+logits = torch.randn(4, 27)
+F.cross_entropy(logits, torch.tensor([1.0, 2.0, 3.0, 4.0]))
+# RuntimeError: expected scalar type Long but found Float
+F.cross_entropy(logits, torch.tensor([1, 2, 3, 4], dtype=torch.int32))
+# RuntimeError: expected scalar type Long but found Int
+torch.nn.Embedding(27, 16)(torch.tensor([1.0, 2.0]))
+# RuntimeError: Expected tensor for argument #1 'indices' to have one of the following
+#   scalar types: Long, Int; but got torch.FloatTensor instead (while checking arguments for embedding)</code></pre>
+</div>
+<p>Matmul does not promote between integer and float; convert with <code>.float()</code>. Class-index targets for <code>cross_entropy</code> must be <code>int64</code>: <code>.long()</code>. One trap: if float targets have the <em>same shape</em> as the logits, <code>cross_entropy</code> does not complain, because it reads them as per-class probabilities. That is a legitimate feature (soft labels) and a silent bug if you meant class indices.</p>
+
+<h4><code>view</code> on a non-contiguous tensor</h4>
+<p>After attention, <code>att @ v</code> is <code>(B, H, T, D)</code> and you need <code>(B, T, E)</code>. A transpose changes only the strides (Chapter 2), so the data is no longer laid out in the order <code>view</code> needs:</p>
+<div class="code" data-lang="python">
+<pre><code>y = torch.randn(2, 4, 16, 4)           # att @ v: (B, H, T, D), contiguous
+t = y.transpose(1, 2)                  # (B, T, H, D): same memory, new strides
+print(t.shape, t.stride(), t.is_contiguous())
+# torch.Size([2, 16, 4, 4]) (256, 4, 64, 1) False
+t.view(2, 16, 16)
+# RuntimeError: view size is not compatible with input tensor's size and stride (at least
+#   one dimension spans across two contiguous subspaces). Use .reshape(...) instead.
+print(t.reshape(2, 16, 16).shape)              # torch.Size([2, 16, 16]): copies when it has to
+print(t.contiguous().view(2, 16, 16).shape)    # torch.Size([2, 16, 16]): explicit copy, then view</code></pre>
+</div>
+<p>This is why <code>FastMicroGPT</code> writes <code>.transpose(0, 1).reshape(...)</code>. Treat the error as information, not an obstacle: it tells you the memory order differs from the logical order. Exercise 12.5 shows a bug that switching to <code>reshape</code> silenced.</p>
+
+<h2 id="shape-discipline">Shape discipline</h2>
+
+<p>Most transformer bugs are shape bugs, and many of them do not crash. Three habits catch them early.</p>
+<ul>
+  <li><strong>Name the dimensions in comments.</strong> Pick letters once and use them everywhere: <code>B</code> batch, <code>T</code> sequence length, <code>E</code> embedding, <code>H</code> heads, <code>D</code> head size, <code>V</code> vocabulary. Write the shape next to every line that changes it.</li>
+  <li><strong>Assert shapes at boundaries</strong>, with the actual shape in the message: <code>assert q.shape == (B, H, T, D), q.shape</code>. An assert costs nanoseconds and turns a silent bug into a crash at the right line.</li>
+  <li><strong>Print every module's output shape once</strong>, with forward hooks.</li>
+</ul>
+
+<p>A <strong>forward hook</strong> is a function PyTorch calls after a module's <code>forward</code> returns, with <code>(module, inputs, output)</code>. <code>register_forward_hook</code> returns a handle; hooks stay installed until you call <code>handle.remove()</code>. To see them work we need a model built from submodules. Here is microgpt as <code>nn.Module</code>s (Chapter 6 style): same sizes, same 4,192 parameters, with Q, K and V packed into one <code>(48, 16)</code> weight.</p>
+
+<div class="code" data-lang="python">
+<div class="code-hdr"><span class="lang">python</span><span class="title">debug_gpt.py</span></div>
+<pre><code>import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class Attention(nn.Module):
+    def __init__(self, n_embd=16, n_head=4):
+        super().__init__()
+        self.n_head = n_head
+        self.qkv = nn.Linear(n_embd, 3 * n_embd, bias=False)
+        self.proj = nn.Linear(n_embd, n_embd, bias=False)
+
+    def forward(self, x):                                    # x: (B, T, E)
+        B, T, E = x.shape
+        q, k, v = self.qkv(x).split(E, dim=-1)               # 3 x (B, T, E)
+        q, k, v = (t.view(B, T, self.n_head, E // self.n_head).transpose(1, 2)
+                   for t in (q, k, v))                       # 3 x (B, H, T, D)
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        return self.proj(y.transpose(1, 2).reshape(B, T, E))
+
+
+class MLP(nn.Module):
+    def __init__(self, n_embd=16):
+        super().__init__()
+        self.fc = nn.Linear(n_embd, 4 * n_embd, bias=False)
+        self.proj = nn.Linear(4 * n_embd, n_embd, bias=False)
+
+    def forward(self, x):
+        return self.proj(F.relu(self.fc(x)))
+
+
+class GPT(nn.Module):
+    def __init__(self, vocab_size=27, n_embd=16, block_size=16):
+        super().__init__()
+        self.tok = nn.Embedding(vocab_size, n_embd)
+        self.pos = nn.Embedding(block_size, n_embd)
+        self.norm1 = nn.RMSNorm(n_embd, eps=1e-5, elementwise_affine=False)
+        self.attn = Attention(n_embd)
+        self.norm2 = nn.RMSNorm(n_embd, eps=1e-5, elementwise_affine=False)
+        self.mlp = MLP(n_embd)
+        self.head = nn.Linear(n_embd, vocab_size, bias=False)
+
+    def forward(self, idx):                                  # idx: (B, T)
+        T = idx.shape[1]
+        x = self.tok(idx) + self.pos(torch.arange(T, device=idx.device))
+        x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
+        return self.head(x)                                  # (B, T, V)</code></pre>
+</div>
+
+<p>The rest of the chapter runs in the same session after this file.</p>
+
+<div class="code" data-lang="python">
+<pre><code>def show_shapes(model):
+    handles = []
+    for name, module in model.named_modules():
+        if name == "":                                       # skip the root module
+            continue
+
+        def hook(module, inputs, output, name=name):
+            print(f"{name:10} {type(module).__name__:10} -&gt; {tuple(output.shape)}")
+        handles.append(module.register_forward_hook(hook))
+    return handles
+
+
+torch.manual_seed(0)
+model = GPT()
+print(sum(p.numel() for p in model.parameters()))            # 4192
+handles = show_shapes(model)
+logits = model(torch.randint(0, 27, (2, 10)))
+for h in handles:
+    h.remove()                                               # hooks stay until removed
+model(torch.randint(0, 27, (2, 10)))                         # silent now</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>4192
+tok        Embedding  -&gt; (2, 10, 16)
+pos        Embedding  -&gt; (10, 16)
+norm1      RMSNorm    -&gt; (2, 10, 16)
+attn.qkv   Linear     -&gt; (2, 10, 48)
+attn.proj  Linear     -&gt; (2, 10, 16)
+attn       Attention  -&gt; (2, 10, 16)
+norm2      RMSNorm    -&gt; (2, 10, 16)
+mlp.fc     Linear     -&gt; (2, 10, 64)
+mlp.proj   Linear     -&gt; (2, 10, 16)
+mlp        MLP        -&gt; (2, 10, 16)
+head       Linear     -&gt; (2, 10, 27)</code></pre>
+</div>
+<p>Hooks fire in execution order, children before their parent finishes, so this doubles as a trace of what the model actually ran. <code>name=name</code> in the inner function's defaults freezes the loop variable; without it every hook would print the last name.</p>
+
+<h2 id="silent-bugs">Bugs that don't crash</h2>
+
+<h4>Broadcasting <code>(B, 1)</code> against <code>(B,)</code></h4>
+<p>A model that predicts one number per example often returns <code>(B, 1)</code>; targets are often <code>(B,)</code>. Broadcasting (Chapter 3) lines them up from the right and stretches both into <code>(B, B)</code>: every prediction is compared with every target.</p>
+<div class="code" data-lang="python">
+<pre><code>pred = torch.tensor([[1.0], [2.0], [3.0], [4.0]])     # (4, 1): a model's output
+y = torch.tensor([1.0, 2.0, 3.0, 4.0])                # (4,): the targets
+print((pred - y).shape)                               # torch.Size([4, 4]), not (4,)!
+print(((pred - y) ** 2).mean())                       # tensor(2.5000), should be 0
+print(((pred.squeeze(1) - y) ** 2).mean())            # tensor(0.): the fix
+print(F.mse_loss(pred, y))                            # tensor(2.5000), with a warning</code></pre>
+</div>
+<p>The predictions are perfect and the loss says 2.5. <code>F.mse_loss</code> at least warns: <code>UserWarning: Using a target size (torch.Size([4])) that is different to the input size (torch.Size([4, 1])). This will likely lead to incorrect results due to broadcasting.</code> A hand-written loss says nothing.</p>
+
+<h4>Softmax over the wrong dimension</h4>
+<div class="code" data-lang="python">
+<pre><code>torch.manual_seed(0)
+logits = torch.randn(3, 5)                 # (B=3, V=5)
+wrong = F.softmax(logits, dim=0)           # normalises over the batch
+right = F.softmax(logits, dim=-1)          # normalises over the vocabulary
+print(wrong.sum(dim=-1))                   # tensor([1.6968, 1.8793, 1.4239])
+print(right.sum(dim=-1))                   # tensor([1.0000, 1.0000, 1.0000])</code></pre>
+</div>
+<p>Both return a tensor of the right shape with values in [0, 1]. Use <code>dim=-1</code> (the last dimension) for vocabulary and attention softmaxes, so adding a batch dimension later cannot shift it, and check that rows sum to 1.</p>
+
+<h4>Forgetting <code>zero_grad</code></h4>
+<div class="code" data-lang="python">
+<pre><code>w = torch.tensor([1.0, 2.0], requires_grad=True)
+for step in range(3):
+    loss = (w ** 2).sum()                  # d loss / dw = 2w = [2, 4]
+    loss.backward()                        # no zero_grad: .grad is += each time
+    print(step, w.grad)
+# 0 tensor([2., 4.])
+# 1 tensor([4., 8.])
+# 2 tensor([ 6., 12.])
+w.grad = None                              # what optimizer.zero_grad() does by default
+(w ** 2).sum().backward()
+print("after reset", w.grad)               # after reset tensor([2., 4.])</code></pre>
+</div>
+<p>This is your <code>Value</code> engine's <code>child.grad += ...</code>: gradients accumulate by design (it is how gradient accumulation over micro-batches works), which is why microgpt sets every <code>parameter.grad = 0.0</code> before each <code>backward()</code>. Forget it and each step uses the sum of all past gradients: training diverges or crawls, with no error.</p>
+
+<h4>Forgetting <code>model.eval()</code></h4>
+<div class="code" data-lang="python">
+<pre><code>torch.manual_seed(0)
+net = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Dropout(0.3), nn.Linear(8, 1))
+x = torch.ones(1, 4)
+with torch.no_grad():
+    print([round(net(x).item(), 4) for _ in range(3)])   # still in train mode
+    net.eval()
+    print([round(net(x).item(), 4) for _ in range(3)])
+# [-0.0868, -0.4247, -0.4501]
+# [-0.3621, -0.3621, -0.3621]</code></pre>
+</div>
+<p>In train mode, dropout makes the same input give different outputs, and validation numbers come out noisy and pessimistic. <code>no_grad</code> does not help; only <code>eval()</code> switches dropout off (Chapter 10). The symptom to recognise: evaluating the same data twice gives different losses.</p>
+
+<h4>Evaluating without <code>no_grad</code></h4>
+<p>Each forward with grad enabled builds a graph and keeps the activations backward would need. If you keep a reference to any tensor of that graph, the whole graph stays alive. The classic leak is accumulating the loss tensor instead of its value. Measured on the laptop GPU (MPS reports its allocator's usage; on CUDA use <code>torch.cuda.memory_allocated()</code>), with a wider version of the model:</p>
+<div class="code" data-lang="python">
+<pre><code>def evaluate(model, batches, track_grad):
+    total = 0.0
+    with torch.set_grad_enabled(track_grad):
+        for x, y in batches:
+            loss = F.cross_entropy(model(x).flatten(0, 1), y.flatten())
+            total = total + loss               # bug: should be loss.item()
+    return total
+
+
+torch.manual_seed(0)
+dev = "mps"
+model = GPT(n_embd=256, block_size=256).to(dev)
+batches = [(torch.randint(0, 27, (32, 256), device=dev),
+            torch.randint(0, 27, (32, 256), device=dev)) for _ in range(20)]
+
+for track in [True, False]:
+    torch.mps.empty_cache()
+    before = torch.mps.current_allocated_memory()
+    total = evaluate(model, batches, track_grad=track)
+    after = torch.mps.current_allocated_memory()
+    print(f"grad tracking={track!s:5}: {(after - before) / 2**20:7.1f} MiB still held, "
+          f"requires_grad={total.requires_grad}")
+    del total</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>grad tracking=True :  3546.4 MiB still held, requires_grad=True
+grad tracking=False:     0.0 MiB still held, requires_grad=False</code></pre>
+</div>
+<p>3.5 GiB of activations for 20 evaluation batches, all kept alive by one float-looking variable. Evaluate under <code>torch.no_grad()</code> or <code>torch.inference_mode()</code>, and accumulate <code>loss.item()</code> (which is what microgpt's <code>evaluate_model</code> does) or <code>loss.detach()</code>.</p>
+
+<h4><code>.data</code> misuse</h4>
+<p><code>t.data</code> is a leftover from early PyTorch: a view of the same storage that autograd does not track at all, including its version counter. <code>t.detach()</code> also shares storage and is not tracked, but in-place edits through it still bump the version counter that autograd checks. The difference shows when you edit a value backward needs. Sigmoid's backward reuses its output (<code>σ' = σ(1 − σ)</code>):</p>
+<div class="code" data-lang="python">
+<pre><code>def run(use_data):
+    a = torch.tensor([1.0, 2.0, 3.0], requires_grad=True)
+    out = a.sigmoid()                      # sigmoid's backward reuses `out`
+    c = out.data if use_data else out.detach()
+    c.zero_()                              # in-place edit through the alias
+    out.sum().backward()
+    return a.grad
+
+
+print(".data:   ", run(True))              # .data:    tensor([0., 0., 0.])  silently wrong
+print(".detach():", run(False))
+# RuntimeError: one of the variables needed for gradient computation has been modified
+#   by an inplace operation: [torch.FloatTensor [3]], which is output 0 of SigmoidBackward0,
+#   is at version 1; expected version 0 instead. Hint: ...
+a = torch.tensor([1.0, 2.0, 3.0], requires_grad=True)
+print("correct: ", torch.autograd.grad(a.sigmoid().sum(), a)[0])
+# correct:  tensor([0.1966, 0.1050, 0.0452])</code></pre>
+</div>
+<p>With <code>.data</code>, the gradient is computed from the zeroed output and comes out as zeros: no error, wrong answer. Use <code>.detach()</code> for "a tensor without history", and <code>with torch.no_grad():</code> for in-place parameter updates. Your microgpt optimizer writes <code>parameter.data -= ...</code> on <code>Value</code> objects; that is your own class, unrelated to PyTorch's <code>.data</code>.</p>
+
+<h4>A parameter that never gets a gradient</h4>
+<p>If a parameter does not take part in computing the loss, autograd never reaches it and its <code>.grad</code> stays <code>None</code>. It still counts in <code>parameters()</code>, still gets saved, and never trains. A typo is enough:</p>
+<div class="code" data-lang="python">
+<pre><code>class Block(nn.Module):
+    def __init__(self, n_embd=16):
+        super().__init__()
+        self.norm1 = nn.RMSNorm(n_embd)            # learnable scale this time
+        self.norm2 = nn.RMSNorm(n_embd)
+        self.fc = nn.Linear(n_embd, n_embd)
+
+    def forward(self, x):
+        x = x + self.fc(self.norm1(x))
+        return x + self.fc(self.norm1(x))          # typo: should be norm2
+
+
+torch.manual_seed(0)
+block = Block()
+block(torch.randn(2, 16)).sum().backward()
+print([name for name, p in block.named_parameters() if p.grad is None])
+# ['norm2.weight']</code></pre>
+</div>
+<p>Run this one-liner after the first <code>backward()</code> of every new model. Any name it prints is either dead code or a bug.</p>
+
+<h2 id="inplace">In-place errors</h2>
+
+<p>Autograd saves some tensors during the forward pass for use in backward (Chapter 4). Every tensor has a <strong>version counter</strong> that each in-place operation (<code>+=</code>, <code>add_</code>, <code>relu_</code>, slice assignment) increments. Autograd records the version when it saves a tensor and checks it again in backward. If they differ, the saved value was overwritten and the gradient would be wrong, so it stops:</p>
+<div class="code" data-lang="python">
+<pre><code>x = torch.tensor([0.0, 1.0, 2.0], requires_grad=True)
+y = x.exp()               # exp's backward needs its own output: dy/dx = y
+y += 1                    # in-place: overwrites the saved y
+y.sum().backward()</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>RuntimeError: one of the variables needed for gradient computation has been modified by an
+inplace operation: [torch.FloatTensor [3]], which is output 0 of ExpBackward0, is at version 1;
+expected version 0 instead. Hint: enable anomaly detection to find the operation that failed
+to compute its gradient, with torch.autograd.set_detect_anomaly(True).</code></pre>
+</div>
+<p>Decode it piece by piece: a <code>[3]</code>-element float tensor, which is the <strong>output of <code>ExpBackward0</code></strong> (so: the result of an <code>exp</code>), was saved at version 0 and is now at version 1 (one in-place edit since). The fix is to make the edit out-of-place, <code>y = y + 1</code>, which creates a new tensor and leaves the saved one intact:</p>
+<div class="code" data-lang="python">
+<pre><code>x = torch.tensor([0.0, 1.0, 2.0], requires_grad=True)
+y = x.exp()
+y = y + 1                 # out-of-place: a new tensor, the saved y is intact
+y.sum().backward()
+print(x.grad)             # tensor([1.0000, 2.7183, 7.3891])</code></pre>
+</div>
+<p>Ops whose backward reuses their <em>output</em> (<code>exp</code>, <code>sigmoid</code>, <code>tanh</code>, <code>relu</code>, softmax) are the usual victims; ops whose backward needs their <em>input</em> (<code>mul</code>, <code>pow</code>, <code>matmul</code>) are victims when you edit the input. In a big model the message does not say which line did it; the anomaly mode below does, and Exercise 12.7 uses it.</p>
+
+<h2 id="nan-inf">NaN and inf</h2>
+
+<p><strong>inf</strong> is the float value for "too large to represent" (or the result of dividing by zero); <strong>NaN</strong> ("not a number") is the result of an undefined operation such as <code>0 × inf</code>, <code>inf − inf</code> or <code>0 / 0</code>. NaN spreads: any arithmetic with a NaN gives NaN, so one bad value in one activation becomes a NaN loss and then NaN in every weight after the optimizer step. The common sources in transformer code:</p>
+
+<div class="code" data-lang="python">
+<pre><code># 1. a query that may see no key at all (e.g. a padding position)
+scores = torch.tensor([[0.5, 1.0, 2.0],
+                       [0.3, 0.1, 0.4]])
+allowed = torch.tensor([[True, True, False],
+                        [False, False, False]])      # row 1: nothing allowed
+att = scores.masked_fill(~allowed, float("-inf")).softmax(dim=-1)
+print(att)
+# tensor([[0.3775, 0.6225, 0.0000],
+#         [   nan,    nan,    nan]])
+
+# 2. log(0), and 0 * -inf
+p = torch.tensor([0.0, 0.5, 0.5])
+onehot = torch.tensor([0.0, 1.0, 0.0])
+print(p.log())                                       # tensor([   -inf, -0.6931, -0.6931])
+print(-(onehot * p.log()).sum())                     # tensor(nan): 0 * -inf = nan
+logits = torch.tensor([-100.0, 0.0, 0.0])            # same distribution, as logits
+print(F.cross_entropy(logits[None], torch.tensor([1])))   # tensor(0.6931)
+
+# 3. fp16 overflow
+print(torch.finfo(torch.float16).max)                # 65504.0
+h = torch.tensor([300.0], dtype=torch.float16)
+print(h * h, (h * h) - (h * h))                      # tensor([inf], ...) tensor([nan], ...)
+print(torch.tensor([300.0], dtype=torch.bfloat16) ** 2)   # tensor([90112.], dtype=torch.bfloat16)</code></pre>
+</div>
+
+<ol>
+  <li><strong>A fully masked attention row.</strong> Softmax of all <code>-inf</code> computes <code>exp(-inf) / sum = 0 / 0</code>. This is the left-padding problem from Chapter 10, where <code>TinyGPT</code> lets each query see its own column so no row is empty. Another fix is to give empty rows one allowed key, or to replace NaN rows afterwards. (In PyTorch 2.8 on CPU, <code>F.scaled_dot_product_attention</code> returned zeros for a fully masked row in my test; a hand-written softmax does not.)</li>
+  <li><strong><code>log(0)</code></strong> is <code>-inf</code>, and multiplying it by a zero weight gives NaN. Computing cross-entropy as <code>softmax</code> then <code>log</code> hits this as soon as a probability underflows to 0. <code>F.cross_entropy</code> and <code>F.log_softmax</code> work on logits with the log-sum-exp trick and never take the log of 0.</li>
+  <li><strong>fp16 overflow.</strong> fp16's largest finite value is 65,504, so <code>300²</code> is inf, and inf minus inf is NaN. bf16 has fp32's exponent range and survives (at reduced precision: 90,000 rounds to 90,112). This is why fp16 training needs a <code>GradScaler</code> and bf16 usually does not (Chapter 9).</li>
+</ol>
+
+<h4>Finding them</h4>
+<p><code>torch.isfinite(t)</code> is True where a value is neither inf nor NaN (<code>torch.isnan</code> and <code>torch.isinf</code> separate the two). Check the loss every step, cheaply, and stop at the first bad one: <code>if not torch.isfinite(loss): raise RuntimeError(...)</code> (a sync on GPU, so in a hot loop check every N steps). To find which module first produces non-finite values in the forward pass, put the check in a forward hook (Exercise 12.8).</p>
+
+<p>NaNs that appear only in gradients need <strong>anomaly detection</strong>. Under <code>torch.autograd.set_detect_anomaly(True)</code>, autograd records the Python stack of every forward op, and during backward checks each gradient function's output; at the first NaN it raises and prints where that op was created in your forward code. The example is a hand-written L2 norm applied to a row of zeros, which is what a padding row looks like:</p>
+<div class="code" data-lang="python">
+<div class="code-hdr"><span class="lang">python</span><span class="title">nan_hunt.py</span></div>
+<pre><code>import torch
+
+
+def my_norm(x):
+    return (x ** 2).sum(dim=-1).sqrt()       # hand-written L2 norm
+
+
+x = torch.zeros(2, 3)
+x[0] = torch.tensor([1.0, 2.0, 2.0])         # row 1 stays all zeros (a padding row)
+x.requires_grad_(True)
+
+my_norm(x).sum().backward()
+print(x.grad)                                 # no error, just NaNs
+
+x.grad = None
+with torch.autograd.set_detect_anomaly(True):
+    try:
+        my_norm(x).sum().backward()
+    except RuntimeError as e:
+        print("RuntimeError:", e)</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>tensor([[0.3333, 0.6667, 0.6667],
+        [   nan,    nan,    nan]])
+.../torch/autograd/graph.py:829: UserWarning: Error detected in PowBackward0. Traceback of forward call that caused the error:
+  File "nan_hunt.py", line 18, in &lt;module&gt;
+    my_norm(x).sum().backward()
+  File "nan_hunt.py", line 5, in my_norm
+    return (x ** 2).sum(dim=-1).sqrt()       # hand-written L2 norm
+  File ".../torch/_tensor.py", line 39, in wrapped
+    return f(*args, **kwargs)
+ (Triggered internally at .../torch/csrc/autograd/python_anomaly_mode.cpp:127.)
+  return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+RuntimeError: Function 'PowBackward0' returned nan values in its 0th output.</code></pre>
+</div>
+<p>(Directory paths shortened.) Read it backwards through the chain rule: <code>sqrt</code>'s derivative at 0 is <code>1 / (2·0) = inf</code>, which is not NaN, so <code>SqrtBackward0</code> passes. Then <code>x ** 2</code>'s backward multiplies that inf by <code>2x = 0</code>: NaN, flagged at <code>PowBackward0</code>, line 5. The fix is an epsilon inside the square root, or <code>torch.linalg.vector_norm</code>, which defines the gradient at 0 as 0. Your microgpt <code>rms_norm</code> has <code>+ 1e-5</code> for exactly this reason. Anomaly mode slows everything down; switch it on to hunt, then off.</p>
+
+<h2 id="loss-not-decreasing">"The loss isn't going down": a checklist</h2>
+
+<p>Work through these in order; each is cheap and rules out a whole class of bugs.</p>
+
+<h4>1. Check the loss at initialisation</h4>
+<p>A freshly initialised model should be unsure about everything, which means a roughly uniform prediction over <code>V</code> classes and a cross-entropy of <code>ln V</code>: <code>ln 27 = 3.2958</code> for microgpt. Much higher means the initial logits are large (confidently wrong); much lower before any training usually means the answer leaks into the input.</p>
+<div class="code" data-lang="python">
+<pre><code>import math
+
+torch.manual_seed(0)
+model = GPT()
+x = torch.randint(0, 27, (32, 16))
+y = torch.randint(0, 27, (32, 16))
+with torch.no_grad():
+    loss0 = F.cross_entropy(model(x).flatten(0, 1), y.flatten())
+print(f"initial loss {loss0.item():.4f}   ln(27) = {math.log(27):.4f}")
+# initial loss 3.6421   ln(27) = 3.2958</code></pre>
+</div>
+<p>3.64 is a little high: PyTorch's default <code>nn.Embedding</code> initialisation is <code>N(0, 1)</code>, larger than microgpt's 0.08, so the logits start wider than uniform. With every parameter re-initialised to <code>N(0, 0.08)</code> as microgpt does (<code>torch.nn.init.normal_(p, std=0.08)</code>), the same check gives 3.2998.</p>
+
+<h4>2. Look at gradient norms per parameter</h4>
+<div class="code" data-lang="python">
+<pre><code>F.cross_entropy(model(x).flatten(0, 1), y.flatten()).backward()
+for name, p in model.named_parameters():
+    print(f"  {name:17} grad norm {p.grad.norm().item():.4f}")</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>  tok.weight        grad norm 0.0344
+  pos.weight        grad norm 0.0397
+  attn.qkv.weight   grad norm 0.0494
+  attn.proj.weight  grad norm 0.0660
+  mlp.fc.weight     grad norm 0.0697
+  mlp.proj.weight   grad norm 0.1912
+  head.weight       grad norm 0.3754</code></pre>
+</div>
+<p>You are looking for zeros (a disconnected parameter, or dead ReLUs), NaN or inf, and norms that differ by many orders of magnitude between layers (vanishing or exploding gradients). Here every parameter gets a gradient and they shrink smoothly toward the input, which is normal.</p>
+
+<h4>3. Overfit one batch, and sweep the learning rate</h4>
+<p>A model with 4,192 parameters can memorise 32 random sequences. If it cannot drive the loss on one fixed batch close to zero, the bug is in the model, the loss or the optimizer, not in the data or the amount of training. Run it for several learning rates at once:</p>
+<div class="code" data-lang="python">
+<pre><code>def overfit(lr, steps=300):
+    torch.manual_seed(0)
+    m = GPT()
+    opt = torch.optim.Adam(m.parameters(), lr=lr)
+    for _ in range(steps):
+        loss = F.cross_entropy(m(x).flatten(0, 1), y.flatten())
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+    return loss.item()
+
+
+for lr in [1e-4, 1e-3, 1e-2, 1e-1, 1.0]:
+    print(f"lr={lr:&lt;6}: loss after 300 steps on one batch = {overfit(lr):.3f}")</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>lr=0.0001: loss after 300 steps on one batch = 3.333
+lr=0.001 : loss after 300 steps on one batch = 0.872
+lr=0.01  : loss after 300 steps on one batch = 0.051
+lr=0.1   : loss after 300 steps on one batch = 1.357
+lr=1.0   : loss after 300 steps on one batch = 5.280</code></pre>
+</div>
+<p>The classic U shape: too small barely moves, too large overshoots and ends above where it started (5.28 is worse than the initial 3.64). microgpt's 0.01 sits at the bottom. If no learning rate in a sweep over several orders of magnitude overfits one batch, stop tuning and look for a bug.</p>
+
+<h4>4. Check that inputs and targets line up</h4>
+<p>For next-token prediction the target at position <code>t</code> is the input at <code>t + 1</code>: <code>x = ids[:, :-1]</code>, <code>y = ids[:, 1:]</code>, as in microgpt's <code>make_training_pair</code>. Get the shift wrong and the model is asked to predict the token it is looking at, which causal attention makes trivial:</p>
+<div class="code" data-lang="python">
+<pre><code>BOS = 26
+names = ("emma olivia ava isabella sophia mia charlotte amelia harper evelyn "
+         "abigail emily elizabeth sofia ella madison scarlett victoria aria grace").split()
+rows = [[BOS] + [ord(c) - ord("a") for c in n] + [BOS] for n in names]
+T = max(len(r) for r in rows)
+ids = torch.tensor([r + [BOS] * (T - len(r)) for r in rows])     # (20, T) padded
+
+
+def train(x, y, steps=300):
+    torch.manual_seed(0)
+    m = GPT()
+    opt = torch.optim.Adam(m.parameters(), lr=0.01)
+    for _ in range(steps):
+        loss = F.cross_entropy(m(x).flatten(0, 1), y.flatten())
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+    return loss.item()
+
+
+for label, y in [("right", ids[:, 1:]), ("wrong", ids[:, :-1])]:
+    print(f"{label}: loss after 300 steps = {train(ids[:, :-1], y):.4f}")
+# right: loss after 300 steps = 0.2999
+# wrong: loss after 300 steps = 0.0002</code></pre>
+</div>
+<p>This bug makes the loss go down <em>too well</em>. A loss far below what the task allows is as suspicious as one that will not move; generate a few samples and the copy-the-input model produces nothing useful. The same symptom appears when the causal mask is missing, because then position <code>t</code> can see the token it should predict.</p>
+
+<h4>5. The rest of the usual suspects</h4>
+<ul>
+  <li><code>optimizer.zero_grad()</code> missing, or called between <code>backward()</code> and <code>step()</code>.</li>
+  <li>The optimizer was built from a different model's parameters, or before the model was replaced (Exercise 12.6 has a variant).</li>
+  <li>The learning-rate schedule is wrong: print the LR every N steps (microgpt prints it with the loss).</li>
+  <li><code>model.eval()</code> was called for validation and <code>model.train()</code> never called again.</li>
+  <li>Logits passed through a softmax before <code>cross_entropy</code>, which applies its own (Exercise 12.4).</li>
+</ul>
+
+<h2 id="reference">Checking against a reference</h2>
+
+<p>The strongest test of numerical code is a second, independent implementation that must agree with it. Three levels.</p>
+
+<h4>Gradients against finite differences</h4>
+<p>A derivative can be estimated without calculus: <code>f'(x) ≈ (f(x + h) − f(x − h)) / 2h</code>, the <strong>central finite difference</strong>. Do it in float64, because float32's rounding error swamps the difference for small <code>h</code>. <code>torch.autograd.gradcheck</code> does this for every input element and compares the whole Jacobian with autograd's.</p>
+<div class="code" data-lang="python">
+<pre><code>def f(x):                                   # a little rms_norm + softmax pipeline
+    return F.softmax(F.rms_norm(x, (4,), eps=1e-5), dim=-1)[..., 0].sum()
+
+
+torch.manual_seed(0)
+x = torch.randn(3, 4, dtype=torch.float64, requires_grad=True)
+f(x).backward()
+
+h = 1e-6
+with torch.no_grad():
+    e = torch.zeros_like(x)
+    e[1, 2] = h
+    numeric = (f(x + e) - f(x - e)) / (2 * h)
+print(f"autograd {x.grad[1, 2].item():.10f}   finite diff {numeric.item():.10f}")
+# autograd -0.0145570161   finite diff -0.0145570161
+
+print(torch.autograd.gradcheck(f, (x,)))    # True: every element, in float64</code></pre>
+</div>
+<p>Where it earns its keep is a hand-written backward, in a custom <code>torch.autograd.Function</code>. Here is one with a deliberate bug (the derivative of <code>x²</code> is <code>2x</code>, not <code>x</code>):</p>
+<div class="code" data-lang="python">
+<pre><code>class BadSquare(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x):
+        ctx.save_for_backward(x)
+        return x * x
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        (x,) = ctx.saved_tensors
+        return grad_out * x                 # bug: should be 2 * x
+
+
+x = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float64, requires_grad=True)
+try:
+    torch.autograd.gradcheck(BadSquare.apply, (x,))
+except Exception as e:
+    print(type(e).__name__ + ":", e)</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>GradcheckError: Jacobian mismatch for output 0 with respect to input 0,
+numerical:tensor([[2.0000, 0.0000, 0.0000],
+        [0.0000, 4.0000, 0.0000],
+        [0.0000, 0.0000, 6.0000]], dtype=torch.float64)
+analytical:tensor([[1., 0., 0.],
+        [0., 2., 0.],
+        [0., 0., 3.]], dtype=torch.float64)</code></pre>
+</div>
+<p>The numerical Jacobian is <code>2x</code> on the diagonal and the analytical one is <code>x</code>: off by exactly the missing factor of 2.</p>
+
+<h4>Outputs: <code>torch.testing.assert_close</code></h4>
+<p>Two float computations of the same thing rarely agree to the last bit, because the order of additions differs (Chapter 10's cache check differed by 6e-8). <code>torch.testing.assert_close(actual, expected)</code> passes when, for every element, <code>|actual − expected| &lt;= atol + rtol × |expected|</code>: an absolute tolerance for values near zero plus a relative one for large values. It also checks shape, dtype and device by default. Default tolerances by dtype:</p>
+<table>
+  <tr><th>dtype</th><th><code>rtol</code></th><th><code>atol</code></th></tr>
+  <tr><td><code>float16</code></td><td>1e-3</td><td>1e-5</td></tr>
+  <tr><td><code>bfloat16</code></td><td>1.6e-2</td><td>1e-5</td></tr>
+  <tr><td><code>float32</code></td><td>1.3e-6</td><td>1e-5</td></tr>
+  <tr><td><code>float64</code></td><td>1e-7</td><td>1e-7</td></tr>
+</table>
+<p>Pass <code>rtol=</code> and <code>atol=</code> explicitly when comparing across precisions or algorithms, and choose them from what the arithmetic can justify, not from what makes the test pass.</p>
+
+<h4>A scalar reference for the whole model</h4>
+<p>Your <code>microgpt_scalar.py</code> is the ideal reference: written one number at a time, it is slow but each line is obviously right. Load the <em>same weights</em> into a few lines in that style, on plain Python floats, and compare the next-token probabilities at every position with the tensor model's. Since all of <code>GPT</code>'s weights are stored <code>[out][in]</code>, <code>.tolist()</code> gives exactly microgpt's matrix layout.</p>
+<div class="code" data-lang="python">
+<pre><code>import math
+
+
+def linear(inputs, weights):                 # microgpt_scalar's linear, on floats
+    return [sum(w * x for w, x in zip(row, inputs)) for row in weights]
+
+
+def softmax(logits):
+    m = max(logits)
+    exps = [math.exp(v - m) for v in logits]
+    total = sum(exps)
+    return [e / total for e in exps]
+
+
+def rms_norm(xs):
+    scale = (sum(x * x for x in xs) / len(xs) + 1e-5) ** -0.5
+    return [x * scale for x in xs]
+
+
+def scalar_forward(W, token_ids, n_head=4, head_size=4, scale=4**-0.5):
+    Wq, Wk, Wv = (W["attn.qkv.weight"][i * 16:(i + 1) * 16] for i in range(3))
+    keys, values, all_probs = [], [], []
+    for pos, tok in enumerate(token_ids):                  # one position at a time
+        x = [a + b for a, b in zip(W["tok.weight"][tok], W["pos.weight"][pos])]
+        h = rms_norm(x)
+        q = linear(h, Wq)
+        keys.append(linear(h, Wk))
+        values.append(linear(h, Wv))
+        heads = []
+        for hd in range(n_head):
+            s = slice(hd * head_size, (hd + 1) * head_size)
+            att = softmax([sum(a * b for a, b in zip(q[s], k[s])) * scale
+                           for k in keys])
+            heads += [sum(a * v[s][d] for a, v in zip(att, values))
+                      for d in range(head_size)]
+        x = [a + b for a, b in zip(x, linear(heads, W["attn.proj.weight"]))]
+        hidden = [max(0.0, u) for u in linear(rms_norm(x), W["mlp.fc.weight"])]
+        x = [a + b for a, b in zip(x, linear(hidden, W["mlp.proj.weight"]))]
+        all_probs.append(softmax(linear(x, W["head.weight"])))
+    return all_probs
+
+
+torch.manual_seed(0)
+model = GPT().eval()
+W = {name: p.tolist() for name, p in model.state_dict().items()}   # same weights
+ids = [26, 4, 12, 12, 0]                                            # &lt;BOS&gt; e m m a
+
+ref = torch.tensor(scalar_forward(W, ids), dtype=torch.float64)     # (5, 27)
+with torch.no_grad():
+    out = F.softmax(model(torch.tensor([ids])), dim=-1)[0].double()  # (5, 27)
+print(f"max abs diff: {(out - ref).abs().max().item():.2e}")
+torch.testing.assert_close(out, ref, rtol=1e-5, atol=1e-6)
+print("tensor model matches the scalar reference")
+
+# what a failure looks like: a reference that divides by head_size, not its sqrt
+ref_bad = torch.tensor(scalar_forward(W, ids, scale=1 / 4), dtype=torch.float64)
+try:
+    torch.testing.assert_close(out, ref_bad, rtol=1e-5, atol=1e-6)
+except AssertionError as e:
+    print(e)</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>max abs diff: 1.86e-08
+tensor model matches the scalar reference
+Tensor-likes are not close!
+
+Mismatched elements: 108 / 135 (80.0%)
+Greatest absolute difference: 0.0026403786776874605 at index (1, 5) (up to 1e-06 allowed)
+Greatest relative difference: 0.04076146278275225 at index (1, 0) (up to 1e-05 allowed)</code></pre>
+</div>
+<p>The tensor model is float32 and the reference is Python's float64, so they agree to about 2e-8, comfortably inside the chosen tolerances. The scalar loop computes attention position by position against a growing list of keys (your <code>gpt_step</code> with its cache), while the tensor model uses a causal mask over all positions at once, so agreement also confirms the mask. The failure message tells you how many elements differ, the worst absolute and relative differences, and where: index <code>(1, 5)</code> is position 1, token 5. Position 0 is not in the mismatch because with a single key the attention weight is 1 whatever the scale; a test with one token would have missed this bug.</p>
+
+<div class="callout tip">
+<div class="callout-title">Make the reference test permanent</div>
+<p>Put the comparison in a test file and run it whenever you touch the model: a new attention kernel, a KV cache, <code>torch.compile</code>, a different dtype. Chapter 10's cache check and this scalar check are the same idea: the optimised version must agree with the obviously correct one.</p>
+</div>
+
+<h2 id="exercises">Exercises</h2>
+
+<p>Each exercise is a short buggy snippet. Diagnose it before opening the solution, then fix it. Unless stated otherwise they run in the session above (<code>torch</code>, <code>nn</code>, <code>F</code> and <code>GPT</code> defined).</p>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 12.1</span>
+  <span class="exercise-diff easy">easy</span>
+  <span class="exercise-title">Read the error</span>
+</div>
+<div class="exercise-body">
+<p>Someone ported microgpt's MLP and gets <code>RuntimeError: mat1 and mat2 shapes cannot be multiplied (4x16 and 64x16)</code> from this line. What is wrong, and what are two fixes?</p>
+<div class="code" data-lang="python">
+<pre><code>x = torch.randn(4, 16)
+W_expand = torch.randn(16, 64)        # meant: 16 inputs -&gt; 64 hidden units
+hidden = F.linear(x, W_expand)</code></pre>
+</div>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<p><code>F.linear(x, W)</code> computes <code>x @ W.T</code> and expects <code>W</code> stored <code>[out][in]</code>, here <code>(64, 16)</code>. The weight was stored <code>[in][out]</code>, so <code>W.T</code> is <code>(64, 16)</code>, and the message reports exactly that as <code>mat2</code>. Fix either the storage or the call:</p>
+<div class="code" data-lang="python">
+<pre><code>W_expand = torch.randn(64, 16)        # [out][in], as microgpt stores it
+print(F.linear(x, W_expand).shape)    # torch.Size([4, 64])
+W_in_out = torch.randn(16, 64)
+print((x @ W_in_out).shape)           # torch.Size([4, 64]): keep [in][out], use @</code></pre>
+</div>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 12.2</span>
+  <span class="exercise-diff easy">easy</span>
+  <span class="exercise-title">The loss that never reaches zero</span>
+</div>
+<div class="exercise-body">
+<p>A regression model fits the data perfectly on a plot, but this loss stays well above zero. Why?</p>
+<div class="code" data-lang="python">
+<pre><code>pred = model_out                      # shape (B, 1)
+loss = ((pred - targets) ** 2).mean() # targets shape (B,)</code></pre>
+</div>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<p>Broadcasting turns <code>(B, 1) - (B,)</code> into <code>(B, B)</code>, comparing every prediction with every target. With the perfect predictions from the chapter the loss is 2.5 instead of 0. Fix the shapes and assert them:</p>
+<div class="code" data-lang="python">
+<pre><code>pred = torch.tensor([[1.0], [2.0], [3.0], [4.0]])
+targets = torch.tensor([1.0, 2.0, 3.0, 4.0])
+pred = pred.squeeze(-1)                         # (B,)
+assert pred.shape == targets.shape, (pred.shape, targets.shape)
+print(((pred - targets) ** 2).mean())           # tensor(0.)</code></pre>
+</div>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 12.3</span>
+  <span class="exercise-diff medium">medium</span>
+  <span class="exercise-title"><code>cross_entropy</code> with sequence logits</span>
+</div>
+<div class="exercise-body">
+<p>Batched training passes <code>(B, T, V)</code> logits and <code>(B, T)</code> targets straight to <code>F.cross_entropy</code>. With <code>T = 10</code> it crashes; with <code>T = 27</code> it runs. Explain both, and give two correct calls.</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<p><code>cross_entropy</code> expects the class dimension at position 1: <code>(N, C)</code> or <code>(N, C, d1, ...)</code>. Given <code>(B, T, V)</code> it treats <code>T</code> as the classes and <code>V</code> as an extra dimension, so it wants targets of shape <code>(B, V)</code>. When <code>T == V</code> the shapes happen to fit and it computes a meaningless number with no error.</p>
+<div class="code" data-lang="python">
+<pre><code>torch.manual_seed(0)
+B, T, V = 4, 10, 27
+logits = torch.randn(B, T, V)
+targets = torch.randint(0, V, (B, T))
+try:
+    F.cross_entropy(logits, targets)
+except RuntimeError as e:
+    print("RuntimeError:", str(e).splitlines()[0])
+# RuntimeError: Expected target size [4, 27], got [4, 10]
+
+a = F.cross_entropy(logits.flatten(0, 1), targets.flatten())   # (B*T, V) and (B*T,)
+b = F.cross_entropy(logits.transpose(1, 2), targets)           # (B, V, T) and (B, T)
+print(a, b)                                # tensor(3.7893) tensor(3.7893)
+
+# the silent case: T happens to equal V
+logits = torch.randn(B, V, V)              # (B, T=27, V=27)
+targets = torch.randint(0, V, (B, V))
+wrong = F.cross_entropy(logits, targets)   # treats dim 1 (time!) as the classes
+right = F.cross_entropy(logits.flatten(0, 1), targets.flatten())
+print(wrong, right)                        # tensor(3.7890) tensor(3.6460)</code></pre>
+</div>
+<p>The flatten form is what this tutorial uses everywhere: it makes the <code>(N, C)</code> contract explicit.</p>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 12.4</span>
+  <span class="exercise-diff medium">medium</span>
+  <span class="exercise-title">The loss floor at 2.36</span>
+</div>
+<div class="exercise-body">
+<p>A 27-class model trains, but its loss never goes below about 2.36, no matter how long it runs or which learning rate you use. The loss line is <code>F.cross_entropy(F.softmax(logits, dim=-1), y)</code>. Explain the floor exactly and show the fix.</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<p><code>cross_entropy</code> applies its own log-softmax, so it is treating probabilities as logits. Probabilities lie in [0, 1], so the best possible "logits" are 1 for the right class and 0 for the other 26, and the best possible loss is <code>−log(e / (e + 26)) = log(e + 26) − 1 ≈ 2.3575</code>. The gradients also get squashed through two softmaxes.</p>
+<div class="code" data-lang="python">
+<pre><code>def train(double_softmax):
+    torch.manual_seed(0)
+    logits = torch.zeros(64, 27, requires_grad=True)     # a "model" with free logits
+    y = torch.randint(0, 27, (64,))
+    opt = torch.optim.Adam([logits], lr=0.1)
+    for _ in range(500):
+        scores = F.softmax(logits, dim=-1) if double_softmax else logits
+        loss = F.cross_entropy(scores, y)
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+    return loss.item()
+
+
+print(f"softmax then cross_entropy: {train(True):.4f}")
+print(f"logits into cross_entropy:  {train(False):.4f}")
+print(f"floor with probabilities as logits: log(e + 26) - 1 = {math.log(math.e + 26) - 1:.4f}")</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>softmax then cross_entropy: 2.3580
+logits into cross_entropy:  0.0020
+floor with probabilities as logits: log(e + 26) - 1 = 2.3575</code></pre>
+</div>
+<p>Pass raw logits to <code>F.cross_entropy</code>. Apply softmax only when you need probabilities, for sampling or display.</p>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 12.5</span>
+  <span class="exercise-diff medium">medium</span>
+  <span class="exercise-title">The head split that peeks at the future</span>
+</div>
+<div class="exercise-body">
+<p>Someone got the <code>view</code> error from earlier in this chapter inside <code>Attention.forward</code> and "fixed" it by writing <code>t.reshape(B, self.n_head, T, E // self.n_head)</code> instead of <code>t.view(B, T, self.n_head, E // self.n_head).transpose(1, 2)</code>. Shapes are fine and it trains. What is wrong, and how could a test catch it without a reference implementation?</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<p><code>(B, T, E)</code> is laid out token by token. Reshaping it directly to <code>(B, H, T, D)</code> cuts that memory into <code>H</code> consecutive chunks, so "head 0" gets the first <code>T/H</code> tokens' full embeddings rearranged as <code>T</code> fake positions. Positions now mix data from different real tokens, including later ones. The correct code splits each token's <code>E</code> into <code>(H, D)</code> first, then moves <code>H</code> forward with a transpose; <code>view</code> refused the buggy version because <code>split</code> leaves non-contiguous strides, and <code>reshape</code> silently copied.</p>
+<p>A causality test needs no reference: change only the last token, and the outputs at all earlier positions must not change.</p>
+<div class="code" data-lang="python">
+<pre><code>class BuggyAttention(Attention):
+    def forward(self, x):
+        B, T, E = x.shape
+        q, k, v = self.qkv(x).split(E, dim=-1)
+        q, k, v = (t.reshape(B, self.n_head, T, E // self.n_head)   # bug
+                   for t in (q, k, v))
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        return self.proj(y.transpose(1, 2).reshape(B, T, E))
+
+
+def leaks_future(model, T=10):
+    """Change only the LAST token; outputs at earlier positions must not move."""
+    torch.manual_seed(1)
+    ids = torch.randint(0, 27, (1, T))
+    ids2 = ids.clone()
+    ids2[0, -1] = (ids[0, -1] + 1) % 27
+    with torch.no_grad():
+        a, b = model(ids), model(ids2)
+    return not torch.allclose(a[:, :-1], b[:, :-1])
+
+
+torch.manual_seed(0)
+model = GPT()
+print("correct attention leaks future:", leaks_future(model))   # False
+model.attn.__class__ = BuggyAttention          # swap in the buggy forward, same weights
+print("buggy attention leaks future:  ", leaks_future(model))   # True</code></pre>
+</div>
+<p>A model that can see the future trains to a suspiciously low loss and then generates garbage, because at generation time the future is not there. Keep <code>leaks_future</code> in your test suite.</p>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 12.6</span>
+  <span class="exercise-diff hard">hard</span>
+  <span class="exercise-title">The layers that never train</span>
+</div>
+<div class="exercise-body">
+<p>A deeper model trains worse than a shallow one. Count its parameters, look at its <code>state_dict</code>, and find out whether layer 0's weights change after an optimizer step. What is wrong?</p>
+<div class="code" data-lang="python">
+<pre><code>class Deep(nn.Module):
+    def __init__(self, n_layers=4, width=16):
+        super().__init__()
+        self.layers = [nn.Linear(width, width) for _ in range(n_layers)]
+        self.out = nn.Linear(width, 1)
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = torch.relu(layer(x))
+        return self.out(x)</code></pre>
+</div>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<p><code>nn.Module</code> registers submodules only when you assign a <code>Module</code> (or <code>nn.ModuleList</code> / <code>nn.ModuleDict</code>) as an attribute. A plain Python list is invisible to it: the four layers are not in <code>parameters()</code>, so the optimizer never updates them; not in <code>state_dict()</code>, so checkpoints silently drop them; and <code>.to(device)</code> would not move them. Autograd still computes their gradients, because it follows the computation, not the module tree, which makes the bug harder to spot.</p>
+<div class="code" data-lang="python">
+<pre><code>class Deep(nn.Module):
+    def __init__(self, n_layers=4, width=16, fixed=False):
+        super().__init__()
+        layers = [nn.Linear(width, width) for _ in range(n_layers)]
+        self.layers = nn.ModuleList(layers) if fixed else layers   # bug: plain list
+        self.out = nn.Linear(width, 1)
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = torch.relu(layer(x))
+        return self.out(x)
+
+
+for fixed in [False, True]:
+    torch.manual_seed(0)
+    model = Deep(fixed=fixed)
+    n = sum(p.numel() for p in model.parameters())
+    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+    before = model.layers[0].weight.clone()
+    model(torch.randn(8, 16)).pow(2).mean().backward()
+    opt.step()
+    moved = not torch.equal(before, model.layers[0].weight)
+    print(f"ModuleList={fixed!s:5}: {n:4d} params registered, "
+          f"{len(model.state_dict())} state_dict keys, layer 0 updated: {moved}, "
+          f"layer 0 grad is None: {model.layers[0].weight.grad is None}")</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>ModuleList=False:   17 params registered, 2 state_dict keys, layer 0 updated: False, layer 0 grad is None: False
+ModuleList=True : 1105 params registered, 10 state_dict keys, layer 0 updated: True, layer 0 grad is None: False</code></pre>
+</div>
+<p>Only the 17 parameters of <code>out</code> were registered. Checking the parameter count against your own arithmetic (here <code>4 × (16·16 + 16) + 17 = 1105</code>) catches this in one line, which is why microgpt asserts <code>number_of_parameters == 4192</code>.</p>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 12.7</span>
+  <span class="exercise-diff hard">hard</span>
+  <span class="exercise-title">Find the in-place op</span>
+</div>
+<div class="exercise-body">
+<p>This MLP drops every other hidden unit with a fixed mask. Backward fails with "one of the variables needed for gradient computation has been modified by an inplace operation ... output 0 of ReluBackward0". Use anomaly detection to find the forward line involved, explain the failure, and fix it.</p>
+<div class="code" data-lang="python">
+<div class="code-hdr"><span class="lang">python</span><span class="title">masked_mlp.py</span></div>
+<pre><code>import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class MaskedMLP(nn.Module):
+    def __init__(self, n_embd=16):
+        super().__init__()
+        self.fc = nn.Linear(n_embd, 4 * n_embd)
+        self.proj = nn.Linear(4 * n_embd, n_embd)
+        self.register_buffer("keep", (torch.arange(4 * n_embd) % 2).float())
+
+    def forward(self, x):
+        h = F.relu(self.fc(x))
+        h *= self.keep
+        return self.proj(h)
+
+
+torch.manual_seed(0)
+mlp = MaskedMLP()
+x = torch.randn(2, 16)
+with torch.autograd.set_detect_anomaly(True):
+    mlp(x).sum().backward()</code></pre>
+</div>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<p>The anomaly warning (trimmed: <code>nn.Module</code> call frames, directory paths and the second traceback removed) points at the forward line that created the failing node:</p>
+<div class="code" data-lang="text">
+<pre><code>UserWarning: Error detected in ReluBackward0. Traceback of forward call that caused the error:
+  File "masked_mlp.py", line 23, in &lt;module&gt;
+    mlp(x).sum().backward()
+  ...
+  File "masked_mlp.py", line 14, in forward
+    h = F.relu(self.fc(x))
+  File ".../torch/nn/functional.py", line 1701, in relu
+    result = torch.relu(input)
+...
+RuntimeError: one of the variables needed for gradient computation has been modified by an
+inplace operation: [torch.FloatTensor [2, 64]], which is output 0 of ReluBackward0, is at
+version 1; expected version 0 instead. Hint: the backtrace further above shows the operation
+that failed to compute its gradient. The variable in question was changed in there or
+anywhere later. Good luck!</code></pre>
+</div>
+<p>ReLU's backward uses its own output (the gradient passes where the output is positive), so autograd saved <code>h</code> at version 0. <code>h *= self.keep</code> overwrote it in place (version 1). The <code>[2, 64]</code> in the message is the shape of <code>h</code>, which already narrows it to the MLP's hidden layer. Fix: make the multiply out-of-place.</p>
+<div class="code" data-lang="python">
+<pre><code>class FixedMLP(MaskedMLP):
+    def forward(self, x):
+        h = F.relu(self.fc(x))
+        h = h * self.keep                  # new tensor; relu's saved output is untouched
+        return self.proj(h)
+
+
+torch.manual_seed(0)
+fixed = FixedMLP()
+fixed(x).sum().backward()
+print(fixed.fc.weight.grad.shape)          # torch.Size([64, 16])</code></pre>
+</div>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 12.8</span>
+  <span class="exercise-diff hard">hard</span>
+  <span class="exercise-title">A debug hook that names the first bad module</span>
+</div>
+<div class="exercise-body">
+<p>Write <code>install_debug_hooks(model)</code> that prints each module's output shape and raises an exception naming the <em>first</em> module whose output contains inf or NaN, with how many bad values. Test it on <code>GPT</code> after planting one <code>inf</code> in <code>mlp.fc.weight</code>, and make sure the hooks are removed even when the exception fires.</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<div class="code" data-lang="python">
+<pre><code>class NonFiniteError(RuntimeError):
+    pass
+
+
+def install_debug_hooks(model, verbose=True):
+    handles = []
+    for name, module in model.named_modules():
+        if name == "":
+            continue
+
+        def hook(module, inputs, output, name=name):
+            if verbose:
+                print(f"{name:10} -&gt; {tuple(output.shape)}")
+            if not torch.isfinite(output).all():
+                bad = (~torch.isfinite(output)).sum().item()
+                raise NonFiniteError(f"{name} ({type(module).__name__}) produced "
+                                     f"{bad} non-finite values")
+        handles.append(module.register_forward_hook(hook))
+    return handles
+
+
+torch.manual_seed(0)
+model = GPT()
+with torch.no_grad():
+    model.mlp.fc.weight[3, 0] = float("inf")           # plant a bad weight
+handles = install_debug_hooks(model)
+try:
+    model(torch.randint(0, 27, (2, 10)))
+except NonFiniteError as e:
+    print("NonFiniteError:", e)
+finally:
+    for h in handles:
+        h.remove()</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>tok        -&gt; (2, 10, 16)
+pos        -&gt; (10, 16)
+norm1      -&gt; (2, 10, 16)
+attn.qkv   -&gt; (2, 10, 48)
+attn.proj  -&gt; (2, 10, 16)
+attn       -&gt; (2, 10, 16)
+norm2      -&gt; (2, 10, 16)
+mlp.fc     -&gt; (2, 10, 64)
+NonFiniteError: mlp.fc (Linear) produced 20 non-finite values</code></pre>
+</div>
+<p>Hooks run in execution order, so the first one to raise is the first module to produce a bad value: <code>mlp.fc</code>, where hidden unit 3 of all 20 tokens (2 × 10) multiplies the inf weight. Raising from inside the hook stops the forward at that module. <code>try/finally</code> guarantees the hooks are removed, otherwise they would keep firing on every later forward. The <code>isfinite(...).all()</code> check is a sync on a GPU, so enable this only while debugging.</p>
+</div>
+</details>
+</div>
+</div>
+
+<h2 id="recap">Recap</h2>
+<ul>
+  <li>Read the last line of the error first. <code>mat1 and mat2 shapes cannot be multiplied</code> means inner dimensions differ (check <code>[out][in]</code> storage); device errors name both devices or say "Placeholder storage" on MPS; dtype errors want <code>.long()</code> targets and indices or <code>.float()</code> operands; the <code>view</code> error means "non-contiguous, use <code>reshape</code> or think about the layout".</li>
+  <li>Name dimensions in comments, assert shapes with the shape in the message, and print module output shapes with forward hooks (remove them with the handle).</li>
+  <li>Silent bugs: <code>(B, 1)</code> against <code>(B,)</code> broadcasting, softmax over the wrong <code>dim</code>, missing <code>zero_grad</code>, missing <code>eval()</code>, evaluating with grad on (3.5 GiB held in the example), <code>.data</code> edits that corrupt gradients, and parameters whose <code>.grad</code> is still <code>None</code> after backward.</li>
+  <li>The in-place error names the op whose saved tensor changed and its version numbers; make the edit out-of-place.</li>
+  <li>NaNs come from fully masked softmax rows, <code>log(0)</code>, <code>0 × inf</code> and fp16 overflow. Check with <code>torch.isfinite</code>; find NaN gradients with <code>torch.autograd.set_detect_anomaly(True)</code>.</li>
+  <li>Loss not going down: initial loss ≈ ln V, per-layer grad norms, overfit one batch, sweep the LR, check target alignment (a loss that is too good is a bug too).</li>
+  <li>Check against references: <code>gradcheck</code> in float64 for gradients, <code>assert_close</code> with justified <code>rtol</code>/<code>atol</code> for outputs, and a scalar implementation in the style of <code>microgpt_scalar.py</code> loaded with the same weights.</li>
+</ul>
+
+<div class="page-nav">
+  <a href="11-performance.html"><span class="lbl">← Prev</span><span class="ttl">Performance &amp; Profiling</span></a>
+  <a href="13-50-questions.html" class="next"><span class="lbl">Next →</span><span class="ttl">The 50 Questions</span></a>
+</div>
+
+</main>
+</div>
+<script src="../assets/site.js"></script>
+</body>
+</html>

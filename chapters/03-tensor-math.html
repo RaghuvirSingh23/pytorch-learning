@@ -1,0 +1,883 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>3 · Tensor Math &amp; Broadcasting — PyTorch</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<button class="sidebar-toggle" aria-label="Toggle navigation">☰ Menu</button>
+<div class="layout">
+<aside class="sidebar">
+  <a href="../index.html" class="brand">PyTorch</a>
+  <span class="brand-sub">a deep dive — 2026</span>
+  <nav>
+    <ol>
+      <li><a href="01-why-pytorch.html">Why PyTorch</a></li>
+      <li><a href="02-tensors.html">Tensors</a></li>
+      <li><a href="03-tensor-math.html">Tensor Math &amp; Broadcasting</a></li>
+      <li><a href="04-autograd.html">Autograd</a></li>
+      <li><a href="05-nn-module.html">nn.Module</a></li>
+      <li><a href="06-transformer-blocks.html">Building a Transformer</a></li>
+      <li><a href="07-losses-optimizers.html">Losses &amp; Optimizers</a></li>
+      <li><a href="08-training-loop.html">The Training Loop</a></li>
+      <li><a href="09-devices-precision.html">Devices &amp; Precision</a></li>
+      <li><a href="10-inference.html">Inference &amp; Sampling</a></li>
+      <li><a href="11-performance.html">Performance &amp; Profiling</a></li>
+      <li><a href="12-debugging.html">Debugging PyTorch</a></li>
+      <li><a href="13-50-questions.html">The 50 Questions</a></li>
+      <li><a href="14-capstone.html">Capstone Project</a></li>
+    </ol>
+    <div class="extras">
+      <a href="../exercises.html">All Exercises</a>
+      <a href="../index.html">← Home</a>
+    </div>
+  </nav>
+  <div class="progress"></div>
+</aside>
+
+<main class="content">
+
+<h1>
+  <span class="chap-num">Chapter 03</span>
+  Tensor Math &amp; Broadcasting
+</h1>
+<p class="lede">
+  This chapter is the arithmetic of a transformer: elementwise operations,
+  reductions along a dimension, broadcasting, matrix multiplication and
+  masks. Each one replaces a loop in microgpt_scalar.py, and by the end you
+  will have rebuilt <code>softmax</code>, <code>rms_norm</code>,
+  <code>linear</code> and the attention scores from tensor operations, with
+  numbers that match your scalar code. Broadcasting gets the most space,
+  because its bugs are silent.
+</p>
+
+<h2 id="elementwise">Elementwise operations</h2>
+
+<p>An <strong>elementwise</strong> operation applies the same scalar function to every element independently: element <code>i</code> of the output depends only on element <code>i</code> of each input. These are your <code>Value.__add__</code>, <code>__mul__</code>, <code>__pow__</code>, <code>exp</code>, <code>log</code> and <code>relu</code>, applied to a whole tensor in one call. A Python number on one side is used for every element.</p>
+
+<div class="code" data-lang="python">
+<pre><code>a = torch.tensor([1.0, 2.0, 3.0])
+b = torch.tensor([10.0, 20.0, 30.0])
+print(a + b)  # tensor([11., 22., 33.])
+print(a * b)  # tensor([10., 40., 90.])
+print(b / a)  # tensor([10., 10., 10.])
+print(a ** 2)  # tensor([1., 4., 9.])
+print(a * 2 + 1)  # tensor([3., 5., 7.])
+print(a.exp())  # tensor([ 2.7183,  7.3891, 20.0855])
+print(a.log())  # tensor([0.0000, 0.6931, 1.0986])
+print(torch.relu(torch.tensor([-1.0, 0.0, 2.0])))  # tensor([0., 0., 2.])
+print(a &gt; 1.5)  # tensor([False,  True,  True])</code></pre>
+</div>
+
+<h4>In-place operations</h4>
+
+<p>Every operation above returns a <strong>new</strong> tensor. Most also have an <strong>in-place</strong> version, named with a trailing underscore, that overwrites its input instead of allocating an output: <code>add_</code>, <code>mul_</code>, <code>sub_</code>, <code>clamp_</code>, <code>zero_</code>, <code>fill_</code>, <code>copy_</code>. The trailing underscore is a PyTorch-wide convention: it always means "modifies <code>self</code>".</p>
+
+<div class="code" data-lang="python">
+<pre><code>a = torch.tensor([1.0, 2.0, 3.0])
+ptr = a.data_ptr()
+
+b = a.add(10)           # out-of-place: a new tensor, a unchanged
+print(a, b)  # tensor([1., 2., 3.]) tensor([11., 12., 13.])
+
+a.add_(10)              # in-place: overwrites a, returns a
+print(a)  # tensor([11., 12., 13.])
+a.mul_(2).sub_(1)       # in-place ops chain
+print(a)  # tensor([21., 23., 25.])
+print(a.data_ptr() == ptr)  # True
+
+a += 1                  # augmented assignment is in-place too
+print(a.data_ptr() == ptr)  # True
+a = a + 1               # a new tensor, bound to the old name
+print(a.data_ptr() == ptr)  # False</code></pre>
+</div>
+
+<p><code>a += 1</code> is in-place (Python calls <code>__iadd__</code>); <code>a = a + 1</code> builds a new tensor and rebinds the name. The difference matters when another variable is a view of <code>a</code>: the in-place version changes what the view sees. In-place ops save memory, which is why optimizers use them to update weights. They also conflict with autograd, which may need the old values for the backward pass:</p>
+
+<div class="code" data-lang="python">
+<pre><code>w = torch.ones(3, requires_grad=True)    # a parameter (Chapter 4)
+w.add_(1)</code></pre>
+</div>
+
+<div class="code" data-lang="text">
+<pre><code>RuntimeError: a leaf Variable that requires grad is being used in an in-place operation.</code></pre>
+</div>
+
+<p>Chapter 4 explains this error and the <code>torch.no_grad()</code> block that optimizers use to get around it.</p>
+
+<h2 id="reductions">Reductions: <code>dim</code> and <code>keepdim</code></h2>
+
+<p>A <strong>reduction</strong> combines many elements into one: <code>sum</code>, <code>mean</code>, <code>max</code>, <code>min</code>, <code>prod</code>, <code>std</code>. With no arguments it reduces the whole tensor to a 0-d tensor. With <code>dim=d</code> it reduces only along dimension <code>d</code>, and <strong>that dimension disappears from the shape</strong>.</p>
+
+<div class="code" data-lang="python">
+<pre><code>x = torch.tensor([[1.0, 5.0, 3.0],
+                  [4.0, 2.0, 6.0]])     # shape (2, 3)
+print(x.sum())  # tensor(21.)
+print(x.sum(dim=0))  # tensor([5., 7., 9.])
+print(x.sum(dim=1))  # tensor([ 9., 12.])
+print(x.sum(dim=1, keepdim=True))
+# tensor([[ 9.],
+#         [12.]])
+print(x.sum(dim=1, keepdim=True).shape)  # torch.Size([2, 1])
+print(x.mean(dim=-1))  # tensor([3., 4.])</code></pre>
+</div>
+
+<div class="code" data-lang="text">
+<pre><code>x = [[1, 5, 3],       shape (2, 3)
+     [4, 2, 6]]
+
+sum(dim=0): collapse dim 0 (down the columns)   -&gt; [1+4, 5+2, 3+6] = [5, 7, 9]   shape (3,)
+sum(dim=1): collapse dim 1 (along each row)     -&gt; [1+5+3, 4+2+6] = [9, 12]     shape (2,)
+sum(dim=1, keepdim=True): same numbers, dim 1 kept with size 1   -&gt;              shape (2, 1)</code></pre>
+</div>
+
+<p><code>dim=-1</code> means the last dimension, which is the usual choice in model code: "per token, over the channels" for <code>(B, T, C)</code>, whatever <code>B</code> and <code>T</code> are. <code>keepdim=True</code> looks cosmetic. It is not: the <code>(2, 1)</code> shape is what lets the result broadcast back against <code>x</code>, as you will see below.</p>
+
+<h4><code>max</code> returns values and indices</h4>
+
+<p>With a <code>dim</code>, <code>max</code> and <code>min</code> return a named tuple of the values and where they were found. <code>argmax</code> returns only the indices; without a <code>dim</code> it returns the index into the <em>flattened</em> tensor.</p>
+
+<div class="code" data-lang="python">
+<pre><code>x = torch.tensor([[1.0, 5.0, 3.0],
+                  [4.0, 2.0, 6.0]])
+print(x.max())  # tensor(6.)
+values, indices = x.max(dim=1)
+print(values, indices)  # tensor([5., 6.]) tensor([1, 2])
+print(x.max(dim=0))
+# torch.return_types.max(
+# values=tensor([4., 5., 6.]),
+# indices=tensor([1, 0, 1]))
+print(x.argmax(dim=0))  # tensor([1, 0, 1])
+print(x.argmax())  # tensor(5)</code></pre>
+</div>
+
+<p><code>argmax(dim=-1)</code> on logits is greedy decoding: the most likely next token at every position. <code>x.argmax()</code> is 5 because 6.0 is element 5 when <code>x</code> is read as a flat list.</p>
+
+<h2 id="softmax">Softmax by hand</h2>
+
+<p>microgpt_scalar's <code>softmax</code> subtracts the largest logit, exponentiates, and divides by the total. With tensors each step is one operation. For one row:</p>
+
+<div class="code" data-lang="python">
+<pre><code>logits = torch.tensor([1.0, 2.0, 3.0])
+m = logits.max(dim=-1, keepdim=True).values   # tensor([3.])
+e = (logits - m).exp()                         # exp(-2), exp(-1), exp(0)
+p = e / e.sum(dim=-1, keepdim=True)
+print(p)  # tensor([0.0900, 0.2447, 0.6652])
+print(p.sum())  # tensor(1.)</code></pre>
+</div>
+
+<p>Those are the numbers your scalar code prints for <code>[1, 2, 3]</code>: <code>[0.09, 0.2447, 0.6652]</code>. Real logits come in batches: <code>(T, V)</code> for one name (one row of 27 logits per position), or <code>(B, T, V)</code>. Softmax must normalise each row separately, which is exactly what <code>dim=-1</code> plus <code>keepdim=True</code> achieve:</p>
+
+<div class="code" data-lang="python">
+<pre><code>def softmax(x, dim=-1):
+    m = x.max(dim=dim, keepdim=True).values
+    e = (x - m).exp()
+    return e / e.sum(dim=dim, keepdim=True)
+
+
+L = torch.tensor([[1.0, 2.0, 3.0],
+                  [1.0, 1.0, 1.0]])
+print(softmax(L))
+# tensor([[0.0900, 0.2447, 0.6652],
+#         [0.3333, 0.3333, 0.3333]])
+print(torch.softmax(L, dim=-1))
+# tensor([[0.0900, 0.2447, 0.6652],
+#         [0.3333, 0.3333, 0.3333]])
+print(torch.allclose(F.softmax(L, dim=-1), softmax(L)))  # True
+print(softmax(L, dim=0))
+# tensor([[0.5000, 0.7311, 0.8808],
+#         [0.5000, 0.2689, 0.1192]])</code></pre>
+</div>
+
+<p>Your version, <code>torch.softmax</code> and <code>F.softmax</code> agree (<code>F</code> is <code>torch.nn.functional</code>; microgpt uses <code>F.softmax(attention_logits, dim=-1)</code>). The last output is the classic mistake: with <code>dim=0</code> each <em>column</em> sums to 1, which is a valid softmax over the wrong axis and raises no error.</p>
+
+<p>Why subtract the max? <code>exp(1000)</code> overflows <code>float32</code> (max about 3.4e38):</p>
+
+<div class="code" data-lang="python">
+<pre><code>big = torch.tensor([1000.0, 1001.0, 1002.0])
+print(big.exp())  # tensor([inf, inf, inf])
+print(big.exp() / big.exp().sum())  # tensor([nan, nan, nan])
+print(torch.softmax(big, dim=-1))  # tensor([0.0900, 0.2447, 0.6652])</code></pre>
+</div>
+
+<p><code>inf / inf</code> is <code>nan</code>. Subtracting the max leaves the result mathematically unchanged (the factor <code>exp(-m)</code> cancels between numerator and denominator) and makes the largest exponent <code>exp(0) = 1</code>. <code>torch.softmax</code> does this internally.</p>
+
+<h2 id="broadcasting">Broadcasting</h2>
+
+<p>You have already used broadcasting: <code>a * 2</code> multiplied every element by one number. <strong>Broadcasting</strong> is the general rule for combining tensors of different shapes elementwise, without copying:</p>
+
+<ol>
+  <li>Line the two shapes up <strong>from the right</strong> (last dimension against last dimension).</li>
+  <li>If one shape is shorter, pretend it has <strong>extra size-1 dimensions on the left</strong>.</li>
+  <li>In each position the sizes must be equal, or one of them must be 1. A <strong>size-1 dimension is stretched</strong> to match the other (by reading the same element repeatedly, stride 0, as with <code>expand</code>).</li>
+  <li>Otherwise it is an error.</li>
+</ol>
+
+<div class="code" data-lang="python">
+<pre><code>x = torch.tensor([[1.0, 2.0, 3.0],
+                  [4.0, 5.0, 6.0]])         # (2, 3)
+row = torch.tensor([10.0, 20.0, 30.0])      # (3,)
+col = torch.tensor([[100.0], [200.0]])      # (2, 1)
+print(x + row)
+# tensor([[11., 22., 33.],
+#         [14., 25., 36.]])
+print(x + col)
+# tensor([[101., 102., 103.],
+#         [204., 205., 206.]])
+print(col + row)
+# tensor([[110., 120., 130.],
+#         [210., 220., 230.]])</code></pre>
+</div>
+
+<p><code>row</code> <code>(3,)</code> becomes <code>(1, 3)</code> and is added to each row. <code>col</code> <code>(2, 1)</code> is added to each column. <code>col + row</code> is <code>(2, 1)</code> with <code>(1, 3)</code>: both stretch, giving the <code>(2, 3)</code> table of all pairwise sums (an "outer" sum). When the rule fails you get an error that names the dimension:</p>
+
+<div class="code" data-lang="python">
+<pre><code>x = torch.ones(2, 3)
+x + torch.tensor([1.0, 2.0])</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>RuntimeError: The size of tensor a (3) must match the size of tensor b (2) at non-singleton dimension 1</code></pre>
+</div>
+
+<p>"Non-singleton" means "not size 1". <code>torch.broadcast_shapes</code> applies the rule to shapes alone, which is handy for checking. With <code>B=8, T=5, C=16, H=4</code>:</p>
+
+<table>
+  <tr><th>a</th><th>b</th><th>b aligned</th><th>result</th><th>where it shows up</th></tr>
+  <tr><td><code>(2, 3)</code></td><td><code>(3,)</code></td><td><code>(1, 3)</code></td><td><code>(2, 3)</code></td><td>adding a bias to every row</td></tr>
+  <tr><td><code>(2, 3)</code></td><td><code>(2, 1)</code></td><td><code>(2, 1)</code></td><td><code>(2, 3)</code></td><td>per-row scale (RMSNorm)</td></tr>
+  <tr><td><code>(2, 1)</code></td><td><code>(1, 3)</code></td><td><code>(1, 3)</code></td><td><code>(2, 3)</code></td><td>outer sum / product</td></tr>
+  <tr><td><code>(8, 5, 16)</code></td><td><code>(5, 16)</code></td><td><code>(1, 5, 16)</code></td><td><code>(8, 5, 16)</code></td><td>position embeddings</td></tr>
+  <tr><td><code>(8, 5, 16)</code></td><td><code>(8, 5, 1)</code></td><td><code>(8, 5, 1)</code></td><td><code>(8, 5, 16)</code></td><td>normalising each token</td></tr>
+  <tr><td><code>(8, 4, 5, 5)</code></td><td><code>(5, 5)</code></td><td><code>(1, 1, 5, 5)</code></td><td><code>(8, 4, 5, 5)</code></td><td>causal mask on attention scores</td></tr>
+  <tr><td><code>(8,)</code></td><td><code>(8, 1)</code></td><td><code>(1, 8)</code> vs <code>(8, 1)</code></td><td><code>(8, 8)</code></td><td><strong>the silent bug</strong></td></tr>
+  <tr><td><code>(2, 3)</code></td><td><code>(2,)</code></td><td><code>(1, 2)</code></td><td>error</td><td>3 vs 2 in the last dimension</td></tr>
+</table>
+
+<p>(Each row was checked with <code>torch.broadcast_shapes</code>.)</p>
+
+<h4>Position embeddings: <code>(B, T, C) + (T, C)</code></h4>
+
+<div class="code" data-lang="python">
+<pre><code>torch.manual_seed(0)
+B, T, C = 2, 5, 16
+tok = torch.randn(B, T, C)        # token_embedding_table[batch_ids]
+pos = torch.randn(T, C)           # position_embedding_table[:T]
+x = tok + pos                     # (B, T, C) + (T, C) -&gt; (B, T, C)
+print(x.shape)  # torch.Size([2, 5, 16])
+print(torch.equal(x[1, 3], tok[1, 3] + pos[3]))  # True</code></pre>
+</div>
+
+<p>The same <code>(T, C)</code> block of position rows is added to every sequence in the batch. In microgpt <code>B</code> is absent and both sides are <code>(T, C)</code>; the batched model in Chapter 8 adds <code>B</code> and this line does not change.</p>
+
+<h4>RMSNorm with <code>keepdim=True</code></h4>
+
+<p>Your <code>rms_norm</code> computes the mean of squares of one token's vector, then multiplies every element by <code>(mean_square + 1e-5) ** -0.5</code>. On the test input <code>[3, 4]</code>, mean square is (9 + 16) / 2 = 12.5:</p>
+
+<div class="code" data-lang="python">
+<pre><code>x = torch.tensor([[3.0, 4.0]])                 # one token, C = 2
+ms = (x * x).mean(dim=-1, keepdim=True)        # mean square, shape (1, 1)
+print(ms)  # tensor([[12.5000]])
+y = x * torch.rsqrt(ms + 1e-5)                 # (1, 2) * (1, 1)
+print(y)  # tensor([[0.8485, 1.1314]])
+print(F.rms_norm(x, (2,), eps=1e-5))  # tensor([[0.8485, 1.1314]])</code></pre>
+</div>
+
+<p>Your scalar code prints <code>[0.8485, 1.1314]</code> for the same input. <code>torch.rsqrt(v)</code> is <code>1 / sqrt(v)</code>, the same <code>** -0.5</code>. The mean is taken over <code>dim=-1</code> (the channels of each token) and kept as a size-1 dimension, so <code>(1, 2) * (1, 1)</code> scales each row by its own factor. For a whole batch the code is identical:</p>
+
+<div class="code" data-lang="python">
+<pre><code>def rms_norm(x, eps=1e-5):
+    ms = x.pow(2).mean(dim=-1, keepdim=True)   # (B, T, 1)
+    return x * torch.rsqrt(ms + eps)           # (B, T, C) * (B, T, 1)
+
+
+torch.manual_seed(0)
+x = torch.randn(2, 5, 16)
+print(torch.allclose(rms_norm(x), F.rms_norm(x, (16,), eps=1e-5)))  # True</code></pre>
+</div>
+
+<p>That is <code>F.rms_norm(inputs, (fast_embedding_size,), eps=1e-5)</code> in <code>FastMicroGPT</code>. Now drop <code>keepdim</code>. The mean square has shape <code>(T,)</code>, and broadcasting aligns it with the <em>last</em> dimension of <code>(T, C)</code>, the channels, not the tokens. microgpt has <code>block_size = 16</code> and <code>C = 16</code>, so for a name that fills the context, <code>T == C</code> and the shapes are compatible:</p>
+
+<div class="code" data-lang="python">
+<pre><code>def rms_norm_bug(x, eps=1e-5):
+    ms = x.pow(2).mean(dim=-1)                 # no keepdim: shape (T,)
+    return x * torch.rsqrt(ms + eps)
+
+
+torch.manual_seed(0)
+x16 = torch.randn(16, 16)                      # a 16-token name: T == C
+y = rms_norm_bug(x16)                          # no error...
+print(torch.allclose(y, F.rms_norm(x16, (16,), eps=1e-5)))  # False
+rms_norm_bug(torch.randn(5, 16))               # a 5-token name</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>False
+RuntimeError: The size of tensor a (16) must match the size of tensor b (5) at non-singleton dimension 1</code></pre>
+</div>
+
+<p>The buggy version crashes on a 5-token name but runs silently on a 16-token one, scaling column <code>j</code> by token <code>j</code>'s factor. A test suite with only short names would pass. <strong>Use <code>keepdim=True</code> whenever a reduced tensor is combined with the original.</strong></p>
+
+<h4>The classic: <code>(B,)</code> minus <code>(B, 1)</code></h4>
+
+<div class="code" data-lang="python">
+<pre><code>pred = torch.tensor([[1.0], [2.0], [3.0], [4.0]])   # (B, 1): model output
+target = torch.tensor([1.0, 2.0, 3.0, 5.0])         # (B,)
+diff = pred - target
+print(diff.shape)  # torch.Size([4, 4])
+print((diff ** 2).mean())  # tensor(3.5000)
+print(((pred.squeeze(-1) - target) ** 2).mean())  # tensor(0.2500)</code></pre>
+</div>
+
+<p>A model that outputs one number per example usually returns <code>(B, 1)</code>; targets are usually <code>(B,)</code>. Subtracting gives <code>(B, B)</code>, every prediction minus every target, and <code>.mean()</code> happily reduces that to one wrong number: 3.5 instead of 0.25. No error, and training even makes some progress. Squeeze or reshape so the shapes match exactly, and assert shapes in loss code.</p>
+
+<div class="callout tip">
+<div class="callout-title">Annotate shapes</div>
+<p>Write the expected shape next to every line of tensor code, as in <code>FastMicroGPT</code> and the snippets here: <code># (B, T, C)</code>. When you read code written by others, do the same on paper. Most broadcasting bugs are found by noticing that a comment and a <code>.shape</code> disagree. An <code>assert x.shape == (B, T, C)</code> at the top of a function turns a silent bug into an immediate error; Chapter 12 returns to shape debugging.</p>
+</div>
+
+<h2 id="matmul">Matrix multiplication</h2>
+
+<p><code>a @ b</code> (or <code>torch.matmul(a, b)</code>) is the operation that does almost all the arithmetic in a transformer. Its shape rules depend on how many dimensions the inputs have:</p>
+
+<table>
+  <tr><th>a</th><th>b</th><th>a @ b</th><th>meaning</th></tr>
+  <tr><td><code>(n,)</code></td><td><code>(n,)</code></td><td><code>()</code></td><td>dot product</td></tr>
+  <tr><td><code>(m, n)</code></td><td><code>(n,)</code></td><td><code>(m,)</code></td><td>matrix × vector</td></tr>
+  <tr><td><code>(n,)</code></td><td><code>(n, p)</code></td><td><code>(p,)</code></td><td>vector × matrix</td></tr>
+  <tr><td><code>(m, n)</code></td><td><code>(n, p)</code></td><td><code>(m, p)</code></td><td>matrix × matrix</td></tr>
+  <tr><td><code>(..., m, n)</code></td><td><code>(..., n, p)</code></td><td><code>(..., m, p)</code></td><td>batched: the leading <code>...</code> dimensions broadcast</td></tr>
+</table>
+
+<p>The last two dimensions are the matrix; everything before them is a batch of independent matrices. The inner sizes (<code>n</code>) must agree.</p>
+
+<div class="code" data-lang="python">
+<pre><code>a = torch.tensor([1.0, 2.0, 3.0])
+b = torch.tensor([4.0, 5.0, 6.0])
+M = torch.tensor([[1.0, 0.0, 1.0],
+                  [0.0, 1.0, 0.0]])          # (2, 3)
+
+print(a @ b)  # tensor(32.)
+print(M @ a)  # tensor([4., 2.])
+print(torch.tensor([1.0, 1.0]) @ M)  # tensor([1., 1., 1.])
+print((M @ M.T).shape)  # torch.Size([2, 2])
+print(torch.equal(torch.matmul(M, a), M @ a))  # True</code></pre>
+</div>
+
+<div class="code" data-lang="python">
+<pre><code>A = torch.randn(8, 5, 4)
+W = torch.randn(8, 4, 3)
+print((A @ W).shape)  # torch.Size([8, 5, 3])
+print((A @ torch.randn(4, 3)).shape)  # torch.Size([8, 5, 3])
+print((torch.randn(2, 1, 5, 4) @ torch.randn(3, 4, 6)).shape)  # torch.Size([2, 3, 5, 6])
+torch.randn(2, 3) @ torch.randn(2, 3)</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>RuntimeError: mat1 and mat2 shapes cannot be multiplied (2x3 and 2x3)</code></pre>
+</div>
+
+<p>In the second line a single <code>(4, 3)</code> matrix is applied to all 8 batch entries. In the third, the batch dimensions <code>(2, 1)</code> and <code>(3,)</code> broadcast to <code>(2, 3)</code>. The error is the inner-dimension mismatch: 3 against 2.</p>
+
+<h4><code>nn.Linear</code> is your <code>linear</code>: <code>x @ W.T + b</code></h4>
+
+<p>microgpt stores every weight matrix <code>[out][in]</code>: <code>mlp_expand_weights</code> is <code>make_matrix(64, 16)</code>, one row of 16 input weights for each of the 64 outputs. Each output is the dot product of the input with one row, so the tensor form is <code>x @ W.T</code>. PyTorch's <code>nn.Linear(in_features, out_features)</code> uses the same layout and adds an optional bias. Here is your file's own test, inputs <code>[2, 3]</code> and expected <code>[-1, 7]</code>:</p>
+
+<div class="code" data-lang="python">
+<pre><code>x = torch.tensor([2.0, 3.0])                  # linear_inputs
+W = torch.tensor([[1.0, -1.0],                # linear_weights, [out][in]
+                  [0.5,  2.0]])
+print(x @ W.T)  # tensor([-1.,  7.])
+print(F.linear(x, W))  # tensor([-1.,  7.])
+
+lin = nn.Linear(2, 2, bias=False)
+with torch.no_grad():
+    lin.weight.copy_(W)                       # load microgpt's weights
+    print(lin(x))  # tensor([-1.,  7.])
+
+mlp_expand = nn.Linear(16, 64)
+print(mlp_expand.weight.shape)  # torch.Size([64, 16])
+print(mlp_expand.bias.shape)  # torch.Size([64])
+X = torch.randn(2, 5, 16)                     # (B, T, C)
+Y = mlp_expand(X)
+print(Y.shape)  # torch.Size([2, 5, 64])
+ref = X @ mlp_expand.weight.T + mlp_expand.bias
+print(torch.allclose(Y, ref, atol=1e-6))  # True</code></pre>
+</div>
+
+<p><code>nn.Linear(16, 64).weight</code> has shape <code>(64, 16)</code>: <code>[out, in]</code>, exactly <code>mlp_expand_weights</code>. Because <code>@</code> batches over leading dimensions, the same layer maps <code>(B, T, 16)</code> to <code>(B, T, 64)</code>, with no change to the code. <code>FastMicroGPT</code> skips the module and calls <code>F.linear(normalized_inputs, self.query_weights)</code>, the bias-free function form. (The <code>torch.no_grad()</code> block is needed to overwrite a parameter; Chapter 4 explains why.)</p>
+
+<h4>Batched matmul for attention scores</h4>
+
+<p>For attention, every query is dotted with every key, for every head and every sequence in the batch. With queries and keys shaped <code>(B, H, T, D)</code>, transpose the keys' last two dimensions and multiply:</p>
+
+<div class="code" data-lang="python">
+<pre><code>torch.manual_seed(0)
+B, H, T, D = 2, 4, 5, 4
+q = torch.randn(B, H, T, D)
+k = torch.randn(B, H, T, D)
+
+scores = q @ k.transpose(-2, -1)             # (B, H, T, D) @ (B, H, D, T)
+print(scores.shape)  # torch.Size([2, 4, 5, 5])
+print(torch.allclose(scores[1, 2, 3, 4], q[1, 2, 3] @ k[1, 2, 4]))  # True
+
+scores_e = torch.einsum("bhtd,bhsd-&gt;bhts", q, k)
+print(torch.allclose(scores, scores_e))  # True</code></pre>
+</div>
+
+<p><code>(B, H, T, D) @ (B, H, D, T)</code> gives <code>(B, H, T, T)</code>: <code>scores[b, h, t, s]</code> is the dot product of query <code>t</code> with key <code>s</code>, which is one entry of <code>attention_logits</code> in microgpt_scalar's <code>attention_head</code> (before the <code>/ head_size**0.5</code>). <code>FastMicroGPT</code> has no batch dimension, so it writes <code>query @ key.transpose(-2, -1)</code> on <code>(H, T, D)</code> tensors; using <code>-2, -1</code> makes the same line work with or without <code>B</code>.</p>
+
+<h4><code>torch.einsum</code></h4>
+
+<p><strong>einsum</strong> (Einstein summation) names each dimension with a letter. Letters that appear in the inputs but not in the output are multiplied and summed over. <code>"bhtd,bhsd-&gt;bhts"</code> says: for each <code>b, h, t, s</code>, sum over <code>d</code> of <code>q[b,h,t,d] * k[b,h,s,d]</code>. That is the attention score, written without thinking about transposes. More examples:</p>
+
+<div class="code" data-lang="python">
+<pre><code>torch.manual_seed(0)
+x = torch.randn(5, 16)
+W = torch.randn(64, 16)
+a, b = torch.randn(3), torch.randn(3)
+
+print(torch.allclose(torch.einsum("ti,oi-&gt;to", x, W), x @ W.T))  # True
+print(torch.allclose(torch.einsum("i,i-&gt;", a, b), a @ b))  # True
+print(torch.einsum("ti-&gt;it", x).shape)  # torch.Size([16, 5])
+print(torch.allclose(torch.einsum("ti-&gt;t", x), x.sum(dim=1)))  # True</code></pre>
+</div>
+
+<p>einsum is easiest to read and check; <code>@</code> is what most production code uses. Both end up in the same matmul kernels for these patterns.</p>
+
+<h2 id="masks"><code>where</code>, <code>masked_fill</code> and the causal mask</h2>
+
+<p><code>torch.where(cond, a, b)</code> is an elementwise if-else: take <code>a</code> where <code>cond</code> is <code>True</code>, else <code>b</code>, with all three broadcast together. <code>x.masked_fill(mask, value)</code> is the common special case "replace the masked elements with one value".</p>
+
+<div class="code" data-lang="python">
+<pre><code>x = torch.tensor([-2.0, 0.5, -1.0, 3.0])
+print(torch.where(x &gt; 0, x, 0.0))  # tensor([0.0000, 0.5000, 0.0000, 3.0000])
+print(torch.where(x &gt; 0, 1, -1))  # tensor([-1,  1, -1,  1])
+print(x.masked_fill(x &lt; 0, 0.0))  # tensor([0.0000, 0.5000, 0.0000, 3.0000])</code></pre>
+</div>
+
+<p>A <strong>causal mask</strong> stops position <code>t</code> from attending to positions after it. In microgpt_scalar this is implicit: the KV cache only contains keys for positions already processed. With all positions computed at once, the <code>(T, T)</code> score matrix contains every pair, and the "future" half (above the diagonal) must be removed. <code>torch.triu(m, diagonal=1)</code> keeps the part of <code>m</code> strictly above the main diagonal and zeroes the rest; on a boolean matrix of ones it marks exactly the future positions:</p>
+
+<div class="code" data-lang="python">
+<pre><code>T = 4
+mask = torch.triu(torch.ones(T, T, dtype=torch.bool), diagonal=1)
+print(mask)
+# tensor([[False,  True,  True,  True],
+#         [False, False,  True,  True],
+#         [False, False, False,  True],
+#         [False, False, False, False]])
+
+scores = torch.zeros(T, T)                       # pretend every score is 0
+scores = scores.masked_fill(mask, float("-inf"))
+print(scores)
+# tensor([[0., -inf, -inf, -inf],
+#         [0., 0., -inf, -inf],
+#         [0., 0., 0., -inf],
+#         [0., 0., 0., 0.]])
+print(torch.softmax(scores, dim=-1))
+# tensor([[1.0000, 0.0000, 0.0000, 0.0000],
+#         [0.5000, 0.5000, 0.0000, 0.0000],
+#         [0.3333, 0.3333, 0.3333, 0.0000],
+#         [0.2500, 0.2500, 0.2500, 0.2500]])</code></pre>
+</div>
+
+<p>Setting a score to <code>-inf</code> makes its <code>exp</code> exactly 0, so masked positions get zero weight and the rest still sum to 1. With all scores equal, row <code>t</code> spreads its attention evenly over the <code>t + 1</code> visible positions. This is the code in <code>FastMicroGPT</code>: the mask is built once in <code>__init__</code> for the full <code>block_size</code>, then sliced to the current length and broadcast over the heads:</p>
+
+<div class="code" data-lang="python">
+<div class="code-hdr"><span class="lang">python</span><span class="title">microgpt.py</span></div>
+<pre><code>            causal_mask = torch.triu(
+                torch.ones(
+                    fast_block_size,
+                    fast_block_size,
+                    dtype=torch.bool,
+                ),
+                diagonal=1,
+            )
+            ...
+            attention_logits = attention_logits.masked_fill(
+                self.causal_mask[:sequence_length, :sequence_length],
+                float("-inf"),
+            )</code></pre>
+</div>
+
+<div class="code" data-lang="python">
+<pre><code>H, T = 4, 5
+causal_mask = torch.triu(torch.ones(16, 16, dtype=torch.bool), diagonal=1)  # block_size 16
+scores = torch.randn(H, T, T)
+masked = scores.masked_fill(causal_mask[:T, :T], float("-inf"))   # (H,T,T) with (T,T)
+print(masked.shape)  # torch.Size([4, 5, 5])
+print(torch.softmax(masked, dim=-1)[2].triu(diagonal=1).abs().sum())  # tensor(0.)</code></pre>
+</div>
+
+<p>The same mask can be written the other way round: <code>torch.tril</code> keeps the lower triangle, giving the positions to <em>keep</em>, and <code>torch.where</code> picks scores or <code>-inf</code>:</p>
+
+<div class="code" data-lang="python">
+<pre><code>T = 4
+torch.manual_seed(0)
+scores = torch.randn(T, T)
+
+mask = torch.triu(torch.ones(T, T, dtype=torch.bool), diagonal=1)
+a = scores.masked_fill(mask, float("-inf"))
+
+keep = torch.tril(torch.ones(T, T, dtype=torch.bool))     # True on/below diagonal
+b = torch.where(keep, scores, float("-inf"))
+print(torch.equal(a, b))  # True
+print(torch.equal(keep, ~mask))  # True</code></pre>
+</div>
+
+<div class="callout pitfall">
+<div class="callout-title">A fully masked row gives NaN</div>
+<div class="code" data-lang="python">
+<pre><code>row = torch.full((3,), float("-inf"))
+print(torch.softmax(row, dim=-1))  # tensor([nan, nan, nan])</code></pre>
+</div>
+<p>If every position in a row is masked, softmax computes <code>0 / 0</code>. A causal mask never does this (the diagonal is always visible), but a padding mask combined with it can, for a row that is entirely padding. The NaN then spreads through every later operation that touches it. Chapter 6 comes back to masks.</p>
+</div>
+
+<div class="hands-on">
+<div class="hands-on-hdr">Hands-on · do this now</div>
+<div class="hands-on-body">
+<p>1. In a Python shell, reproduce three numbers from <code>microgpt_scalar.py</code> with tensor code only: <code>linear</code> on <code>[2, 3]</code> giving <code>[-1, 7]</code>, <code>softmax</code> on <code>[1, 2, 3]</code> giving <code>[0.09, 0.2447, 0.6652]</code>, and <code>rms_norm</code> on <code>[3, 4]</code> giving <code>[0.8485, 1.1314]</code>.</p>
+<p>2. Before running each line, say the shape out loud, then check with <code>torch.broadcast_shapes</code> or <code>.shape</code>: <code>torch.ones(3, 1) + torch.ones(4)</code>, <code>torch.ones(2, 5, 16) @ torch.ones(16, 64)</code>, <code>torch.ones(4, 5, 4) @ torch.ones(4, 5, 4).transpose(-2, -1)</code>.</p>
+<p>3. Build the causal mask for <code>T = 6</code> with <code>triu</code>, apply it to <code>torch.zeros(6, 6)</code>, softmax each row, and confirm row 5 is all <code>0.1667</code>.</p>
+</div>
+</div>
+
+<h2 id="exercises">Exercises</h2>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 3.1</span>
+  <span class="exercise-diff easy">easy</span>
+  <span class="exercise-title">Shape prediction drill</span>
+</div>
+<div class="exercise-body">
+<p>With <code>r = torch.randn</code>, write down the result shape (or "error") for each, then check:</p>
+<div class="code" data-lang="python">
+<pre><code>r(4, 3) + r(3)              r(4, 3) + r(4)              r(4, 1) * r(1, 5)
+r(2, 3, 4).sum(dim=1)       r(2, 3, 4).mean(-1, keepdim=True)
+r(5, 3) @ r(3)              r(2, 5, 3) @ r(3, 7)        r(2, 1, 5, 3) @ r(4, 3, 6)
+r(8) - r(8, 1)              r(3, 4).max(dim=0).indices</code></pre>
+</div>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<div class="code" data-lang="python">
+<pre><code>import torch
+
+r = torch.randn
+exprs = {
+    "r(4, 3) + r(3)":               lambda: r(4, 3) + r(3),
+    "r(4, 3) + r(4)":               lambda: r(4, 3) + r(4),
+    "r(4, 1) * r(1, 5)":            lambda: r(4, 1) * r(1, 5),
+    "r(2, 3, 4).sum(dim=1)":        lambda: r(2, 3, 4).sum(dim=1),
+    "r(2, 3, 4).mean(-1, keepdim=True)": lambda: r(2, 3, 4).mean(-1, keepdim=True),
+    "r(5, 3) @ r(3)":               lambda: r(5, 3) @ r(3),
+    "r(2, 5, 3) @ r(3, 7)":         lambda: r(2, 5, 3) @ r(3, 7),
+    "r(2, 1, 5, 3) @ r(4, 3, 6)":   lambda: r(2, 1, 5, 3) @ r(4, 3, 6),
+    "r(8) - r(8, 1)":               lambda: r(8) - r(8, 1),
+    "r(3, 4).max(dim=0).indices":   lambda: r(3, 4).max(dim=0).indices,
+}
+for text, fn in exprs.items():
+    try:
+        shape = tuple(fn().shape)
+    except RuntimeError as e:
+        shape = "error"
+    print(f"{text:36} -&gt; {shape}")</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>r(4, 3) + r(3)                       -&gt; (4, 3)
+r(4, 3) + r(4)                       -&gt; error
+r(4, 1) * r(1, 5)                    -&gt; (4, 5)
+r(2, 3, 4).sum(dim=1)                -&gt; (2, 4)
+r(2, 3, 4).mean(-1, keepdim=True)    -&gt; (2, 3, 1)
+r(5, 3) @ r(3)                       -&gt; (5,)
+r(2, 5, 3) @ r(3, 7)                 -&gt; (2, 5, 7)
+r(2, 1, 5, 3) @ r(4, 3, 6)           -&gt; (2, 4, 5, 6)
+r(8) - r(8, 1)                       -&gt; (8, 8)
+r(3, 4).max(dim=0).indices           -&gt; (4,)</code></pre>
+</div>
+<p><code>r(4, 3) + r(4)</code> fails because broadcasting aligns from the right (3 against 4); you meant <code>r(4)[:, None]</code>. In <code>r(2, 1, 5, 3) @ r(4, 3, 6)</code> the matrices are <code>(5, 3) @ (3, 6)</code> and the batch dimensions <code>(2, 1)</code> and <code>(4,)</code> broadcast to <code>(2, 4)</code>.</p>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 3.2</span>
+  <span class="exercise-diff easy">easy</span>
+  <span class="exercise-title">Reductions on a 2×3 tensor</span>
+</div>
+<div class="exercise-body">
+<p>For <code>x = torch.tensor([[2., 7., 1.], [8., 3., 9.]])</code>, predict <code>x.sum(dim=0)</code>, <code>x.mean(dim=1, keepdim=True)</code>, <code>x.max(dim=0)</code>, <code>x.argmax()</code>, <code>x.argmax(dim=1)</code> and the shape of <code>x.min(dim=1, keepdim=True).values</code>.</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<div class="code" data-lang="python">
+<pre><code>import torch
+
+x = torch.tensor([[2.0, 7.0, 1.0],
+                  [8.0, 3.0, 9.0]])
+print(x.sum(dim=0))  # tensor([10., 10., 10.])
+print(x.mean(dim=1, keepdim=True))
+print(x.max(dim=0).values, x.max(dim=0).indices)  # tensor([8., 7., 9.]) tensor([1, 0, 1])
+print(x.argmax())  # tensor(5)
+print(x.argmax(dim=1))  # tensor([1, 2])
+print(x.min(dim=1, keepdim=True).values.shape)  # torch.Size([2, 1])</code></pre>
+</div>
+<p><code>mean(dim=1, keepdim=True)</code> is <code>[[3.3333], [6.6667]]</code>, shape <code>(2, 1)</code>. <code>argmax()</code> without a <code>dim</code> is 5: the 9 is the last element of the flattened tensor.</p>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 3.3</span>
+  <span class="exercise-diff medium">medium</span>
+  <span class="exercise-title">Broadcasting bug hunt</span>
+</div>
+<div class="exercise-body">
+<p>Each line has a shape bug. Say whether it crashes or silently computes the wrong thing, then fix it. (a) Center each row of a <code>(3, 3)</code> tensor: <code>x - x.mean(dim=1)</code>. (b) Weight per-token losses <code>(B, T) = (4, 6)</code> by per-example weights <code>w</code> of shape <code>(4,)</code>: <code>losses * w</code>. (c) Accuracy of predicted ids <code>(B,)</code> against targets: <code>(pred_ids == target_ids[:, None]).float().mean()</code>.</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<div class="code" data-lang="python">
+<pre><code>import torch
+
+torch.manual_seed(0)
+
+# (a) center each row of a 3x3 batch
+x = torch.randn(3, 3)
+bad = x - x.mean(dim=1)
+good = x - x.mean(dim=1, keepdim=True)
+print(bad.mean(dim=1))
+print(good.mean(dim=1).abs().max() &lt; 1e-6)  # tensor(True)
+
+# (b) weight each example's per-token losses
+losses = torch.rand(4, 6)            # (B, T)
+w = torch.tensor([1.0, 0.5, 0.5, 2.0])  # (B,)
+try:
+    losses * w
+except RuntimeError as e:
+    print("(b)", e)
+print((losses * w[:, None]).shape)  # torch.Size([4, 6])
+
+# (c) accuracy of predicted token ids
+pred_ids = torch.tensor([3, 1, 4, 1])
+target_ids = torch.tensor([3, 1, 5, 9])
+bad_acc = (pred_ids == target_ids[:, None]).float().mean()
+good_acc = (pred_ids == target_ids).float().mean()
+print(bad_acc, good_acc)  # tensor(0.1875) tensor(0.5000)</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>tensor([-0.0522, -0.3800,  0.4322])
+tensor(True)
+(b) The size of tensor a (6) must match the size of tensor b (4) at non-singleton dimension 1
+torch.Size([4, 6])
+tensor(0.1875) tensor(0.5000)</code></pre>
+</div>
+<p>(a) is silent because the matrix is square: the <code>(3,)</code> means are subtracted along columns, and the rows do not end up with mean zero. (b) crashes, which is the lucky case; <code>w[:, None]</code> makes it <code>(4, 1)</code>. (c) is silent: <code>(4,)</code> against <code>(4, 1)</code> compares every prediction with every target, a <code>(4, 4)</code> table, and reports 3/16 instead of 2/4.</p>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 3.4</span>
+  <span class="exercise-diff medium">medium</span>
+  <span class="exercise-title">Stable <code>log_softmax</code> and cross-entropy</span>
+</div>
+<div class="exercise-body">
+<p>Write <code>log_softmax(x, dim=-1)</code> without ever computing <code>softmax</code> first, and show why <code>torch.softmax(x).log()</code> is not good enough. Then use it to compute the mean negative log-likelihood of targets <code>[4, 12, 12, 0, 26]</code> (<code>e m m a BOS</code>) under random <code>(5, 27)</code> logits, and match <code>F.cross_entropy</code>.</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<div class="code" data-lang="python">
+<pre><code>import torch
+import torch.nn.functional as F
+
+
+def log_softmax(x, dim=-1):
+    m = x.max(dim=dim, keepdim=True).values
+    shifted = x - m
+    return shifted - shifted.exp().sum(dim=dim, keepdim=True).log()
+
+
+big = torch.tensor([1000.0, 1001.0, 1002.0])
+print(log_softmax(big))  # tensor([-2.4076, -1.4076, -0.4076])
+print(torch.allclose(log_softmax(big), F.log_softmax(big, dim=-1)))  # True
+
+extreme = torch.tensor([0.0, 200.0])
+print(torch.softmax(extreme, dim=-1).log())  # tensor([-inf, 0.])
+print(log_softmax(extreme))  # tensor([-200.,    0.])
+
+torch.manual_seed(0)
+logits = torch.randn(5, 27)                  # (T, V): one row per position
+targets = torch.tensor([4, 12, 12, 0, 26])   # e m m a BOS
+nll = -log_softmax(logits)[torch.arange(5), targets]   # each row's target
+print(nll.mean())  # tensor(3.2367)
+print(F.cross_entropy(logits, targets))  # tensor(3.2367)</code></pre>
+</div>
+<p><code>log(exp(s_i) / Σ exp(s_j)) = s_i - log Σ exp(s_j)</code> with <code>s = x - max(x)</code>, so no division and no tiny probability is ever formed. Through <code>softmax</code>, <code>exp(-200)</code> underflows to 0 in <code>float32</code> and its log is <code>-inf</code>; the direct formula gives the exact <code>-200</code>. <code>log_softmax(logits)[torch.arange(5), targets]</code> uses fancy indexing to pick row <code>i</code>, column <code>targets[i]</code>: this is microgpt_scalar's <code>negative_log_likelihood</code> for every position at once, and <code>F.cross_entropy</code> is exactly this mean.</p>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 3.5</span>
+  <span class="exercise-diff medium">medium</span>
+  <span class="exercise-title">RMSNorm with a learnable gain</span>
+</div>
+<div class="exercise-body">
+<p>Most RMSNorm layers multiply the normalised vector by a learnable per-channel <code>weight</code> of shape <code>(C,)</code> (microgpt omits it). Write <code>rms_norm(x, weight, eps)</code> for <code>(B, T, C)</code> input, check it against <code>F.rms_norm(x, (C,), weight=weight, eps=1e-5)</code>, and check that with <code>weight = 1</code> every token's output has mean square 1.</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<div class="code" data-lang="python">
+<pre><code>import torch
+import torch.nn.functional as F
+
+
+def rms_norm(x, weight, eps=1e-5):
+    ms = x.pow(2).mean(dim=-1, keepdim=True)        # (B, T, 1)
+    return x * torch.rsqrt(ms + eps) * weight       # (B, T, C) * (B, T, 1) * (C,)
+
+
+torch.manual_seed(0)
+B, T, C = 2, 5, 16
+x = torch.randn(B, T, C)
+weight = torch.rand(C)                              # learnable gain, one per channel
+mine = rms_norm(x, weight)
+ref = F.rms_norm(x, (C,), weight=weight, eps=1e-5)
+print(mine.shape, torch.allclose(mine, ref, atol=1e-6))  # torch.Size([2, 5, 16]) True
+print(rms_norm(x, torch.ones(C)).pow(2).mean(dim=-1)[0])
+# tensor([1.0000, 1.0000, 1.0000, 1.0000, 1.0000])</code></pre>
+</div>
+<p>Two broadcasts in one line: <code>(B, T, C) * (B, T, 1)</code> scales each token by its own factor, then <code>* (C,)</code> (aligned as <code>(1, 1, C)</code>) scales each channel. The mean squares come out as 1.0000 (just below 1 because of <code>eps</code>), the property your scalar test checked with <code>rms_output_magnitude</code>.</p>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 3.6</span>
+  <span class="exercise-diff hard">hard</span>
+  <span class="exercise-title">Attention scores three ways</span>
+</div>
+<div class="exercise-body">
+<p>For random <code>q, k, v</code> of shape <code>(B, H, T, D) = (2, 4, 5, 4)</code>, compute the attention scores with four nested Python loops, with <code>@</code>, and with <code>einsum</code>, and show they match. Then scale by <code>1/sqrt(D)</code>, apply a causal mask, softmax, and verify that every row sums to 1 and nothing above the diagonal gets weight. Finish with the output <code>weights @ v</code>, also checked with einsum.</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<div class="code" data-lang="python">
+<pre><code>import torch
+
+torch.manual_seed(0)
+B, H, T, D = 2, 4, 5, 4
+q, k, v = torch.randn(B, H, T, D), torch.randn(B, H, T, D), torch.randn(B, H, T, D)
+
+# 1. Python loops: one dot product at a time
+loops = torch.empty(B, H, T, T)
+for b in range(B):
+    for h in range(H):
+        for t in range(T):
+            for s in range(T):
+                loops[b, h, t, s] = (q[b, h, t] * k[b, h, s]).sum()
+
+# 2. batched matmul and 3. einsum
+mm = q @ k.transpose(-2, -1)
+es = torch.einsum("bhtd,bhsd-&gt;bhts", q, k)
+print(torch.allclose(loops, mm, atol=1e-6), torch.allclose(mm, es, atol=1e-6))  # True True
+
+mask = torch.triu(torch.ones(T, T, dtype=torch.bool), diagonal=1)
+weights = torch.softmax((mm / D**0.5).masked_fill(mask, float("-inf")), dim=-1)
+print(torch.allclose(weights.sum(dim=-1), torch.ones(B, H, T)))  # True
+print(weights.triu(diagonal=1).abs().max())  # tensor(0.)
+out = weights @ v
+print(out.shape)  # torch.Size([2, 4, 5, 4])
+print(torch.allclose(out, torch.einsum("bhts,bhsd-&gt;bhtd", weights, v), atol=1e-6))  # True</code></pre>
+</div>
+<p>The loop version is microgpt_scalar's <code>attention_head</code> structure, run for every head and batch entry. The <code>(T, T)</code> mask broadcasts over <code>(B, H)</code>. The output einsum <code>"bhts,bhsd-&gt;bhtd"</code> sums over key positions <code>s</code>: each output is a weighted average of value rows, as in <code>head_output</code>. Chapter 6 wraps this into a module and compares it with <code>F.scaled_dot_product_attention</code>.</p>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 3.7</span>
+  <span class="exercise-diff hard">hard</span>
+  <span class="exercise-title">Matmul from broadcasting</span>
+</div>
+<div class="exercise-body">
+<p>Implement <code>x @ W.T</code> for <code>x</code> of shape <code>(T, IN)</code> and <code>W</code> of shape <code>(OUT, IN)</code> using only broadcasting, <code>*</code> and <code>sum</code>. Check it matches. With <code>T = 64, IN = OUT = 512</code>, how much memory does the intermediate take, and how does the time compare to <code>@</code>?</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<p>Timings measured on an Apple Silicon laptop CPU (yours will differ):</p>
+<div class="code" data-lang="python">
+<pre><code>import statistics
+import time
+
+import torch
+
+torch.manual_seed(0)
+T, IN, OUT = 64, 512, 512
+x = torch.randn(T, IN)
+W = torch.randn(OUT, IN)
+
+products = x[:, None, :] * W[None, :, :]       # (T, 1, IN) * (1, OUT, IN)
+print(products.shape)  # torch.Size([64, 512, 512])
+print(products.numel() * products.element_size() / 2**20, "MiB")  # 64.0 MiB
+y = products.sum(dim=-1)                       # (T, OUT)
+print(torch.allclose(y, x @ W.T, atol=1e-3))  # True
+
+
+def bench(fn, repeats=20):
+    for _ in range(3):
+        fn()
+    times = []
+    for _ in range(repeats):
+        start = time.perf_counter()
+        fn()
+        times.append(time.perf_counter() - start)
+    return statistics.median(times)
+
+
+t_bcast = bench(lambda: (x[:, None, :] * W[None, :, :]).sum(dim=-1))
+t_mm = bench(lambda: x @ W.T)
+print(f"broadcast+sum: {t_bcast * 1e3:.2f} ms   matmul: {t_mm * 1e3:.3f} ms")
+# broadcast+sum: 0.61 ms   matmul: 0.035 ms</code></pre>
+</div>
+<p><code>x[:, None, :]</code> is <code>(T, 1, IN)</code> and <code>W[None, :, :]</code> is <code>(1, OUT, IN)</code>; their product is every input row times every weight row, <code>(T, OUT, IN)</code>, and summing <code>IN</code> gives the dot products. The arithmetic is the same as the matmul, but eager PyTorch materialises all 16.8 million products (64 MiB) in memory, then reads them back to sum. The matmul kernel keeps partial sums in registers and reuses each loaded tile of <code>x</code> and <code>W</code> many times, so it is roughly 15 to 20 times faster here (16× to 17× across runs on this machine). This gap between "same math" and "same memory traffic" is what kernel fusion and <code>torch.compile</code> (Chapter 11) are about.</p>
+</div>
+</details>
+</div>
+</div>
+
+<h2 id="recap">Recap</h2>
+<ul>
+  <li>Elementwise ops (<code>+ * / ** exp log relu</code>, comparisons) apply per element. A trailing underscore (<code>add_</code>) means in-place; <code>a += 1</code> is in-place too.</li>
+  <li>Reductions take <code>dim</code>; that dimension disappears unless <code>keepdim=True</code>. <code>max(dim)</code> returns values and indices; <code>argmax</code> without <code>dim</code> indexes the flattened tensor.</li>
+  <li>Softmax by hand: subtract the row max, <code>exp</code>, divide by the row sum, all with <code>dim=-1, keepdim=True</code>. Gives <code>[0.0900, 0.2447, 0.6652]</code> for <code>[1, 2, 3]</code>, like your scalar code.</li>
+  <li>Broadcasting: align shapes from the right, missing dimensions count as 1, size-1 dimensions stretch. <code>(B, T, C) + (T, C)</code> adds position embeddings; <code>keepdim</code> makes per-token scaling work.</li>
+  <li>Silent bugs: <code>(B,) - (B, 1)</code> gives <code>(B, B)</code>; a reduction without <code>keepdim</code> can broadcast along the wrong axis when two sizes happen to match (microgpt's <code>T = C = 16</code>).</li>
+  <li><code>@</code> batches over leading dimensions. <code>nn.Linear</code> computes <code>x @ W.T + b</code> with <code>W</code> stored <code>[out, in]</code>, like microgpt's weights. Attention scores are <code>(B, H, T, D) @ (B, H, D, T) -&gt; (B, H, T, T)</code>, or <code>einsum("bhtd,bhsd-&gt;bhts")</code>.</li>
+  <li>The causal mask is <code>triu(ones(T, T, dtype=bool), diagonal=1)</code>, applied with <code>masked_fill(mask, -inf)</code> before softmax. A row with everything masked becomes NaN.</li>
+</ul>
+
+<div class="page-nav">
+  <a href="02-tensors.html"><span class="lbl">← Prev</span><span class="ttl">Tensors</span></a>
+  <a href="04-autograd.html" class="next"><span class="lbl">Next →</span><span class="ttl">Autograd</span></a>
+</div>
+
+</main>
+</div>
+<script src="../assets/site.js"></script>
+</body>
+</html>

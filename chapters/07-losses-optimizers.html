@@ -1,0 +1,1032 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>7 · Losses &amp; Optimizers — PyTorch</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<button class="sidebar-toggle" aria-label="Toggle navigation">☰ Menu</button>
+<div class="layout">
+<aside class="sidebar">
+  <a href="../index.html" class="brand">PyTorch</a>
+  <span class="brand-sub">a deep dive — 2026</span>
+  <nav>
+    <ol>
+      <li><a href="01-why-pytorch.html">Why PyTorch</a></li>
+      <li><a href="02-tensors.html">Tensors</a></li>
+      <li><a href="03-tensor-math.html">Tensor Math &amp; Broadcasting</a></li>
+      <li><a href="04-autograd.html">Autograd</a></li>
+      <li><a href="05-nn-module.html">nn.Module</a></li>
+      <li><a href="06-transformer-blocks.html">Building a Transformer</a></li>
+      <li><a href="07-losses-optimizers.html">Losses &amp; Optimizers</a></li>
+      <li><a href="08-training-loop.html">The Training Loop</a></li>
+      <li><a href="09-devices-precision.html">Devices &amp; Precision</a></li>
+      <li><a href="10-inference.html">Inference &amp; Sampling</a></li>
+      <li><a href="11-performance.html">Performance &amp; Profiling</a></li>
+      <li><a href="12-debugging.html">Debugging PyTorch</a></li>
+      <li><a href="13-50-questions.html">The 50 Questions</a></li>
+      <li><a href="14-capstone.html">Capstone Project</a></li>
+    </ol>
+    <div class="extras">
+      <a href="../exercises.html">All Exercises</a>
+      <a href="../index.html">← Home</a>
+    </div>
+  </nav>
+  <div class="progress"></div>
+</aside>
+
+<main class="content">
+
+<h1>
+  <span class="chap-num">Chapter 07</span>
+  Losses &amp; Optimizers
+</h1>
+<p class="lede">
+  A model produces numbers; a <strong>loss</strong> turns them into one score
+  for "how wrong", and an <strong>optimizer</strong> uses the gradients of that
+  score to change the weights. You wrote both by hand in microgpt:
+  <code>negative_log_likelihood</code> and <code>apply_adam</code>. This chapter
+  shows the PyTorch versions, proves they compute the same numbers, and adds the
+  pieces every real training run uses: AdamW, learning-rate schedules, and
+  gradient clipping.
+</p>
+
+<h2 id="the-loss">What a loss function is</h2>
+
+<p>A <strong>loss function</strong> takes the model's output and the right answer and returns a single number that is small when the model is right. Training is the loop "compute the loss, compute its gradient with respect to every weight, nudge every weight downhill".</p>
+
+<p>For next-token prediction the right answer at each position is one token id out of the vocabulary. The model outputs one <strong>logit</strong> per vocabulary entry: a raw, unnormalised score, any real number. Softmax turns logits into probabilities, and the loss at that position is <code>-log(p[target])</code>, the <strong>negative log-likelihood</strong>. If the model gives the right token probability 1, the loss is 0; probability 0.5 costs 0.69; probability 0.01 costs 4.6. microgpt does exactly this in <code>negative_log_likelihood()</code>, and <code>calculate_document_loss()</code> averages it over the positions of one name.</p>
+
+<p>In classification language, each vocabulary entry is a <strong>class</strong>, the number of classes is <code>C</code> (27 for microgpt), and this loss is called <strong>cross-entropy</strong>.</p>
+
+<h2 id="cross-entropy"><code>F.cross_entropy</code> is your <code>negative_log_likelihood</code></h2>
+
+<p>Here are three positions and a toy vocabulary of 4 tokens. We compute the loss three ways: step by step with tensors, with <code>F.cross_entropy</code>, and with microgpt's own functions on plain Python floats.</p>
+
+<div class="code" data-lang="python">
+<div class="code-hdr"><span class="lang">python</span><span class="title">ce_by_hand.py</span></div>
+<pre><code>import math
+import torch
+import torch.nn.functional as F
+
+# 3 positions, a vocabulary of 4 tokens: one row of logits per position
+logits = torch.tensor([[2.0, 1.0, 0.1, -1.0],
+                       [0.5, 2.5, 0.0,  0.3],
+                       [1.0, 1.0, 1.0,  1.0]])
+targets = torch.tensor([0, 1, 3])        # correct next token at each position
+
+probs = torch.softmax(logits, dim=-1)    # each row sums to 1
+picked = probs[torch.arange(3), targets] # p[target] for each row
+per_token = -torch.log(picked)           # negative log-likelihood per position
+print(picked)                            # tensor([0.6381, 0.7529, 0.2500])
+print(per_token)                         # tensor([0.4493, 0.2838, 1.3863])
+print(per_token.mean())                  # tensor(0.7065)
+print(F.cross_entropy(logits, targets))  # tensor(0.7065)
+
+# microgpt's softmax + negative_log_likelihood + average, on plain floats
+def softmax(row):
+    m = max(row)
+    exps = [math.exp(x - m) for x in row]
+    total = sum(exps)
+    return [e / total for e in exps]
+
+def negative_log_likelihood(probabilities, target_id):
+    return -math.log(probabilities[target_id])
+
+token_losses = [negative_log_likelihood(softmax(row), t)
+                for row, t in zip(logits.tolist(), targets.tolist())]
+print([round(x, 4) for x in token_losses])   # [0.4493, 0.2838, 1.3863]
+print(sum(token_losses) / len(token_losses)) # 0.7064832182393465</code></pre>
+</div>
+
+<p>Same three per-token losses, same average. <code>probs[torch.arange(3), targets]</code> is advanced indexing from Chapter 2: row <code>i</code>, column <code>targets[i]</code>. The third row is all equal logits, so each token gets probability 0.25 and the loss is <code>ln 4 = 1.3863</code>.</p>
+
+<p>So <code>F.cross_entropy(logits, targets)</code> is <code>calculate_document_loss</code> for one name: softmax, pick the target probability, negative log, average. The PyTorch version takes <strong>raw logits</strong>, not probabilities, and does the softmax inside. The next section shows why.</p>
+
+<h2 id="log-softmax">Why it takes logits: <code>log_softmax</code></h2>
+
+<p>Computing <code>log(softmax(x))</code> in two steps breaks when the model is very confident and wrong. Probabilities live in float32, and float32 cannot store anything smaller than about 1.4e-45. A probability of <code>exp(-200)</code> becomes exactly 0, and <code>log(0)</code> is minus infinity.</p>
+
+<div class="code" data-lang="python">
+<div class="code-hdr"><span class="lang">python</span><span class="title">log_softmax.py</span></div>
+<pre><code>import torch
+import torch.nn.functional as F
+
+logits = torch.tensor([[0.0, 200.0]])   # the model is very sure of token 1
+target = torch.tensor([0])              # ...but the answer is token 0
+
+p = torch.softmax(logits, dim=-1)
+print(p)                                # tensor([[0., 1.]])  exp(-200) underflowed to 0
+print(-torch.log(p[0, 0]))              # tensor(inf)         the naive loss
+print(-F.log_softmax(logits, dim=-1)[0, 0])  # tensor(200.)
+print(F.cross_entropy(logits, target))       # tensor(200.)
+
+# the gradient of the naive version is poisoned too
+x = logits.clone().requires_grad_()
+naive = -torch.log(torch.softmax(x, dim=-1)[0, 0])
+naive.backward()
+print(x.grad)                           # tensor([[nan, nan]])
+
+x = logits.clone().requires_grad_()
+F.cross_entropy(x, target).backward()
+print(x.grad)                           # tensor([[-1.,  1.]])
+
+# and without subtracting the max first, exp itself overflows
+big = torch.tensor([100.0, 0.0])
+e = torch.exp(big)
+print(e)                                # tensor([inf, 1.])
+print(e / e.sum())                      # tensor([nan, 0.])</code></pre>
+</div>
+
+<p>The right answer is 200 (the logit gap), and <code>log_softmax</code> gets it because it never forms the tiny probability. It uses the identity</p>
+
+<div class="code" data-lang="text">
+<pre><code>log_softmax(x)_i = x_i - m - log( sum_j exp(x_j - m) )      where m = max(x)
+                 = x_i - logsumexp(x)</code></pre>
+</div>
+
+<p>After subtracting <code>m</code> the largest exponent is <code>exp(0) = 1</code>, so the sum is between 1 and <code>C</code> and its log is always finite. That max-subtraction is the same trick as the <code>maximum_logit</code> line in microgpt's <code>softmax()</code>; the last two prints above show what happens without it.</p>
+
+<div class="code" data-lang="python">
+<pre><code>import torch
+
+x = torch.tensor([0.0, 200.0])
+m = x.max()
+print(x - m - torch.log(torch.exp(x - m).sum()))   # tensor([-200.,    0.])
+print(x - torch.logsumexp(x, dim=0))               # tensor([-200.,    0.])
+print(torch.log_softmax(x, dim=0))                 # tensor([-200.,    0.])</code></pre>
+</div>
+
+<div class="callout hood">
+<div class="callout-title">Under the hood: two kernels, one formula</div>
+<p><code>F.cross_entropy(x, t)</code> computes <code>F.nll_loss(F.log_softmax(x, dim=1), t)</code>. <code>nll_loss</code> just picks <code>-logp[i, t[i]]</code> and reduces. The fused gradient is also simple: <code>softmax(x) - onehot(t)</code>, divided by <code>N</code> for the mean. That is the <code>[-1., 1.]</code> above: probabilities <code>[0, 1]</code> minus one-hot <code>[1, 0]</code>.</p>
+</div>
+
+<div class="callout pitfall">
+<div class="callout-title">Never softmax before <code>cross_entropy</code></div>
+<p>If your model already applies softmax and you pass probabilities in, PyTorch softmaxes them again. It runs, returns a plausible-looking number, and quietly stops learning: with 4 classes even a perfect probability row <code>[1, 0, 0, 0]</code> scores 0.7437, not 0. On the example above the loss becomes 1.1147 instead of 0.7065. Models return logits; the loss owns the softmax.</p>
+</div>
+
+<h2 id="shapes">Shapes: <code>(N, C)</code> logits, <code>(N,)</code> targets</h2>
+
+<p>The basic contract is: <code>input</code> has shape <code>(N, C)</code>, one row of <code>C</code> logits per example, and <code>target</code> has shape <code>(N,)</code>, one integer class id per example, dtype <code>torch.long</code> (int64). microgpt's forward returns <code>(T, 27)</code> for one name, which already fits.</p>
+
+<p>A batched model returns <code>(B, T, C)</code>: <code>B</code> names, <code>T</code> positions each, <code>C</code> logits per position. Every position is an independent prediction, so flatten batch and time into one axis of <code>B*T</code> rows:</p>
+
+<div class="code" data-lang="python">
+<pre><code>import torch
+import torch.nn.functional as F
+
+torch.manual_seed(0)
+B, T, C = 2, 3, 27
+logits = torch.randn(B, T, C)           # what a batched model returns
+targets = torch.randint(0, C, (B, T))   # one target id per position
+
+flat = F.cross_entropy(logits.view(B * T, C), targets.view(B * T))
+print(logits.view(B * T, C).shape, targets.view(B * T).shape)
+# torch.Size([6, 27]) torch.Size([6])
+print(flat)                                            # tensor(4.5729)
+# same thing with the class dimension moved to position 1: (B, C, T)
+print(F.cross_entropy(logits.transpose(1, 2), targets))   # tensor(4.5729)
+
+try:
+    F.cross_entropy(logits, targets)    # (B, T, C): T=3 is read as the class dim
+except Exception as e:
+    print(type(e).__name__ + ":", e)
+# RuntimeError: Expected target size [2, 27], got [2, 3]</code></pre>
+</div>
+
+<p>For inputs with more than two dimensions, <code>cross_entropy</code> expects the <strong>class dimension second</strong>: <code>(N, C, d1, d2, ...)</code>, a convention inherited from images. Passing <code>(B, T, C)</code> makes it think there are 3 classes and 27 positions. Here the shapes happened to disagree and you got an error. If <code>T</code> equalled <code>C</code> it would silently compute the wrong thing. <strong>Flattening to <code>(B*T, C)</code> is the habit to keep.</strong> Use <code>.reshape</code> instead of <code>.view</code> if the logits might not be contiguous (Chapter 2).</p>
+
+<div class="callout pitfall">
+<div class="callout-title">Targets must be int64</div>
+<p>Class-index targets must be <code>torch.long</code>. An <code>int32</code> target fails with <code>RuntimeError: expected scalar type Long but found Int</code>, and a float target of shape <code>(N,)</code> fails with <code>... but found Float</code>. A float target of the <em>same shape as the logits</em> is legal, and means something else: a full probability distribution per row (soft labels).</p>
+</div>
+
+<h2 id="reduction"><code>reduction</code>, <code>ignore_index</code>, <code>label_smoothing</code></h2>
+
+<p>Three keyword arguments cover nearly everything you will need for language models.</p>
+
+<ul>
+  <li><strong><code>reduction</code></strong>: how the per-position losses become one number. <code>"mean"</code> (default) averages, <code>"sum"</code> adds, <code>"none"</code> returns the per-position vector, which is microgpt's <code>token_losses</code> list.</li>
+  <li><strong><code>ignore_index</code></strong> (default <code>-100</code>): any target equal to it contributes nothing, neither to the sum nor to the count the mean divides by. This is how you mask <strong>padding</strong>, the filler positions you add so names of different lengths fit in one rectangular tensor (Chapter 8 builds such batches).</li>
+  <li><strong><code>label_smoothing</code></strong> (default 0.0): mixes the one-hot target with a uniform distribution, so the model is never pushed toward infinite confidence. With <code>ε = 0.1</code> the target becomes 90% "the right token" and 10% spread over all classes. Common in translation models, rare in LLM pretraining.</li>
+</ul>
+
+<div class="code" data-lang="python">
+<pre><code>import torch
+import torch.nn.functional as F
+
+logits = torch.tensor([[2.0, 1.0, 0.1, -1.0],
+                       [0.5, 2.5, 0.0,  0.3],
+                       [1.0, 1.0, 1.0,  1.0]])
+targets = torch.tensor([0, 1, 3])
+
+print(F.cross_entropy(logits, targets, reduction="none"))  # tensor([0.4493, 0.2838, 1.3863])
+print(F.cross_entropy(logits, targets, reduction="sum"))   # tensor(2.1194)
+print(F.cross_entropy(logits, targets, reduction="mean"))  # tensor(0.7065)
+
+# position 2 is padding: mark its target with -100 (the default ignore_index)
+padded_targets = torch.tensor([0, 1, -100])
+print(F.cross_entropy(logits, padded_targets))             # tensor(0.3666)  mean over 2
+print(F.cross_entropy(logits[:2], targets[:2]))            # tensor(0.3666)  same number
+print(F.cross_entropy(logits, padded_targets, reduction="none"))
+# tensor([0.4493, 0.2838, 0.0000])
+
+print(F.cross_entropy(logits, targets, label_smoothing=0.1))   # tensor(0.8115)</code></pre>
+</div>
+
+<p>Note the mean with padding is <code>(0.4493 + 0.2838) / 2</code>, not <code>/ 3</code>. PyTorch divides by the number of non-ignored targets. microgpt's <code>evaluate_model</code> uses <code>reduction="sum"</code> and divides by its own token count for the same reason: so every token counts once, whatever the name lengths.</p>
+
+<h2 id="baseline">The first number to expect: <code>ln(C)</code></h2>
+
+<p>A model that knows nothing should spread probability evenly: <code>1/C</code> for every class. Its loss is <code>-log(1/C) = ln(C)</code>. For microgpt's 27 tokens that is <strong>3.2958</strong>. A freshly initialised model with small weights emits small, nearly equal logits, so its first loss should land right there.</p>
+
+<div class="code" data-lang="python">
+<pre><code>import math
+import torch
+import torch.nn.functional as F
+
+V = 27
+print(math.log(V))                             # 3.295836866004329
+
+uniform = torch.zeros(5, V)                    # equal logits = uniform guess
+targets = torch.tensor([0, 4, 13, 26, 7])
+print(F.cross_entropy(uniform, targets))       # tensor(3.2958)
+
+torch.manual_seed(0)
+small = 0.1 * torch.randn(1000, V)             # what a freshly initialised model emits
+print(F.cross_entropy(small, torch.randint(0, V, (1000,))))   # tensor(3.2990)</code></pre>
+</div>
+
+<p>If your step-0 loss is much higher than <code>ln(C)</code>, the initial logits are too large: the model is confidently wrong before it has learned anything, usually because of a too-wide weight initialisation. That costs you the first few hundred steps just undoing it. Chapter 8 turns this into a standard sanity check.</p>
+
+<h2 id="optimizers">What an optimizer is</h2>
+
+<p>After <code>loss.backward()</code>, every parameter <code>p</code> has a <code>p.grad</code> tensor of the same shape: the slope of the loss with respect to each number in <code>p</code>. An <strong>optimizer</strong> is an object that holds references to the parameters (not copies) and, when you call <code>optimizer.step()</code>, updates each one in place using its <code>.grad</code>. The <strong>learning rate</strong> (<code>lr</code>) is the step size.</p>
+
+<p>The simplest rule is <strong>SGD</strong> (stochastic gradient descent): <code>p = p - lr * p.grad</code>. That is exactly microgpt's demonstration line <code>parameter.data -= learning_rate * parameter.grad</code>.</p>
+
+<div class="code" data-lang="python">
+<div class="code-hdr"><span class="lang">python</span><span class="title">sgd.py</span></div>
+<pre><code>import torch
+
+w = torch.nn.Parameter(torch.tensor([1.0, -2.0]))
+opt = torch.optim.SGD([w], lr=0.1)
+
+loss = (w ** 2).sum()        # d(loss)/dw = 2w = [2, -4]
+loss.backward()
+print(w.grad)                # tensor([ 2., -4.])
+
+opt.step()                   # w &lt;- w - lr * w.grad
+print(w.data)                # tensor([ 0.8000, -1.6000])
+
+opt.zero_grad()
+print(w.grad)                # None
+
+# the same update by hand
+v = torch.tensor([1.0, -2.0], requires_grad=True)
+(v ** 2).sum().backward()
+with torch.no_grad():        # the update itself must not be recorded by autograd
+    v -= 0.1 * v.grad
+print(v.data)                # tensor([ 0.8000, -1.6000])</code></pre>
+</div>
+
+<p>Three facts about every <code>torch.optim</code> optimizer:</p>
+<ul>
+  <li>The first argument is an iterable of parameters, usually <code>model.parameters()</code>. They are stored in <code>optimizer.param_groups</code>, a list of dicts, each with its own <code>"params"</code>, <code>"lr"</code> and other settings.</li>
+  <li><code>step()</code> reads <code>.grad</code> and writes the parameters in place, under <code>no_grad</code>. It does not compute gradients; <code>backward()</code> does.</li>
+  <li><code>step()</code> does not clear <code>.grad</code>. Gradients accumulate across <code>backward()</code> calls (Chapter 4), so you clear them yourself with <code>zero_grad()</code> every iteration.</li>
+</ul>
+
+<p>SGD has options: <code>momentum=0.9</code> keeps a running "velocity" buffer per parameter and steps along it, which smooths noisy gradients. SGD with momentum is still common for image models. For transformers, Adam-family optimizers are the default.</p>
+
+<h2 id="adam">Adam: your <code>apply_adam</code>, as a class</h2>
+
+<p><strong>Adam</strong> keeps two running averages per parameter. The <strong>first moment</strong> <code>m</code> is an exponential moving average of the gradient (its direction, smoothed). The <strong>second moment</strong> <code>v</code> is a moving average of the squared gradient (its typical size). The update divides one by the square root of the other, so every parameter moves about <code>lr</code> per step whether its gradients are tiny or huge. <code>beta1</code> and <code>beta2</code> are how much of the old average to keep each step; <code>eps</code> keeps the division safe when <code>v</code> is near zero.</p>
+
+<p>Because <code>m</code> and <code>v</code> start at 0, early averages are biased toward 0. Dividing by <code>1 - beta**t</code> (the <strong>bias correction</strong>) undoes that: at step 1, <code>m = 0.15·g</code> and <code>m / (1 - 0.85) = g</code>. So the first step moves every parameter by almost exactly <code>lr</code>, in the direction opposite its gradient's sign.</p>
+
+<p>Below, microgpt's <code>apply_adam</code> runs on plain Python floats next to <code>torch.optim.Adam</code> with microgpt's settings, on the same small function, for 5 steps.</p>
+
+<div class="code" data-lang="python">
+<div class="code-hdr"><span class="lang">python</span><span class="title">adam_match.py</span></div>
+<pre><code>import torch
+
+beta1, beta2, eps, lr = 0.85, 0.99, 1e-8, 0.01
+c = [3.0, -1.0, 0.5]
+
+def gradient(w):                 # d/dw of sum((w - c)^2) + w0*w1*w2
+    return [2 * (w[0] - c[0]) + w[1] * w[2],
+            2 * (w[1] - c[1]) + w[0] * w[2],
+            2 * (w[2] - c[2]) + w[0] * w[1]]
+
+# microgpt's apply_adam, on plain Python floats
+w_micro = [0.1, 0.2, 0.3]
+first_moments = [0.0] * 3
+second_moments = [0.0] * 3
+
+def apply_adam(params, grads, step_number, learning_rate):
+    for i, g in enumerate(grads):
+        first_moments[i] = beta1 * first_moments[i] + (1 - beta1) * g
+        second_moments[i] = beta2 * second_moments[i] + (1 - beta2) * g ** 2
+        m_hat = first_moments[i] / (1 - beta1 ** step_number)
+        v_hat = second_moments[i] / (1 - beta2 ** step_number)
+        params[i] -= learning_rate * m_hat / (v_hat ** 0.5 + eps)
+
+# PyTorch
+w = torch.nn.Parameter(torch.tensor([0.1, 0.2, 0.3]))
+opt = torch.optim.Adam([w], lr=lr, betas=(beta1, beta2), eps=eps)
+
+for step in range(1, 6):
+    opt.zero_grad()
+    loss = ((w - torch.tensor(c)) ** 2).sum() + w.prod()
+    loss.backward()
+    opt.step()
+
+    apply_adam(w_micro, gradient(w_micro), step, lr)
+    diff = max(abs(a - b) for a, b in zip(w.tolist(), w_micro))
+    print(step, [round(x, 6) for x in w.tolist()], f"max diff {diff:.1e}")
+
+state = opt.state[w]
+print(sorted(state.keys()))
+print(state["step"])
+print(state["exp_avg"], [round(m, 4) for m in first_moments])
+print(state["exp_avg_sq"], [round(v, 4) for v in second_moments])</code></pre>
+</div>
+
+<div class="code" data-lang="text">
+<pre><code>1 [0.11, 0.19, 0.31] max diff 2.6e-09
+2 [0.119999, 0.180003, 0.319975] max diff 1.0e-08
+3 [0.129995, 0.170009, 0.329905] max diff 1.6e-08
+4 [0.139989, 0.160022, 0.339771] max diff 8.5e-09
+5 [0.149979, 0.150042, 0.349553] max diff 1.1e-08
+['exp_avg', 'exp_avg_sq', 'step']
+tensor(5.)
+tensor([-3.1690,  1.3315, -0.1848]) [-3.169, 1.3315, -0.1848]
+tensor([1.5936, 0.2819, 0.0057]) [1.5936, 0.2819, 0.0057]</code></pre>
+</div>
+
+<p>Step 1 moved each weight by exactly 0.01, as the bias-correction argument predicted. The two implementations agree to about 1e-8: the only difference is that PyTorch works in float32 and microgpt's Python floats are float64.</p>
+
+<h4><code>optimizer.state</code> is your moment lists</h4>
+
+<p><code>opt.state</code> is a dict keyed by parameter tensor. For Adam each entry holds:</p>
+
+<table>
+  <tr><th>microgpt_scalar.py</th><th>torch.optim.Adam</th><th>shape</th></tr>
+  <tr><td><code>adam_first_moments[i]</code></td><td><code>state[p]["exp_avg"]</code></td><td>same as <code>p</code></td></tr>
+  <tr><td><code>adam_second_moments[i]</code></td><td><code>state[p]["exp_avg_sq"]</code></td><td>same as <code>p</code></td></tr>
+  <tr><td><code>step_number</code> argument</td><td><code>state[p]["step"]</code></td><td>scalar tensor</td></tr>
+  <tr><td><code>adam_beta1, adam_beta2</code></td><td><code>betas=(0.85, 0.99)</code></td><td>in <code>param_groups</code></td></tr>
+  <tr><td><code>learning_rate</code> argument</td><td><code>param_groups[g]["lr"]</code></td><td>in <code>param_groups</code></td></tr>
+</table>
+
+<p>Two consequences. First, <strong>Adam's state is twice the size of the model</strong>: two extra float32 tensors per parameter. Chapter 9 turns that into the "16 bytes per parameter" rule. Second, the state is part of the training run. A checkpoint that saves only the weights resumes with <code>m = v = 0</code>, which is a different optimizer. Chapter 8 saves <code>optimizer.state_dict()</code> too, as microgpt already does.</p>
+
+<div class="callout hood">
+<div class="callout-title"><code>foreach</code> and <code>fused</code></div>
+<p>microgpt passes <code>foreach=False</code>. By default PyTorch picks a "foreach" implementation that updates all parameters with a few multi-tensor kernels instead of a Python loop over parameters, which matters on a GPU where each kernel launch has a fixed cost. <code>fused=True</code> (CUDA and some other devices) goes further and does the whole Adam update in one kernel. The math is the same in all three; microgpt's tiny CPU model happens to run fastest with the simple loop.</p>
+</div>
+
+<h2 id="adamw">AdamW and decoupled weight decay</h2>
+
+<p><strong>Weight decay</strong> pulls every weight a little toward zero each step, which discourages the model from relying on a few huge weights. There are two ways to do it, and with Adam they are not the same.</p>
+
+<ul>
+  <li><strong>L2 penalty</strong> (<code>torch.optim.Adam(weight_decay=wd)</code>): add <code>wd * p</code> to the gradient. Adam then divides the whole gradient, decay included, by <code>sqrt(v)</code>. Parameters with large gradients get almost no decay.</li>
+  <li><strong>Decoupled decay</strong> (<code>torch.optim.AdamW</code>): first shrink <code>p = p * (1 - lr * wd)</code>, then do the normal Adam update with the raw gradient. Every weight decays by the same fraction.</li>
+</ul>
+
+<p>One step with numbers small enough to check by hand: <code>p = 1.0</code>, <code>grad = 0.5</code>, <code>lr = 0.1</code>, <code>wd = 0.1</code>.</p>
+
+<div class="code" data-lang="python">
+<pre><code>import torch
+
+p_adamw = torch.nn.Parameter(torch.tensor([1.0]))
+p_l2 = torch.nn.Parameter(torch.tensor([1.0]))
+opt_adamw = torch.optim.AdamW([p_adamw], lr=0.1, weight_decay=0.1)
+opt_l2 = torch.optim.Adam([p_l2], lr=0.1, weight_decay=0.1)   # L2 inside Adam
+
+p_adamw.grad = torch.tensor([0.5])
+p_l2.grad = torch.tensor([0.5])
+opt_adamw.step()
+opt_l2.step()
+print(f"AdamW:   {p_adamw.item():.6f}")    # AdamW:   0.890000
+print(f"Adam+L2: {p_l2.item():.6f}")       # Adam+L2: 0.900000</code></pre>
+</div>
+
+<p>AdamW: decay <code>1.0 × (1 - 0.01) = 0.99</code>, then the first Adam step moves by <code>lr = 0.1</code>: 0.89. Adam+L2: the gradient becomes <code>0.5 + 0.1 × 1.0 = 0.6</code>, but the first Adam step normalises it to "move by <code>lr</code>" anyway: 0.90. The decay vanished into the normalisation. This is why every modern LLM recipe uses AdamW (in torch 2.8 you can also write <code>Adam(..., decoupled_weight_decay=True)</code>, which is the same thing). Note that <code>AdamW</code>'s default <code>weight_decay</code> is <code>0.01</code>, not 0.</p>
+
+<h4>Param groups: no decay on norms and biases</h4>
+
+<p>The usual recipe decays only weight matrices and embedding tables. Biases and normalisation weights (gains) are 1-D vectors with a few numbers each; pulling a norm's gain toward 0 just fights the normalisation. Optimizers accept a list of dicts called <strong>param groups</strong>, each with its own settings:</p>
+
+<div class="code" data-lang="python">
+<pre><code>import torch
+from torch import nn
+
+torch.manual_seed(0)
+model = nn.Sequential(
+    nn.Linear(16, 64), nn.ReLU(), nn.Linear(64, 16), nn.RMSNorm(16),
+)
+
+decay, no_decay = [], []
+for name, p in model.named_parameters():
+    if p.dim() &gt;= 2:          # weight matrices (and embedding tables)
+        decay.append(p)
+    else:                     # biases and norm weights: 1-D
+        no_decay.append(p)
+    print(f"{name:9s} {str(tuple(p.shape)):9s} {'decay' if p.dim() &gt;= 2 else 'no decay'}")
+
+optimizer = torch.optim.AdamW(
+    [
+        {"params": decay, "weight_decay": 0.1},
+        {"params": no_decay, "weight_decay": 0.0},
+    ],
+    lr=3e-4,
+    betas=(0.9, 0.95),
+)
+for group in optimizer.param_groups:
+    print(len(group["params"]), group["weight_decay"], group["lr"])</code></pre>
+</div>
+
+<div class="code" data-lang="text">
+<pre><code>0.weight  (64, 16)  decay
+0.bias    (64,)     no decay
+2.weight  (16, 64)  decay
+2.bias    (16,)     no decay
+3.weight  (16,)     no decay
+2 0.1 0.0003
+3 0.0 0.0003</code></pre>
+</div>
+
+<p>Keys you leave out of a group (<code>lr</code>, <code>betas</code>) come from the keyword arguments. microgpt has no biases and no norm weights (its <code>F.rms_norm</code> call has no gain), so all 9 of its tensors are 2-D and would land in the decay group.</p>
+
+<h2 id="zero-grad"><code>zero_grad(set_to_none=True)</code></h2>
+
+<p><code>optimizer.zero_grad()</code> clears the gradients of every parameter it manages. Since PyTorch 2.0 the default is <code>set_to_none=True</code>: instead of filling <code>.grad</code> with zeros it sets it to <code>None</code>, which skips a memory write and frees the memory until the next <code>backward()</code> allocates it again. microgpt writes it out explicitly: <code>optimizer.zero_grad(set_to_none=True)</code>.</p>
+
+<p>The difference is visible with Adam. A zero gradient is still a gradient: Adam updates its moments with it and, because <code>m</code> remembers the past, still moves the weight. A <code>None</code> gradient means "skip this parameter".</p>
+
+<div class="code" data-lang="python">
+<pre><code>import torch
+
+w = torch.nn.Parameter(torch.tensor([1.0]))
+opt = torch.optim.Adam([w], lr=0.1)
+w.grad = torch.tensor([0.5])
+opt.step()
+print(f"after step 1: {w.item():.4f}")          # after step 1: 0.9000
+
+opt.zero_grad(set_to_none=False)       # grad becomes a tensor of zeros
+print(w.grad)                          # tensor([0.])
+opt.step()                             # zero gradient, but momentum still moves w
+print(f"after zero-grad step: {w.item():.4f}")  # after zero-grad step: 0.8330
+
+opt.zero_grad()                        # default set_to_none=True
+print(w.grad)                          # None
+opt.step()                             # params with grad None are skipped
+print(f"after None-grad step: {w.item():.4f}")  # after None-grad step: 0.8330</code></pre>
+</div>
+
+<p>The difference shows up only for a parameter that gets no gradient at all in some step: a frozen layer, or a branch the forward pass skipped. (An embedding row the batch did not use is not that case: the table as a whole gets a gradient with zeros in that row, so Adam's momentum still moves the row.) The flip side of <code>None</code>: any code of yours that reads <code>p.grad</code> must handle it.</p>
+
+<h2 id="schedules">Learning-rate schedules</h2>
+
+<p>A <strong>learning-rate schedule</strong> changes <code>lr</code> over the run. microgpt uses <strong>linear decay</strong>: <code>lr = 0.01 * (1 - progress)</code>, written straight into <code>param_groups</code> each step. PyTorch packages this as a <strong>scheduler</strong> object that wraps the optimizer. <code>LambdaLR</code> is the general one: you give it a function from step number to a multiplier, and it sets <code>lr = base_lr * f(step)</code>.</p>
+
+<div class="code" data-lang="python">
+<div class="code-hdr"><span class="lang">python</span><span class="title">lambdalr.py</span></div>
+<pre><code>import torch
+
+number_of_training_steps = 5
+w = torch.nn.Parameter(torch.zeros(1))
+optimizer = torch.optim.Adam([w], lr=0.01, betas=(0.85, 0.99), eps=1e-8)
+scheduler = torch.optim.lr_scheduler.LambdaLR(
+    optimizer,
+    lr_lambda=lambda step: 1.0 - step / number_of_training_steps,
+)
+
+for training_iteration in range(number_of_training_steps):
+    microgpt_lr = 0.01 * (1.0 - training_iteration / number_of_training_steps)
+    used_lr = optimizer.param_groups[0]["lr"]
+
+    w.grad = torch.ones(1)       # stands in for loss.backward()
+    optimizer.step()             # uses the current lr
+    scheduler.step()             # then moves the lr to the next step's value
+
+    print(training_iteration, f"used={used_lr:.8f}", f"microgpt={microgpt_lr:.8f}")
+print(scheduler.get_last_lr())</code></pre>
+</div>
+
+<div class="code" data-lang="text">
+<pre><code>0 used=0.01000000 microgpt=0.01000000
+1 used=0.00800000 microgpt=0.00800000
+2 used=0.00600000 microgpt=0.00600000
+3 used=0.00400000 microgpt=0.00400000
+4 used=0.00200000 microgpt=0.00200000
+[0.0]</code></pre>
+</div>
+
+<p>Creating the scheduler immediately applies <code>f(0)</code>. Each <code>scheduler.step()</code> advances an internal counter and applies <code>f(counter)</code>, so iteration <code>i</code> trains with <code>f(i)</code>, exactly microgpt's schedule. <code>get_last_lr()</code> returns the lr that is set now, which after the last step is the "next" value 0.0.</p>
+
+<h4>Warmup + cosine</h4>
+
+<p>LLM pretraining almost always uses <strong>warmup</strong> then <strong>cosine decay</strong>. Warmup ramps the lr up from near 0 over the first few hundred steps. Early on Adam's <code>v</code> estimate is based on very few gradients and the weights are random, so full-size steps can blow the run up. Cosine decay then glides from the peak down to a floor along half a cosine wave: it stays near the peak for a while, then falls, then flattens out.</p>
+
+<div class="code" data-lang="python">
+<div class="code-hdr"><span class="lang">python</span><span class="title">warmup_cosine.py</span></div>
+<pre><code>import math
+import torch
+
+warmup_steps, total_steps, min_ratio = 100, 1000, 0.1
+
+def warmup_cosine(step):
+    if step &lt; warmup_steps:                       # linear ramp 1/100 .. 100/100
+        return (step + 1) / warmup_steps
+    progress = (step - warmup_steps) / (total_steps - warmup_steps)   # 0 -&gt; 1
+    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))              # 1 -&gt; 0
+    return min_ratio + (1.0 - min_ratio) * cosine
+
+w = torch.nn.Parameter(torch.zeros(1))
+optimizer = torch.optim.AdamW([w], lr=3e-3)
+scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, warmup_cosine)
+
+for step in range(total_steps):
+    if step in (0, 49, 99, 100, 325, 550, 775, 999):
+        print(f"step {step:4d}  lr={optimizer.param_groups[0]['lr']:.6f}")
+    w.grad = torch.ones(1)
+    optimizer.step()
+    scheduler.step()</code></pre>
+</div>
+
+<div class="code" data-lang="text">
+<pre><code>step    0  lr=0.000030
+step   49  lr=0.001500
+step   99  lr=0.003000
+step  100  lr=0.003000
+step  325  lr=0.002605
+step  550  lr=0.001650
+step  775  lr=0.000695
+step  999  lr=0.000300</code></pre>
+</div>
+
+<p>The <code>(step + 1)</code> avoids a wasted first step at lr 0. Halfway through the decay (step 550) the lr is exactly halfway between peak and floor. PyTorch also ships ready-made pieces (<code>LinearLR</code>, <code>CosineAnnealingLR</code>, chained with <code>SequentialLR</code>), but one <code>LambdaLR</code> with a function you can read is easier to check.</p>
+
+<h4>Call order: <code>optimizer.step()</code>, then <code>scheduler.step()</code></h4>
+
+<p>Get it backwards and PyTorch warns you, and your run skips the first value of the schedule:</p>
+
+<div class="code" data-lang="python">
+<pre><code>import warnings
+import torch
+
+w = torch.nn.Parameter(torch.zeros(1))
+optimizer = torch.optim.SGD([w], lr=0.1)
+scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda s: 1.0 - s / 10)
+
+with warnings.catch_warnings(record=True) as caught:
+    warnings.simplefilter("always")
+    scheduler.step()             # wrong order: scheduler before optimizer
+    w.grad = torch.ones(1)
+    optimizer.step()
+print(caught[0].message)</code></pre>
+</div>
+
+<div class="code" data-lang="text">
+<pre><code>Detected call of `lr_scheduler.step()` before `optimizer.step()`. In PyTorch 1.1.0 and later, you should call them in the opposite order: `optimizer.step()` before `lr_scheduler.step()`.  Failure to do this will result in PyTorch skipping the first value of the learning rate schedule. See more details at https://pytorch.org/docs/stable/optim.html#how-to-adjust-learning-rate</code></pre>
+</div>
+
+<h2 id="clipping">Gradient clipping</h2>
+
+<p>Sometimes one batch produces a huge gradient (an unusual example, a loss spike) and one step throws the weights somewhere bad. <strong>Gradient clipping</strong> caps the size of the update direction. The standard version measures the <strong>global norm</strong>: square every gradient number in every parameter, add them all up, take the square root. It is the length of the whole gradient seen as one long vector. If that length exceeds <code>max_norm</code>, every gradient is multiplied by <code>max_norm / norm</code>; the direction is unchanged, only the length shrinks.</p>
+
+<p>microgpt_scalar.py computes this same number as <code>gradient_norm = sqrt(sum(parameter.grad**2 ...))</code>. Worked example: one parameter with gradient <code>[3, 4]</code> and one with <code>[12]</code>. Global norm <code>= sqrt(9 + 16 + 144) = sqrt(169) = 13</code>.</p>
+
+<div class="code" data-lang="python">
+<pre><code>import torch
+
+a = torch.nn.Parameter(torch.zeros(2))
+b = torch.nn.Parameter(torch.zeros(1))
+a.grad = torch.tensor([3.0, 4.0])
+b.grad = torch.tensor([12.0])
+
+total = torch.nn.utils.clip_grad_norm_([a, b], max_norm=1.0)
+print(total)                       # tensor(13.)          the norm BEFORE clipping
+print(a.grad, b.grad)              # tensor([0.2308, 0.3077]) tensor([0.9231])
+print(torch.cat([a.grad, b.grad]).norm())   # tensor(1.0000)
+
+a.grad = torch.tensor([0.3, 0.4])  # norm 0.5 &lt; max_norm: left alone
+b.grad = torch.tensor([0.0])
+print(torch.nn.utils.clip_grad_norm_([a, b], max_norm=1.0), a.grad)
+# tensor(0.5000) tensor([0.3000, 0.4000])</code></pre>
+</div>
+
+<p>The trailing underscore means it modifies the <code>.grad</code> tensors in place. It returns the norm measured <em>before</em> clipping, which is worth logging every step: a rising or spiky grad norm is often the first sign of trouble. Typical LLM setting: <code>max_norm=1.0</code>. Clip after <code>backward()</code> and before <code>optimizer.step()</code>. Clipping per parameter (<code>clip_grad_value_</code> clamps each number) exists too, but changes the direction and is rarely used for transformers.</p>
+
+<div class="hands-on">
+<div class="hands-on-hdr">Hands-on · do this now</div>
+<div class="hands-on-body">
+<p>Put every piece of this chapter together on the smallest language model there is: a <strong>bigram</strong> table, where the logits for the next character depend only on the current one. The "model" is one <code>27 × 27</code> parameter; row <code>i</code> holds the next-token logits after token <code>i</code>.</p>
+<div class="code" data-lang="python">
+<div class="code-hdr"><span class="lang">python</span><span class="title">bigram.py</span></div>
+<pre><code>import math
+import torch
+import torch.nn.functional as F
+
+names = ["emma", "olivia", "ava", "isabella", "sophia", "mia", "amelia", "harper"]
+BOS = 26
+
+def encode(name):
+    return [BOS] + [ord(ch) - ord("a") for ch in name] + [BOS]
+
+inputs, targets = [], []
+for name in names:
+    ids = encode(name)
+    inputs += ids[:-1]
+    targets += ids[1:]
+x = torch.tensor(inputs)            # (N,) current token
+y = torch.tensor(targets)           # (N,) next token
+print(x.shape, f"baseline ln(27) = {math.log(27):.4f}")
+
+torch.manual_seed(0)
+table = torch.nn.Parameter(0.01 * torch.randn(27, 27))   # row = current, col = next-token logit
+optimizer = torch.optim.Adam([table], lr=0.1, betas=(0.85, 0.99), eps=1e-8)
+steps = 100
+scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda s: 1.0 - s / steps)
+
+for step in range(steps):
+    logits = table[x]                         # (N, 27)
+    loss = F.cross_entropy(logits, y)
+    optimizer.zero_grad()
+    loss.backward()
+    lr = optimizer.param_groups[0]["lr"]      # the lr this step uses
+    grad_norm = torch.nn.utils.clip_grad_norm_([table], max_norm=1.0)
+    optimizer.step()
+    scheduler.step()
+    if step % 20 == 0 or step == steps - 1:
+        print(f"step {step:3d}  loss {loss.item():.4f}  grad_norm {grad_norm.item():.3f}"
+              f"  lr {lr:.4f}")</code></pre>
+</div>
+<div class="code terminal" data-lang="sh">
+<pre><code>$ python bigram.py
+torch.Size([50]) baseline ln(27) = 3.2958
+step   0  loss 3.2952  grad_norm 0.199  lr 0.1000
+step  20  loss 1.4268  grad_norm 0.087  lr 0.0800
+step  40  loss 1.2006  grad_norm 0.021  lr 0.0600
+step  60  loss 1.1652  grad_norm 0.015  lr 0.0400
+step  80  loss 1.1536  grad_norm 0.012  lr 0.0200
+step  99  loss 1.1503  grad_norm 0.011  lr 0.0010</code></pre>
+</div>
+<p>Check three things. The step-0 loss is <code>ln(27)</code> to three decimals. The grad norm shrinks as the loss flattens. The loss stops near 1.15, not 0: after "a" the next letter could be "v", "m", "<code>&lt;end&gt;</code>" and others, and a bigram cannot tell which. That floor is a property of the data and the model, not a bug. Then change <code>lr=0.1</code> to <code>lr=0.001</code> and see how far 100 steps get you.</p>
+</div>
+</div>
+
+<h2 id="exercises">Exercises</h2>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 7.1</span>
+  <span class="exercise-diff easy">easy</span>
+  <span class="exercise-title">Cross-entropy by hand</span>
+</div>
+<div class="exercise-body">
+<p>For logits <code>[1.0, 2.0, 3.0]</code> and target class 2, compute the cross-entropy loss with pen and a calculator, using the logsumexp form. Then check it with <code>F.cross_entropy</code>.</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<p><code>loss = logsumexp(x) - x[2]</code>. Pull out the max (3): <code>logsumexp = 3 + ln(e^-2 + e^-1 + e^0) = 3 + ln(1.5032) = 3.4076</code>. Loss <code>= 3.4076 - 3 = 0.4076</code>.</p>
+<div class="code" data-lang="python">
+<pre><code>import math
+import torch
+import torch.nn.functional as F
+
+logits = torch.tensor([[1.0, 2.0, 3.0]])
+target = torch.tensor([2])
+lse = 3.0 + math.log(1 + math.exp(-1) + math.exp(-2))   # logsumexp, max pulled out
+print(f"{lse:.4f} {lse - 3.0:.4f}")                      # 3.4076 0.4076
+print(F.cross_entropy(logits, target))                   # tensor(0.4076)</code></pre>
+</div>
+<p>Note the logits must be 2-D, <code>(N=1, C=3)</code>, and the target 1-D, <code>(N=1,)</code>.</p>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 7.2</span>
+  <span class="exercise-diff easy">easy</span>
+  <span class="exercise-title">Know your starting loss</span>
+</div>
+<div class="exercise-body">
+<p>What initial loss should you expect for microgpt (27 tokens), GPT-2 (50,257 tokens) and Llama 3 (128,256 tokens)? A colleague's microgpt run prints 9.8 at step 0. What is the most likely cause?</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<div class="code" data-lang="python">
+<pre><code>import math
+print(f"{math.log(27):.4f} {math.log(50257):.4f} {math.log(128256):.4f}")
+# 3.2958 10.8249 11.7618</code></pre>
+</div>
+<p>9.8 is three times <code>ln(27)</code>: the model is confidently wrong at initialisation, so its logits are large. Usual causes: weights initialised with a standard deviation near 1 instead of microgpt's 0.08 (for example <code>nn.Embedding</code>'s default <code>N(0, 1)</code>), or a missing normalisation before the output layer. The run may still train, but it wastes steps undoing the init.</p>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 7.3</span>
+  <span class="exercise-diff medium">medium</span>
+  <span class="exercise-title">Prove that <code>ignore_index</code> masks padding</span>
+</div>
+<div class="exercise-body">
+<p>Make random logits of shape <code>(2, 5, 27)</code> for the names "emma" (5 targets) and "ava" (4 targets plus one pad). Show three things: (a) the loss with <code>-100</code> pad targets equals the loss over only the real positions, (b) the pad position gets zero gradient, (c) putting garbage logits at the pad position does not change the loss.</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<div class="code" data-lang="python">
+<pre><code>import torch
+import torch.nn.functional as F
+
+torch.manual_seed(0)
+logits = torch.randn(2, 5, 27, requires_grad=True)    # B=2, T=5
+targets = torch.tensor([[ 4, 12, 12,  0, 26],          # "emma" + end
+                        [ 0, 21,  0, 26, -100]])       # "ava"  + end + 1 pad
+loss = F.cross_entropy(logits.view(-1, 27), targets.view(-1))
+
+real = targets.view(-1) != -100
+loss_real = F.cross_entropy(logits.view(-1, 27)[real], targets.view(-1)[real])
+print(loss, loss_real)
+# tensor(3.3097, grad_fn=&lt;NllLossBackward0&gt;) tensor(3.3097, grad_fn=&lt;NllLossBackward0&gt;)
+
+loss.backward()
+print(logits.grad[1, 4].abs().sum())                   # tensor(0.)  pad row: no gradient
+
+with torch.no_grad():
+    changed = logits.clone()
+    changed[1, 4] = 1000.0                             # garbage at the pad position
+print(F.cross_entropy(changed.view(-1, 27), targets.view(-1)))   # tensor(3.3097)</code></pre>
+</div>
+<p>(c) is why it does not matter what token id you put in the <em>input</em> at a pad position: whatever the model predicts there is never scored.</p>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 7.4</span>
+  <span class="exercise-diff medium">medium</span>
+  <span class="exercise-title">Hand-check one AdamW step</span>
+</div>
+<div class="exercise-body">
+<p>Parameter <code>[2.0, -1.0]</code>, gradient <code>[0.4, -0.1]</code>, <code>lr=0.01</code>, <code>weight_decay=0.1</code>, default betas <code>(0.9, 0.999)</code>, <code>eps=1e-8</code>. Predict the parameter after one <code>AdamW</code> step, write the four stages as tensor code, and compare with <code>torch.optim.AdamW</code>.</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<p>Decay: <code>[2.0, -1.0] × 0.999 = [1.998, -0.999]</code>. First Adam step after bias correction is <code>lr × g / |g|</code>, so <code>-0.01</code> for the first, <code>+0.01</code> for the second: <code>[1.988, -0.989]</code>.</p>
+<div class="code" data-lang="python">
+<pre><code>import torch
+
+lr, wd, b1, b2, eps = 0.01, 0.1, 0.9, 0.999, 1e-8
+p = torch.nn.Parameter(torch.tensor([2.0, -1.0]))
+g = torch.tensor([0.4, -0.1])
+opt = torch.optim.AdamW([p], lr=lr, betas=(b1, b2), eps=eps, weight_decay=wd)
+p.grad = g.clone()
+opt.step()
+
+# by hand
+q = torch.tensor([2.0, -1.0])
+q = q * (1 - lr * wd)                           # 1. decoupled decay
+m = (1 - b1) * g                                # 2. moments (start at 0)
+v = (1 - b2) * g * g
+m_hat = m / (1 - b1)                            # 3. bias correction, step 1
+v_hat = v / (1 - b2)
+q = q - lr * m_hat / (v_hat.sqrt() + eps)       # 4. Adam update
+print(p.data, q, torch.allclose(p.data, q))
+# tensor([ 1.9880, -0.9890]) tensor([ 1.9880, -0.9890]) True</code></pre>
+</div>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 7.5</span>
+  <span class="exercise-diff medium">medium</span>
+  <span class="exercise-title">Warmup + cosine with real numbers</span>
+</div>
+<div class="exercise-body">
+<p>Build a schedule with peak lr <code>1e-3</code>, floor <code>1e-4</code>, 10 warmup steps, 50 total steps, using <code>LambdaLR</code>. Print the lr used at steps 0, 5, 9, 10, 30, 49. Before running, predict step 30 (the midpoint of the decay).</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<p>Step 30 is progress <code>(30 - 10) / 40 = 0.5</code>, cosine factor 0.5, so lr <code>= 1e-4 + 0.5 × 9e-4 = 5.5e-4</code>. <code>LambdaLR</code> wants a multiplier of the base lr, so the function divides by the peak.</p>
+<div class="code" data-lang="python">
+<pre><code>import math
+import torch
+
+peak, floor, warmup, total = 1e-3, 1e-4, 10, 50
+
+def factor(step):
+    if step &lt; warmup:
+        return (step + 1) / warmup
+    progress = (step - warmup) / (total - warmup)
+    lr = floor + (peak - floor) * 0.5 * (1 + math.cos(math.pi * progress))
+    return lr / peak                         # LambdaLR wants a multiplier
+
+w = torch.nn.Parameter(torch.zeros(1))
+opt = torch.optim.AdamW([w], lr=peak)
+sched = torch.optim.lr_scheduler.LambdaLR(opt, factor)
+for step in range(total):
+    if step in (0, 5, 9, 10, 30, 49):
+        print(step, f"{opt.param_groups[0]['lr']:.6f}")
+    w.grad = torch.zeros(1)
+    opt.step()
+    sched.step()</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>0 0.000100
+5 0.000600
+9 0.001000
+10 0.001000
+30 0.000550
+49 0.000101</code></pre>
+</div>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 7.6</span>
+  <span class="exercise-diff hard">hard</span>
+  <span class="exercise-title">Write <code>apply_adam</code> as a real <code>torch.optim.Optimizer</code></span>
+</div>
+<div class="exercise-body">
+<p>Subclass <code>torch.optim.Optimizer</code> to make <code>MicroAdam</code>, a line-for-line port of microgpt's <code>apply_adam</code> that keeps its moments in <code>self.state</code>. Train two copies of a small MLP for 10 steps, one with <code>MicroAdam</code> and one with <code>torch.optim.Adam(lr=0.01, betas=(0.85, 0.99), eps=1e-8)</code>, and show the parameters match.</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<div class="code" data-lang="python">
+<pre><code>import torch
+from torch import nn
+
+class MicroAdam(torch.optim.Optimizer):
+    def __init__(self, params, lr=0.01, betas=(0.85, 0.99), eps=1e-8):
+        super().__init__(params, dict(lr=lr, betas=betas, eps=eps))
+
+    @torch.no_grad()
+    def step(self):
+        for group in self.param_groups:
+            beta1, beta2 = group["betas"]
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                state = self.state[p]
+                if not state:                                  # first time we see p
+                    state["step"] = 0
+                    state["m"] = torch.zeros_like(p)
+                    state["v"] = torch.zeros_like(p)
+                state["step"] += 1
+                t, m, v, g = state["step"], state["m"], state["v"], p.grad
+                m.mul_(beta1).add_(g, alpha=1 - beta1)         # first moment
+                v.mul_(beta2).addcmul_(g, g, value=1 - beta2)  # second moment
+                m_hat = m / (1 - beta1 ** t)
+                v_hat = v / (1 - beta2 ** t)
+                p.sub_(group["lr"] * m_hat / (v_hat.sqrt() + group["eps"]))
+
+def make_model():
+    torch.manual_seed(0)
+    return nn.Sequential(nn.Linear(8, 16), nn.ReLU(), nn.Linear(16, 4))
+
+torch.manual_seed(1)
+x, y = torch.randn(32, 8), torch.randint(0, 4, (32,))
+ours, ref = make_model(), make_model()
+opt_ours = MicroAdam(ours.parameters())
+opt_ref = torch.optim.Adam(ref.parameters(), lr=0.01, betas=(0.85, 0.99), eps=1e-8)
+
+for step in range(10):
+    for model, opt in ((ours, opt_ours), (ref, opt_ref)):
+        opt.zero_grad()
+        nn.functional.cross_entropy(model(x), y).backward()
+        opt.step()
+
+diff = max((a - b).abs().max().item() for a, b in zip(ours.parameters(), ref.parameters()))
+print(f"max parameter difference after 10 steps: {diff:.2e}")
+# max parameter difference after 10 steps: 5.96e-08</code></pre>
+</div>
+<p>The base class gives you <code>param_groups</code>, <code>self.state</code> (a dict keyed by parameter), <code>zero_grad()</code> and <code>state_dict()</code> for free. The remaining 6e-8 is float32 rounding: PyTorch evaluates the same formula in a slightly different order.</p>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 7.7</span>
+  <span class="exercise-diff hard">hard</span>
+  <span class="exercise-title">Implement <code>clip_grad_norm_</code> yourself</span>
+</div>
+<div class="exercise-body">
+<p>Write <code>my_clip_grad_norm_(parameters, max_norm)</code>: compute the global L2 norm, scale all gradients in place if it exceeds <code>max_norm</code>, and return the pre-clip norm. Compare against PyTorch on a small MLP whose loss you multiply by 10 to get big gradients, and confirm the clipped norm is <code>max_norm</code>.</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<div class="code" data-lang="python">
+<pre><code>import torch
+from torch import nn
+
+def my_clip_grad_norm_(parameters, max_norm, eps=1e-6):
+    grads = [p.grad for p in parameters if p.grad is not None]
+    total = torch.sqrt(sum((g ** 2).sum() for g in grads))   # one norm over everything
+    scale = torch.clamp(max_norm / (total + eps), max=1.0)   # never scale up
+    for g in grads:
+        g.mul_(scale)
+    return total
+
+def grads_after_backward():
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(8, 16), nn.ReLU(), nn.Linear(16, 4))
+    x, y = torch.randn(32, 8), torch.randint(0, 4, (32,))
+    (10 * nn.functional.cross_entropy(model(x), y)).backward()   # big grads on purpose
+    return model
+
+a, b = grads_after_backward(), grads_after_backward()
+n1 = my_clip_grad_norm_(list(a.parameters()), max_norm=0.5)
+n2 = torch.nn.utils.clip_grad_norm_(b.parameters(), max_norm=0.5)
+print(n1, n2)                     # tensor(3.6348) tensor(3.6348)
+print(max((p.grad - q.grad).abs().max().item() for p, q in zip(a.parameters(), b.parameters())))
+# 0.0
+print(torch.sqrt(sum((p.grad ** 2).sum() for p in a.parameters())))   # tensor(0.5000)</code></pre>
+</div>
+<p>The <code>eps</code> and the clamp are what PyTorch does too; using a tensor <code>scale</code> instead of a Python <code>if</code> means no GPU-to-CPU sync is needed to decide whether to clip (Chapter 11 explains why that matters).</p>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 7.8</span>
+  <span class="exercise-diff hard">hard</span>
+  <span class="exercise-title">Label smoothing from the formula</span>
+</div>
+<div class="exercise-body">
+<p>With smoothing <code>ε</code>, the target distribution is <code>(1 - ε)·onehot + ε/C</code> for every class. Show that this makes the loss <code>(1 - ε)·NLL + ε·mean_c(-log p_c)</code>, compute it with <code>log_softmax</code>, and match <code>F.cross_entropy(..., label_smoothing=0.1)</code> on the three-row example from this chapter (0.8115).</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<p>Cross-entropy against a distribution <code>q</code> is <code>-Σ_c q_c log p_c</code>. Split <code>q</code>: the one-hot part gives <code>(1 - ε)·(-log p_target)</code>; the uniform part gives <code>(ε/C)·Σ_c(-log p_c) = ε·mean_c(-log p_c)</code>.</p>
+<div class="code" data-lang="python">
+<pre><code>import torch
+import torch.nn.functional as F
+
+logits = torch.tensor([[2.0, 1.0, 0.1, -1.0],
+                       [0.5, 2.5, 0.0,  0.3],
+                       [1.0, 1.0, 1.0,  1.0]])
+targets = torch.tensor([0, 1, 3])
+eps = 0.1
+
+log_p = F.log_softmax(logits, dim=-1)                 # (N, C)
+nll = -log_p[torch.arange(3), targets]                # usual per-token loss
+uniform = -log_p.mean(dim=-1)                         # loss against a uniform target
+by_hand = ((1 - eps) * nll + eps * uniform).mean()
+print(by_hand)                                        # tensor(0.8115)
+print(F.cross_entropy(logits, targets, label_smoothing=eps))   # tensor(0.8115)</code></pre>
+</div>
+<p>The uniform term is minimised when all logits are equal, so it keeps pulling logits together and the model can never reach probability 1. Even a perfect model's loss stays above 0.</p>
+</div>
+</details>
+</div>
+</div>
+
+<h2 id="recap">Recap</h2>
+<ul>
+  <li><code>F.cross_entropy(logits, targets)</code> = softmax, pick <code>p[target]</code>, <code>-log</code>, average: microgpt's <code>negative_log_likelihood</code> + <code>calculate_document_loss</code>. It takes raw logits and uses <code>log_softmax</code> (logsumexp) so confident-but-wrong predictions give large finite losses instead of <code>inf</code>/<code>nan</code>.</li>
+  <li>Shapes: <code>(N, C)</code> logits with <code>(N,)</code> int64 targets. Flatten <code>(B, T, C)</code> to <code>(B*T, C)</code>; never pass <code>(B, T, C)</code> directly.</li>
+  <li><code>reduction="none"|"sum"|"mean"</code>; <code>ignore_index=-100</code> masks padding and removes it from the mean's denominator; <code>label_smoothing</code> softens targets.</li>
+  <li>An untrained model should start at <code>ln(C)</code>: 3.2958 for 27 tokens.</li>
+  <li>Optimizers hold parameter references; <code>step()</code> updates in place from <code>.grad</code>; <code>zero_grad()</code> (default <code>set_to_none=True</code>) clears them. SGD is <code>p -= lr * grad</code>.</li>
+  <li><code>torch.optim.Adam(betas=(0.85, 0.99), eps=1e-8)</code> reproduces <code>apply_adam</code> to float32 precision; <code>optimizer.state[p]</code> holds <code>exp_avg</code>, <code>exp_avg_sq</code>, <code>step</code>.</li>
+  <li>AdamW decays weights directly (<code>p *= 1 - lr*wd</code>) instead of through the gradient; use param groups to skip decay on biases and norm gains.</li>
+  <li>Schedules: <code>LambdaLR</code> reproduces microgpt's linear decay; warmup + cosine is the LLM default. Call <code>optimizer.step()</code> then <code>scheduler.step()</code>.</li>
+  <li><code>clip_grad_norm_</code> rescales all gradients so their global L2 norm is at most <code>max_norm</code>, and returns the pre-clip norm. Log it.</li>
+</ul>
+
+<div class="page-nav">
+  <a href="06-transformer-blocks.html"><span class="lbl">← Prev</span><span class="ttl">Building a Transformer</span></a>
+  <a href="08-training-loop.html" class="next"><span class="lbl">Next →</span><span class="ttl">The Training Loop</span></a>
+</div>
+
+</main>
+</div>
+<script src="../assets/site.js"></script>
+</body>
+</html>

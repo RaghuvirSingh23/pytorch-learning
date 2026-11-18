@@ -1,0 +1,959 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>2 · Tensors — PyTorch</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<button class="sidebar-toggle" aria-label="Toggle navigation">☰ Menu</button>
+<div class="layout">
+<aside class="sidebar">
+  <a href="../index.html" class="brand">PyTorch</a>
+  <span class="brand-sub">a deep dive — 2026</span>
+  <nav>
+    <ol>
+      <li><a href="01-why-pytorch.html">Why PyTorch</a></li>
+      <li><a href="02-tensors.html">Tensors</a></li>
+      <li><a href="03-tensor-math.html">Tensor Math &amp; Broadcasting</a></li>
+      <li><a href="04-autograd.html">Autograd</a></li>
+      <li><a href="05-nn-module.html">nn.Module</a></li>
+      <li><a href="06-transformer-blocks.html">Building a Transformer</a></li>
+      <li><a href="07-losses-optimizers.html">Losses &amp; Optimizers</a></li>
+      <li><a href="08-training-loop.html">The Training Loop</a></li>
+      <li><a href="09-devices-precision.html">Devices &amp; Precision</a></li>
+      <li><a href="10-inference.html">Inference &amp; Sampling</a></li>
+      <li><a href="11-performance.html">Performance &amp; Profiling</a></li>
+      <li><a href="12-debugging.html">Debugging PyTorch</a></li>
+      <li><a href="13-50-questions.html">The 50 Questions</a></li>
+      <li><a href="14-capstone.html">Capstone Project</a></li>
+    </ol>
+    <div class="extras">
+      <a href="../exercises.html">All Exercises</a>
+      <a href="../index.html">← Home</a>
+    </div>
+  </nav>
+  <div class="progress"></div>
+</aside>
+
+<main class="content">
+
+<h1>
+  <span class="chap-num">Chapter 02</span>
+  Tensors
+</h1>
+<p class="lede">
+  Everything in PyTorch is a tensor, so this chapter is about the object
+  itself: how to create one, how to pick pieces out of it, how to change its
+  shape, and what is actually in memory when you do. The memory part (storage,
+  strides, views) explains the most confusing error you will hit in
+  attention code, and it is the part a compiler engineer will find most
+  familiar.
+</p>
+
+<h2 id="dtype-shape">Shape, dtype, device</h2>
+
+<p>Chapter 1 defined a tensor as a grid of numbers with one <strong>shape</strong>, one <strong>dtype</strong> and one <strong>device</strong>. <code>torch.tensor(data)</code> builds one from nested Python lists, and picks the dtype from the data:</p>
+
+<div class="code" data-lang="python">
+<pre><code>import torch
+
+a = torch.tensor([1, 2, 3])
+b = torch.tensor([1.0, 2.0, 3.0])
+c = torch.tensor([1, 2.5])
+d = torch.tensor([True, False])
+print(a.dtype)  # torch.int64
+print(b.dtype)  # torch.float32
+print(c.dtype)  # torch.float32
+print(d.dtype)  # torch.bool
+print(c)  # tensor([1.0000, 2.5000])</code></pre>
+</div>
+
+<p>Integers become <code>int64</code> (also spelled <code>torch.long</code>: what token ids use). Any float makes the whole tensor <code>float32</code>, PyTorch's default float. Booleans become <code>bool</code>. One tensor cannot mix types, so <code>[1, 2.5]</code> is promoted to float and printed with a shared format. From here on, every snippet assumes <code>import torch</code>.</p>
+
+<div class="code" data-lang="python">
+<pre><code>m = torch.tensor([[1, 2, 3],
+                  [4, 5, 6]])
+print(m.shape)  # torch.Size([2, 3])
+print(m.shape[1])  # 3
+print(m.ndim)  # 2
+print(m.numel())  # 6
+print(m.device)  # cpu
+
+s = torch.tensor(3.5)
+print(s.shape, s.ndim)  # torch.Size([]) 0</code></pre>
+</div>
+
+<p><code>shape</code> is a <code>torch.Size</code>, which behaves like a tuple. <code>ndim</code> is the number of dimensions, <code>numel()</code> the total number of elements. A tensor with shape <code>torch.Size([])</code> is a <strong>0-d tensor</strong> (a scalar): one number, no dimensions. Reductions such as a loss produce these.</p>
+
+<h2 id="creating">Creating tensors</h2>
+
+<p>You rarely type data in by hand. These factory functions take a shape (as separate ints or a tuple) and optional <code>dtype=</code> and <code>device=</code>:</p>
+
+<div class="code" data-lang="python">
+<pre><code>print(torch.zeros(2, 3))
+# tensor([[0., 0., 0.],
+#         [0., 0., 0.]])
+print(torch.ones(3, dtype=torch.int64))
+# tensor([1, 1, 1])
+print(torch.full((2, 2), 7.0))
+# tensor([[7., 7.],
+#         [7., 7.]])
+print(torch.arange(5))
+# tensor([0, 1, 2, 3, 4])
+print(torch.arange(0, 1, 0.25))
+# tensor([0.0000, 0.2500, 0.5000, 0.7500])
+print(torch.linspace(0, 1, 5))
+# tensor([0.0000, 0.2500, 0.5000, 0.7500, 1.0000])
+
+torch.manual_seed(0)
+print(torch.randn(2, 3))
+# tensor([[ 1.5410, -0.2934, -2.1788],
+#         [ 0.5684, -1.0845, -1.3986]])
+print(torch.rand(3))
+# tensor([0.0223, 0.1689, 0.2939])
+print(torch.randint(0, 27, (2, 5)))
+# tensor([[11, 18,  9, 14, 21],
+#         [17, 11,  8, 20, 26]])
+
+e = torch.empty(2, 3)
+print(e.shape)
+# torch.Size([2, 3])</code></pre>
+</div>
+
+<table>
+  <tr><th>Function</th><th>Gives</th><th>Typical use</th></tr>
+  <tr><td><code>zeros</code>, <code>ones</code>, <code>full(shape, v)</code></td><td>constant fill</td><td>initial buffers, masks</td></tr>
+  <tr><td><code>arange(start, end, step)</code></td><td>evenly spaced, end excluded (like <code>range</code>)</td><td>position ids <code>0..T-1</code></td></tr>
+  <tr><td><code>linspace(start, end, n)</code></td><td><code>n</code> points, end included</td><td>plots, schedules</td></tr>
+  <tr><td><code>randn</code></td><td>normal, mean 0, std 1</td><td>weight init (microgpt: <code>random.gauss(0, 0.08)</code>)</td></tr>
+  <tr><td><code>rand</code>, <code>randint(lo, hi, shape)</code></td><td>uniform [0, 1); integers in [lo, hi)</td><td>dropout masks, random token ids</td></tr>
+  <tr><td><code>empty</code></td><td>uninitialised memory</td><td>outputs you will overwrite fully</td></tr>
+</table>
+
+<p>The random numbers above are reproducible because of <code>torch.manual_seed(0)</code>, which seeds PyTorch's generator the way <code>random.seed(42)</code> seeds Python's in microgpt. <code>torch.empty</code> does not set the values at all; they are whatever bytes were in that memory, so only its shape is printed here.</p>
+
+<p>The <code>*_like</code> variants copy shape, dtype and device from an existing tensor, which saves you from accidentally creating a CPU tensor next to a GPU one:</p>
+
+<div class="code" data-lang="python">
+<pre><code>x = torch.tensor([[1.5, 2.5], [3.5, 4.5]])
+print(torch.zeros_like(x))
+# tensor([[0., 0.],
+#         [0., 0.]])
+print(torch.full_like(x, -1.0))
+# tensor([[-1., -1.],
+#         [-1., -1.]])
+print(torch.ones_like(x, dtype=torch.int64))
+# tensor([[1, 1],
+#         [1, 1]])</code></pre>
+</div>
+
+<h2 id="devices">Devices</h2>
+
+<p>A tensor's memory is on exactly one device. <code>.to(device)</code> returns a copy on another device (or the same tensor, if it is already there); <code>device=</code> creates it there directly. This Mac has an Apple GPU, so the examples use <code>"mps"</code>; on an NVIDIA machine write <code>"cuda"</code>.</p>
+
+<div class="code" data-lang="python">
+<pre><code>x = torch.ones(3)                  # on the CPU
+y = x.to("mps")                    # a copy in Apple GPU memory ("cuda" on NVIDIA)
+z = torch.zeros(3, device="mps")   # created there directly
+print(y.device, z.device)  # mps:0 mps:0
+print((y + z).device)  # mps:0
+x + y</code></pre>
+</div>
+
+<div class="code" data-lang="text">
+<pre><code>RuntimeError: Expected all tensors to be on the same device, but found at least two devices, mps:0 and cpu!</code></pre>
+</div>
+
+<p>PyTorch never moves data between devices behind your back: an operation needs all its inputs on one device. This is why microgpt creates token ids with <code>device=device</code> and calls <code>model.to(device)</code>. Chapter 9 covers devices properly.</p>
+
+<h2 id="indexing">Indexing and slicing</h2>
+
+<p>Indexing works like nested Python lists and NumPy, one index per dimension, separated by commas. Negative indices count from the end; <code>start:stop:step</code> slices.</p>
+
+<div class="code" data-lang="python">
+<pre><code>t = torch.arange(12).view(3, 4)
+print(t)
+# tensor([[ 0,  1,  2,  3],
+#         [ 4,  5,  6,  7],
+#         [ 8,  9, 10, 11]])
+print(t[0])  # tensor([0, 1, 2, 3])
+print(t[-1])  # tensor([ 8,  9, 10, 11])
+print(t[1, 2])  # tensor(6)
+print(t[:, 1])  # tensor([1, 5, 9])
+print(t[1:, ::2])
+# tensor([[ 4,  6],
+#         [ 8, 10]])
+print(t[0].shape, t[0:1].shape)  # torch.Size([4]) torch.Size([1, 4])</code></pre>
+</div>
+
+<p>Note the last line. <strong>An integer index removes that dimension; a slice keeps it.</strong> <code>t[0]</code> is a row of shape <code>(4,)</code>, <code>t[0:1]</code> is a <code>(1, 4)</code> matrix holding the same row. <code>t[1, 2]</code> is a 0-d tensor; <code>.item()</code> turns it into a Python number.</p>
+
+<p><code>...</code> (Ellipsis) means "all the dimensions I did not mention". It lets you index the last dimension without knowing how many come before it, which is common in code that must work for both <code>(T, C)</code> and <code>(B, T, C)</code>:</p>
+
+<div class="code" data-lang="python">
+<pre><code>x = torch.zeros(2, 3, 4)
+print(x[..., 0].shape)  # torch.Size([2, 3])
+print(x[0, ...].shape)  # torch.Size([3, 4])
+print(x[:, :, 0].shape)  # torch.Size([2, 3])</code></pre>
+</div>
+
+<h4>Integer-array ("fancy") indexing</h4>
+
+<p>Index with a list or an integer tensor, and you pick those positions, in that order, with repeats allowed:</p>
+
+<div class="code" data-lang="python">
+<pre><code>t = torch.arange(12).view(3, 4)
+print(t[[0, 2]])
+# tensor([[ 0,  1,  2,  3],
+#         [ 8,  9, 10, 11]])
+print(t[[0, 2], [1, 3]])  # tensor([ 1, 11])
+rows = torch.tensor([2, 0, 0, 1])
+print(t[rows].shape)  # torch.Size([4, 4])</code></pre>
+</div>
+
+<p><code>t[[0, 2]]</code> picks rows 0 and 2. <code>t[[0, 2], [1, 3]]</code> pairs the lists up: elements <code>(0, 1)</code> and <code>(2, 3)</code>, not a 2×2 block. Indexing with <code>rows</code> of shape <code>(4,)</code> gives one row per entry, so the result has shape <code>(4, 4)</code>: <strong>the index's shape replaces the indexed dimension</strong>.</p>
+
+<h4>Boolean masks</h4>
+
+<p>A comparison gives a <code>bool</code> tensor of the same shape. Indexing with it selects the elements where it is <code>True</code>, flattened to 1-D. Assigning through a mask writes only those elements.</p>
+
+<div class="code" data-lang="python">
+<pre><code>t = torch.arange(12).view(3, 4)
+mask = t &gt; 5
+print(mask)
+# tensor([[False, False, False, False],
+#         [False, False,  True,  True],
+#         [ True,  True,  True,  True]])
+print(t[mask])  # tensor([ 6,  7,  8,  9, 10, 11])
+
+u = t.clone()
+u[u % 2 == 1] = 0              # assignment through a mask
+print(u)
+# tensor([[ 0,  0,  2,  0],
+#         [ 4,  0,  6,  0],
+#         [ 8,  0, 10,  0]])</code></pre>
+</div>
+
+<h2 id="embedding">The embedding lookup is indexing</h2>
+
+<p>microgpt_scalar's <code>embed</code> does <code>token_embedding_table[token_id]</code>: pick one row of the table for one token. With a tensor table and a tensor of ids, fancy indexing does that for every token at once. A tiny table first, so you can see the rows:</p>
+
+<div class="code" data-lang="python">
+<pre><code>table = torch.arange(15.0).view(5, 3)   # vocabulary 5, 3 numbers per token
+ids = torch.tensor([4, 0, 2, 2])         # a "sentence" of 4 token ids
+print(table)
+# tensor([[ 0.,  1.,  2.],
+#         [ 3.,  4.,  5.],
+#         [ 6.,  7.,  8.],
+#         [ 9., 10., 11.],
+#         [12., 13., 14.]])
+print(table[ids])
+# tensor([[12., 13., 14.],
+#         [ 0.,  1.,  2.],
+#         [ 6.,  7.,  8.],
+#         [ 6.,  7.,  8.]])</code></pre>
+</div>
+
+<p>Ids <code>[4, 0, 2, 2]</code> picked rows 4, 0, 2, 2. Now microgpt's sizes. This is the first line of <code>FastMicroGPT.forward</code>:</p>
+
+<div class="code" data-lang="python">
+<div class="code-hdr"><span class="lang">python</span><span class="title">microgpt.py</span></div>
+<pre><code>            inputs = (
+                self.token_embedding_table[token_ids]
+                + self.position_embedding_table[:sequence_length]
+            )</code></pre>
+</div>
+
+<div class="code" data-lang="python">
+<pre><code>torch.manual_seed(0)
+token_embedding_table = torch.randn(27, 16)      # vocabulary 27, C = 16
+position_embedding_table = torch.randn(16, 16)   # block_size 16, C = 16
+
+token_ids = torch.tensor([26, 4, 12, 12, 0])     # BOS e m m a
+T = token_ids.shape[0]
+tok = token_embedding_table[token_ids]           # (T, C)
+pos = position_embedding_table[:T]               # (T, C): rows 0..T-1
+print(tok.shape, pos.shape)  # torch.Size([5, 16]) torch.Size([5, 16])
+print(torch.equal(tok[1], token_embedding_table[4]))  # True
+
+batch_ids = torch.tensor([[26, 4, 12, 12, 0],    # BOS e m m a
+                          [26, 0, 21, 0, 26]])   # BOS a v a BOS
+print(token_embedding_table[batch_ids].shape)  # torch.Size([2, 5, 16])</code></pre>
+</div>
+
+<p>A <code>(T,)</code> tensor of ids gives <code>(T, C)</code> embeddings: one 16-number row per token. A slice <code>[:T]</code> of the position table gives the matching <code>(T, C)</code> position rows, and adding the two is exactly <code>embed(token_id, position_id)</code> for every position at once. Index with a <code>(B, T)</code> batch of ids and you get <code>(B, T, C)</code>, the shape the rest of a batched transformer works on. In this chapter <strong>B</strong> is the batch size, <strong>T</strong> the sequence length (time) and <strong>C</strong> the channels (embedding size).</p>
+
+<h2 id="reshaping">Reshaping</h2>
+
+<p><code>view(*shape)</code> reinterprets the same elements, read in row-major order, with a new shape. <code>-1</code> means "work this dimension out". <code>reshape</code> does the same and also works in cases where <code>view</code> cannot (more on that in the memory section).</p>
+
+<div class="code" data-lang="python">
+<pre><code>x = torch.arange(6)
+print(x.view(2, 3))
+print(x.view(3, -1).shape)  # torch.Size([3, 2])
+print(x.reshape(-1, 6).shape)  # torch.Size([1, 6])</code></pre>
+</div>
+
+<p>The element count must match:</p>
+
+<div class="code" data-lang="python">
+<pre><code>x = torch.arange(6)
+x.view(4, 2)</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>RuntimeError: shape '[4, 2]' is invalid for input of size 6</code></pre>
+</div>
+
+<h4>Adding and removing size-1 dimensions</h4>
+
+<p><code>unsqueeze(d)</code> inserts a dimension of size 1 at position <code>d</code>; indexing with <code>None</code> does the same. <code>squeeze()</code> removes size-1 dimensions (all of them, or only the one you name, and only if it is size 1). <code>flatten(start)</code> merges dimensions from <code>start</code> onward.</p>
+
+<div class="code" data-lang="python">
+<pre><code>v = torch.zeros(2, 3)
+print(v.unsqueeze(0).shape)  # torch.Size([1, 2, 3])
+print(v.unsqueeze(1).shape)  # torch.Size([2, 1, 3])
+print(v.unsqueeze(-1).shape)  # torch.Size([2, 3, 1])
+print(v[None].shape)  # torch.Size([1, 2, 3])
+
+w = torch.zeros(1, 5, 1)
+print(w.squeeze().shape)  # torch.Size([5])
+print(w.squeeze(0).shape)  # torch.Size([5, 1])
+print(w.squeeze(1).shape)  # torch.Size([1, 5, 1])
+
+y = torch.zeros(2, 3, 4)
+print(y.flatten().shape)  # torch.Size([24])
+print(y.flatten(1).shape)  # torch.Size([2, 12])</code></pre>
+</div>
+
+<div class="callout pitfall">
+<div class="callout-title">Bare <code>squeeze()</code> eats your batch dimension</div>
+<p><code>x.squeeze()</code> removes <em>every</em> size-1 dimension. Code that works for a batch of 8 silently changes shape when the batch size happens to be 1: <code>(1, T, C)</code> becomes <code>(T, C)</code>. Always name the dimension: <code>squeeze(-1)</code>.</p>
+</div>
+
+<h4>Reordering dimensions</h4>
+
+<p><code>transpose(a, b)</code> swaps two dimensions; <code>permute</code> gives a full new order; <code>.T</code> is the 2-D transpose. <code>transpose(-2, -1)</code> swaps the last two, which is how attention transposes keys whatever the leading dimensions are.</p>
+
+<div class="code" data-lang="python">
+<pre><code>y = torch.zeros(2, 3, 4)
+print(y.transpose(0, 1).shape)  # torch.Size([3, 2, 4])
+print(y.transpose(-2, -1).shape)  # torch.Size([2, 4, 3])
+print(y.permute(2, 0, 1).shape)  # torch.Size([4, 2, 3])
+m = torch.tensor([[1, 2, 3], [4, 5, 6]])
+print(m.T)</code></pre>
+</div>
+
+<p>Here is the reshape pattern in <code>FastMicroGPT</code>: the query projection is <code>(T, C)</code>, and attention wants one <code>(T, D)</code> matrix per head.</p>
+
+<div class="code" data-lang="python">
+<div class="code-hdr"><span class="lang">python</span><span class="title">microgpt.py</span></div>
+<pre><code>            query = query.view(
+                sequence_length,
+                fast_number_of_heads,
+                fast_head_size,
+            ).transpose(0, 1)</code></pre>
+</div>
+
+<div class="code" data-lang="python">
+<pre><code>T, C, H = 5, 16, 4                 # tokens, embedding size, heads
+D = C // H                          # head size 4
+torch.manual_seed(0)
+query = torch.randn(T, C)           # F.linear output: one row per token
+
+q = query.view(T, H, D)             # split each row into 4 heads of 4
+print(q.shape)  # torch.Size([5, 4, 4])
+q = q.transpose(0, 1)               # heads first: (H, T, D)
+print(q.shape)  # torch.Size([4, 5, 4])
+print(torch.equal(q[1, 3], query[3, 4:8]))  # True</code></pre>
+</div>
+
+<p><code>view(T, H, D)</code> cuts each 16-number row into four 4-number pieces. <code>transpose(0, 1)</code> brings heads to the front. Head 1 of token 3 is columns 4 to 7 of row 3: the same slice <code>query[head_start:head_end]</code> that microgpt_scalar's <code>attention_head</code> takes.</p>
+
+<h4><code>expand</code> vs <code>repeat</code></h4>
+
+<div class="code" data-lang="python">
+<pre><code>col = torch.tensor([[1], [2], [3]])    # shape (3, 1)
+e = col.expand(3, 4)                   # no copy
+r = col.repeat(1, 4)                   # real copy
+print(e)
+print(torch.equal(e, r))  # True
+print(e.stride(), r.stride())  # (1, 0) (4, 1)
+print(e.data_ptr() == col.data_ptr())  # True</code></pre>
+</div>
+
+<p>Both give the same values. <code>repeat</code> allocates and copies. <code>expand</code> only stretches size-1 dimensions (or adds new leading ones) and copies nothing: it sets that dimension's stride to 0, so every column reads the same memory. You will see what a stride is in a moment. Treat expanded tensors as read-only.</p>
+
+<h4><code>cat</code> vs <code>stack</code></h4>
+
+<div class="code" data-lang="python">
+<pre><code>a = torch.tensor([1, 2, 3])
+b = torch.tensor([4, 5, 6])
+print(torch.cat([a, b]))  # tensor([1, 2, 3, 4, 5, 6])
+print(torch.stack([a, b]))
+# tensor([[1, 2, 3],
+#         [4, 5, 6]])
+print(torch.stack([a, b], dim=1))
+# tensor([[1, 4],
+#         [2, 5],
+#         [3, 6]])
+
+# a growing key cache: 2 cached keys of size 16, then one more
+cache = torch.zeros(2, 16)
+new_key = torch.ones(16)
+cache = torch.cat([cache, new_key.unsqueeze(0)], dim=0)
+print(cache.shape)  # torch.Size([3, 16])</code></pre>
+</div>
+
+<p><code>cat</code> joins along an <em>existing</em> dimension; shapes must match everywhere else. <code>stack</code> creates a <em>new</em> dimension and needs identical shapes. In microgpt_scalar the KV cache is a Python list that grows with <code>key_cache.append(key)</code>; with tensors you either <code>torch.stack</code> the list into <code>(T, C)</code>, or grow a tensor with <code>cat</code> along <code>dim=0</code> as above. Chapter 10 builds a real cache.</p>
+
+<h2 id="memory">Memory: storage, strides and views</h2>
+
+<p>A tensor is two things. The <strong>storage</strong> is a flat 1-D buffer of bytes. The tensor itself is a description of how to read that buffer: a <strong>shape</strong>, a <strong>storage offset</strong> (where element <code>[0, 0, ...]</code> is) and <strong>strides</strong> (how many elements to step in storage to move by one along each dimension). The address of an element is</p>
+
+<div class="code" data-lang="text">
+<pre><code>offset(i, j, ...) = storage_offset + i*stride[0] + j*stride[1] + ...
+
+t = torch.arange(12).view(3, 4)
+storage:  [ 0  1  2  3  4  5  6  7  8  9 10 11 ]    12 x int64 = 96 bytes
+
+t            shape (3, 4)  stride (4, 1)  offset 0   t[i, j]  at 0 + 4i + j
+t.T          shape (4, 3)  stride (1, 4)  offset 0   t.T[i, j] at 0 + i + 4j
+t[1:, 1:]    shape (2, 3)  stride (4, 1)  offset 5   at 5 + 4i + j</code></pre>
+</div>
+
+<p>This is exactly a C array with a dope vector, the descriptor Fortran compilers use for array sections. Check it in PyTorch:</p>
+
+<div class="code" data-lang="python">
+<pre><code>t = torch.arange(12).view(3, 4)
+print(t.stride())  # (4, 1)
+print(t.untyped_storage().nbytes())  # 96
+print(t.element_size())  # 8
+
+s = t[1:, 1:]                   # rows 1-2, columns 1-3
+print(s)
+print(s.storage_offset(), s.stride())  # 5 (4, 1)
+print(s.data_ptr() - t.data_ptr())  # 40</code></pre>
+</div>
+
+<p>The slice <code>t[1:, 1:]</code> starts 5 elements into the same storage, 40 bytes past <code>t</code>'s first element. No numbers were copied.</p>
+
+<h4>Views share memory</h4>
+
+<p>A <strong>view</strong> is a tensor that shares storage with another. <code>view</code>, slicing, basic indexing, <code>transpose</code>, <code>permute</code>, <code>expand</code>, <code>unsqueeze</code> and <code>squeeze</code> all return views: they only compute a new shape, stride and offset. Writing through a view changes the original:</p>
+
+<div class="code" data-lang="python">
+<pre><code>t = torch.arange(12).view(3, 4)
+v = t.view(4, 3)
+v[0, 0] = 100                   # write through the view...
+print(t[0, 0])  # tensor(100)
+print(v.data_ptr() == t.data_ptr())  # True
+
+row = t[1]                      # basic indexing: also a view
+row += 1000
+print(t[1])  # tensor([1004, 1005, 1006, 1007])
+
+picked = t[[1]]                 # advanced indexing: a copy
+picked += 1
+print(t[1])  # tensor([1004, 1005, 1006, 1007])</code></pre>
+</div>
+
+<p>The last block is the exception to remember: <strong>advanced (fancy or boolean) indexing returns a copy</strong>, because the selected elements generally cannot be described by one offset and one stride per dimension.</p>
+
+<h4>Contiguous, and why <code>view</code> sometimes fails</h4>
+
+<p>A tensor is <strong>contiguous</strong> when its strides are the row-major strides for its shape: the last dimension has stride 1 and each earlier stride is the product of the sizes after it. <code>(3, 4)</code> with strides <code>(4, 1)</code> is contiguous. Its transpose, shape <code>(4, 3)</code> with strides <code>(1, 4)</code>, is not: walking along a row of <code>t.T</code> jumps 4 elements at a time.</p>
+
+<div class="code" data-lang="python">
+<pre><code>t = torch.arange(12).view(3, 4)
+tt = t.transpose(0, 1)
+print(tt.shape, tt.stride())  # torch.Size([4, 3]) (1, 4)
+print(tt.is_contiguous())  # False
+print(tt.data_ptr() == t.data_ptr())  # True
+
+c = tt.contiguous()             # copy into row-major order
+print(c.stride(), c.is_contiguous())  # (3, 1) True
+print(c.data_ptr() == t.data_ptr())  # False</code></pre>
+</div>
+
+<p><code>.contiguous()</code> returns the tensor itself if it is already contiguous, and otherwise copies the elements into a fresh buffer in row-major order. Now try to flatten the transpose. Reading <code>t.T</code> in row-major order means visiting storage positions 0, 4, 8, 1, 5, 9, ... No single stride produces that sequence, so a <code>view</code> is impossible:</p>
+
+<div class="code" data-lang="python">
+<pre><code>t = torch.arange(12).view(3, 4)
+tt = t.transpose(0, 1)
+flat = tt.reshape(12)           # works: copies because it has to
+print(flat)  # tensor([ 0,  4,  8,  1,  5,  9,  2,  6, 10,  3,  7, 11])
+print(flat.data_ptr() == t.data_ptr())  # False
+tt.view(12)</code></pre>
+</div>
+
+<div class="code" data-lang="text">
+<pre><code>RuntimeError: view size is not compatible with input tensor's size and stride (at least one dimension spans across two contiguous subspaces). Use .reshape(...) instead.</code></pre>
+</div>
+
+<p><code>reshape</code> returns a view when one exists and silently copies when it does not. <code>view</code> never copies, so it fails instead. That is the whole difference.</p>
+
+<p>Now the line in <code>FastMicroGPT.forward</code> that merges the heads back together makes sense:</p>
+
+<div class="code" data-lang="python">
+<div class="code-hdr"><span class="lang">python</span><span class="title">microgpt.py</span></div>
+<pre><code>            concatenated_heads = attention_weights @ value
+            concatenated_heads = concatenated_heads.transpose(0, 1).reshape(
+                sequence_length,
+                fast_embedding_size,
+            )</code></pre>
+</div>
+
+<p><code>attention_weights @ value</code> produces a fresh, contiguous <code>(H, T, D)</code> tensor. Transposing it to <code>(T, H, D)</code> makes it non-contiguous, and merging <code>H</code> and <code>D</code> into <code>C</code> then needs a copy. With <code>.view</code> it fails:</p>
+
+<div class="code" data-lang="python">
+<pre><code>T, H, D = 5, 4, 4
+heads = torch.randn(H, T, D)          # per-head outputs, like attention_weights @ value
+back = heads.transpose(0, 1)          # (T, H, D), not contiguous
+print(back.is_contiguous())  # False
+merged = back.reshape(T, H * D)       # what microgpt.py does
+print(merged.shape)  # torch.Size([5, 16])
+back.view(T, H * D)</code></pre>
+</div>
+
+<div class="code" data-lang="text">
+<pre><code>False
+torch.Size([5, 16])
+RuntimeError: view size is not compatible with input tensor's size and stride (at least one dimension spans across two contiguous subspaces). Use .reshape(...) instead.</code></pre>
+</div>
+
+<div class="callout hood">
+<div class="callout-title">Under the hood: who produces which layout</div>
+<p>Matmul writes its result in standard row-major order. Elementwise operations (<code>+</code>, <code>*</code>, <code>exp</code>) instead keep the stride <em>order</em> of their input: <code>(x * 2)</code> for a transposed <code>x</code> is transposed too. Kernels prefer contiguous inputs because the innermost loop then reads consecutive addresses, which is what caches and vector loads want. That is why GPU attention code is careful about the order of <code>transpose</code> and <code>contiguous()</code>, and why a stray <code>.contiguous()</code> in a hot loop shows up in profiles as a copy kernel.</p>
+</div>
+
+<p>When you want an independent copy regardless of layout, use <code>clone()</code>:</p>
+
+<div class="code" data-lang="python">
+<pre><code>t = torch.arange(4)
+c = t.clone()
+c[0] = -1
+print(t)  # tensor([0, 1, 2, 3])
+print(c)  # tensor([-1,  1,  2,  3])</code></pre>
+</div>
+
+<table>
+  <tr><th>Returns a view (shares memory)</th><th>Returns a copy</th><th>Depends</th></tr>
+  <tr><td><code>view</code>, slicing, <code>t[i]</code>, <code>transpose</code>, <code>permute</code>, <code>.T</code>, <code>unsqueeze</code>, <code>squeeze</code>, <code>expand</code>, <code>.numpy()</code>, <code>from_numpy</code></td><td><code>clone</code>, fancy and boolean indexing, <code>repeat</code>, <code>cat</code>, <code>stack</code>, <code>torch.tensor(...)</code>, every arithmetic op</td><td><code>reshape</code>, <code>flatten</code>, <code>contiguous</code>: a view if possible, else a copy</td></tr>
+</table>
+
+<h2 id="leaving">Leaving PyTorch</h2>
+
+<p>Sooner or later you need plain Python or NumPy values: to print a loss, to look up a character, to plot.</p>
+
+<div class="code" data-lang="python">
+<pre><code>loss = torch.tensor([0.25, 0.75]).mean()
+print(loss)  # tensor(0.5000)
+print(loss.item())  # 0.5
+print(type(loss.item()))  # &lt;class 'float'&gt;
+print(torch.tensor([[1, 2], [3, 4]]).tolist())  # [[1, 2], [3, 4]]
+torch.tensor([1.0, 2.0, 3.0]).item()</code></pre>
+</div>
+
+<div class="code" data-lang="text">
+<pre><code>RuntimeError: a Tensor with 3 elements cannot be converted to Scalar</code></pre>
+</div>
+
+<p><code>.item()</code> converts a one-element tensor to a Python number; microgpt uses it for <code>loss.item()</code> and for the sampled <code>next_token_id</code>. <code>.tolist()</code> converts any tensor to nested lists. On a GPU tensor both force a device-to-host copy and wait for the GPU to finish, so keep them out of hot loops.</p>
+
+<p>NumPy conversion shares memory in both directions, on CPU:</p>
+
+<div class="code" data-lang="python">
+<pre><code>t = torch.zeros(3)
+n = t.numpy()                   # shares t's memory
+n[0] = 7.0
+print(t)  # tensor([7., 0., 0.])
+
+a = np.array([1.0, 2.0])        # NumPy's default float is float64
+u = torch.from_numpy(a)         # shares a's memory, keeps float64
+a[1] = 9.0
+print(u)  # tensor([1., 9.], dtype=torch.float64)
+
+w = torch.tensor(a)             # torch.tensor always copies
+a[0] = -5.0
+print(w)  # tensor([1., 9.], dtype=torch.float64)</code></pre>
+</div>
+
+<p>Two errors you will meet, and their fixes:</p>
+
+<div class="code" data-lang="python">
+<pre><code>p = torch.ones(2, requires_grad=True)
+try:
+    p.numpy()
+except RuntimeError as e:
+    print(e)
+print(p.detach().numpy())  # [1. 1.]
+
+g = torch.ones(2, device="mps")
+try:
+    g.numpy()
+except TypeError as e:
+    print(e)
+print(g.cpu().numpy())  # [1. 1.]</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>Can't call numpy() on Tensor that requires grad. Use tensor.detach().numpy() instead.
+[1. 1.]
+can't convert mps:0 device type tensor to numpy. Use Tensor.cpu() to copy the tensor to host memory first.
+[1. 1.]</code></pre>
+</div>
+
+<div class="callout pitfall">
+<div class="callout-title">NumPy's float64 meets PyTorch's float32</div>
+<p>NumPy defaults to 64-bit floats and <code>from_numpy</code> keeps the dtype. Feed that into a float32 model and you get:</p>
+<div class="code" data-lang="python">
+<pre><code>W = torch.randn(4, 3)                        # float32, like model weights
+x = torch.from_numpy(np.random.rand(2, 3))   # float64
+x @ W.T</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>RuntimeError: expected m1 and m2 to have the same dtype, but got: double != float</code></pre>
+</div>
+<p>Convert at the boundary: <code>torch.from_numpy(a).float()</code>, or <code>torch.tensor(a, dtype=torch.float32)</code>.</p>
+</div>
+
+<div class="hands-on">
+<div class="hands-on-hdr">Hands-on · do this now</div>
+<div class="hands-on-body">
+<p>1. Open a Python shell in <code>~/learning-pytorch</code> and make <code>t = torch.arange(12).view(3, 4)</code>. For each of <code>t.T</code>, <code>t[:, 1]</code>, <code>t[::2]</code> and <code>t.view(2, 6)</code>, write down the shape, stride, storage offset and whether it is contiguous. Then check with <code>.shape</code>, <code>.stride()</code>, <code>.storage_offset()</code>, <code>.is_contiguous()</code>.</p>
+<p>2. Prove which of them are views: set element <code>[0, 0]</code> of each (or <code>[0]</code> for 1-D) to <code>-1</code> and print <code>t</code> after each write.</p>
+<p>3. In a copy of <code>microgpt.py</code>, change the <code>.reshape(</code> on the line after <code>attention_weights @ value</code> to <code>.view(</code> and run <code>TRAINING_STEPS=1 EVALUATION_LIMIT=1 python microgpt.py</code>. You should get the "view size is not compatible" error from this chapter. Change it back.</p>
+</div>
+</div>
+
+<h2 id="exercises">Exercises</h2>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 2.1</span>
+  <span class="exercise-diff easy">easy</span>
+  <span class="exercise-title">Predict shape and dtype</span>
+</div>
+<div class="exercise-body">
+<p>Without running them, write down what each line prints. Then run them.</p>
+<div class="code" data-lang="python">
+<pre><code>torch.tensor([[1, 2], [3, 4]]).shape
+torch.tensor(5.0).shape
+torch.arange(3, 9, 2)
+torch.arange(5.0).dtype
+torch.tensor([1, 2.0]).dtype
+torch.full((2,), 3).dtype
+torch.randn(4, 1, 3).squeeze().shape
+torch.tensor([[1], [2]]).T.shape</code></pre>
+</div>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<div class="code" data-lang="python">
+<pre><code>import torch
+
+print(torch.tensor([[1, 2], [3, 4]]).shape)  # torch.Size([2, 2])
+print(torch.tensor(5.0).shape)  # torch.Size([])
+print(torch.arange(3, 9, 2))  # tensor([3, 5, 7])
+print(torch.arange(5.0).dtype)  # torch.float32
+print(torch.tensor([1, 2.0]).dtype)  # torch.float32
+print(torch.full((2,), 3).dtype)  # torch.int64
+print(torch.randn(4, 1, 3).squeeze().shape)  # torch.Size([4, 3])
+print(torch.tensor([[1], [2]]).T.shape)  # torch.Size([1, 2])</code></pre>
+</div>
+<p>The tricky ones: <code>torch.arange(5.0)</code> is float because the argument is a float; <code>torch.full((2,), 3)</code> infers <code>int64</code> from the fill value 3 (write <code>3.0</code> for a float tensor); <code>squeeze()</code> removes the size-1 middle dimension.</p>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 2.2</span>
+  <span class="exercise-diff easy">easy</span>
+  <span class="exercise-title">Indexing drill</span>
+</div>
+<div class="exercise-body">
+<p>With <code>x = torch.arange(24).view(2, 3, 4)</code>, predict: <code>x[1, 2]</code>, <code>x[:, 0]</code>, <code>x[..., 1]</code>, <code>x[0, :, ::2]</code>, <code>x[x &gt; 20]</code>, and the shapes of <code>x[:, [0, 2]]</code> and <code>x[:, 1:2]</code>.</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<div class="code" data-lang="python">
+<pre><code>import torch
+
+x = torch.arange(24).view(2, 3, 4)
+print(x[1, 2])  # tensor([20, 21, 22, 23])
+print(x[:, 0])
+# tensor([[ 0,  1,  2,  3],
+#         [12, 13, 14, 15]])
+print(x[..., 1])
+# tensor([[ 1,  5,  9],
+#         [13, 17, 21]])
+print(x[0, :, ::2])
+# tensor([[ 0,  2],
+#         [ 4,  6],
+#         [ 8, 10]])
+print(x[x &gt; 20])  # tensor([21, 22, 23])
+print(x[:, [0, 2]].shape)  # torch.Size([2, 2, 4])
+print(x[:, 1:2].shape)  # torch.Size([2, 1, 4])</code></pre>
+</div>
+<p>Think of <code>x</code> as 2 blocks of 3 rows of 4. <code>x[:, 0]</code> is row 0 of each block; <code>x[..., 1]</code> is column 1 of every row, shape <code>(2, 3)</code>. <code>x[:, [0, 2]]</code> keeps the dimension (a list of 2 indices gives size 2), and <code>x[:, 1:2]</code> keeps it with size 1, while <code>x[:, 1]</code> would drop it.</p>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 2.3</span>
+  <span class="exercise-diff medium">medium</span>
+  <span class="exercise-title">Stride puzzles</span>
+</div>
+<div class="exercise-body">
+<p>For <code>x = torch.arange(24).view(2, 3, 4)</code>, predict the shape, stride, storage offset and contiguity of: <code>x</code>, <code>x.transpose(0, 2)</code>, <code>x.permute(1, 0, 2)</code>, <code>x[:, ::2, 1:]</code>, <code>x[0].expand(5, 3, 4)</code>, <code>x[:, 1]</code>.</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<div class="code" data-lang="python">
+<pre><code>import torch
+
+x = torch.arange(24).view(2, 3, 4)
+for name, v in [
+    ("x", x),
+    ("x.transpose(0, 2)", x.transpose(0, 2)),
+    ("x.permute(1, 0, 2)", x.permute(1, 0, 2)),
+    ("x[:, ::2, 1:]", x[:, ::2, 1:]),
+    ("x[0].expand(5, 3, 4)", x[0].expand(5, 3, 4)),
+    ("x[:, 1]", x[:, 1]),
+]:
+    print(f"{name:22} shape={tuple(v.shape)} stride={v.stride()} "
+          f"offset={v.storage_offset()} contiguous={v.is_contiguous()}")</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>x                      shape=(2, 3, 4) stride=(12, 4, 1) offset=0 contiguous=True
+x.transpose(0, 2)      shape=(4, 3, 2) stride=(1, 4, 12) offset=0 contiguous=False
+x.permute(1, 0, 2)     shape=(3, 2, 4) stride=(4, 12, 1) offset=0 contiguous=False
+x[:, ::2, 1:]          shape=(2, 2, 3) stride=(12, 8, 1) offset=1 contiguous=False
+x[0].expand(5, 3, 4)   shape=(5, 3, 4) stride=(0, 4, 1) offset=0 contiguous=False
+x[:, 1]                shape=(2, 4) stride=(12, 1) offset=4 contiguous=False</code></pre>
+</div>
+<p>Rules that produce every line: transposing and permuting reorder the strides along with the shape. A step of 2 doubles a stride (4 becomes 8). Slicing from 1 adds <code>1 × stride</code> to the offset. <code>expand</code> gives the new dimension stride 0. <code>x[:, 1]</code> starts at offset 4 and is not contiguous because its first stride (12) skips the other rows of each block; a contiguous <code>(2, 4)</code> tensor would have stride <code>(4, 1)</code>.</p>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 2.4</span>
+  <span class="exercise-diff medium">medium</span>
+  <span class="exercise-title">A <code>(B, T)</code> batch of names</span>
+</div>
+<div class="exercise-body">
+<p>microgpt trains on one name at a time. Build a batch instead: encode <code>["emma", "ava", "olivia"]</code> the microgpt way (a–z → 0–25, BOS = 26 at both ends), pad to the longest with <code>-1</code>, and slice out <code>inputs</code> and <code>targets</code> of shape <code>(B, T)</code> so that <code>targets[b, t]</code> is the token after <code>inputs[b, t]</code>. Count the real (non-padding) targets, and replace padding in <code>inputs</code> with a valid id so an embedding lookup will not fail.</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<div class="code" data-lang="python">
+<pre><code>import torch
+
+BOS = 26
+names = ["emma", "ava", "olivia"]
+
+
+def encode(name):
+    # same as microgpt: a..z -&gt; 0..25, BOS at both ends
+    return [BOS] + [ord(ch) - ord("a") for ch in name] + [BOS]
+
+
+encoded = [encode(n) for n in names]
+L = max(len(e) for e in encoded)
+batch = torch.full((len(names), L), -1, dtype=torch.long)   # -1 = padding
+for i, e in enumerate(encoded):
+    batch[i, :len(e)] = torch.tensor(e)
+print(batch)
+# tensor([[26,  4, 12, 12,  0, 26, -1, -1],
+#         [26,  0, 21,  0, 26, -1, -1, -1],
+#         [26, 14, 11,  8, 21,  8,  0, 26]])
+
+inputs = batch[:, :-1]           # (B, T): what the model sees
+targets = batch[:, 1:]           # (B, T): the next token at each position
+print(inputs.shape, targets.shape)  # torch.Size([3, 7]) torch.Size([3, 7])
+
+real = targets != -1
+print(real.sum().item())  # 16
+inputs = inputs.masked_fill(inputs == -1, BOS)   # a valid id for the lookup
+print(inputs)
+# tensor([[26,  4, 12, 12,  0, 26, 26],
+#         [26,  0, 21,  0, 26, 26, 26],
+#         [26, 14, 11,  8, 21,  8,  0]])</code></pre>
+</div>
+<p>This is <code>make_training_pair</code> for a whole batch: <code>token_ids[:n]</code> and <code>token_ids[1:n + 1]</code> became <code>batch[:, :-1]</code> and <code>batch[:, 1:]</code>. There are 5 + 4 + 7 = 16 real targets. Padding in <code>inputs</code> must be a valid row index (−1 would silently pick the <em>last</em> row of the table, and 27 or more raises an <code>IndexError</code>), so it is replaced by BOS; the padded <em>targets</em> stay −1 so the loss can skip them (<code>ignore_index</code>, Chapter 7).</p>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 2.5</span>
+  <span class="exercise-diff medium">medium</span>
+  <span class="exercise-title">Embedding lookup as a matmul</span>
+</div>
+<div class="exercise-body">
+<p>Show that <code>table[ids]</code> equals multiplying one-hot vectors by the table. Use a <code>(27, 16)</code> random table and a <code>(2, 5)</code> batch of ids, and <code>torch.nn.functional.one_hot</code>. Why does every framework use indexing instead?</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<div class="code" data-lang="python">
+<pre><code>import torch
+import torch.nn.functional as F
+
+torch.manual_seed(0)
+table = torch.randn(27, 16)                      # token_embedding_table
+ids = torch.tensor([[26, 4, 12, 12, 0],
+                    [26, 0, 21, 0, 26]])         # (B, T) = (2, 5)
+
+by_index = table[ids]                            # (2, 5, 16)
+one_hot = F.one_hot(ids, num_classes=27)         # (2, 5, 27), int64
+by_matmul = one_hot.float() @ table              # (2, 5, 27) @ (27, 16)
+print(one_hot[0, 1].nonzero().item())  # 4
+print(by_index.shape, by_matmul.shape)  # torch.Size([2, 5, 16]) torch.Size([2, 5, 16])
+print(torch.equal(by_index, by_matmul))  # True</code></pre>
+</div>
+<p>Row <code>i</code> of <code>one_hot @ table</code> is the sum of table rows weighted by the one-hot vector, which is just the row at the hot position. The matmul does 27× the reads and 27 multiply-adds per output where indexing does a single copy, and the one-hot tensor is <code>(B, T, V)</code>, which for a real vocabulary of 100k+ tokens is enormous. Indexing is a gather: memory-bound and cheap. The equivalence still tells you the gradient: the table's gradient is the one-hot matrix transposed times the output gradient, a scatter-add into the rows that were used.</p>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 2.6</span>
+  <span class="exercise-diff hard">hard</span>
+  <span class="exercise-title">Split and merge attention heads</span>
+</div>
+<div class="exercise-body">
+<p>Take a <code>(T, C)</code> value projection with <code>T=5, C=16, H=4</code>. Split it into heads <code>(H, T, D)</code>, apply random <code>(H, T, T)</code> attention weights with <code>@</code>, then merge the result back to <code>(T, C)</code>. Show that <code>.view</code> fails for the merge, give three fixes, and check each against concatenating the heads with <code>torch.cat</code> (what microgpt_scalar's <code>concatenated_head_outputs.extend</code> does). Also explain why <code>v_heads.transpose(0, 1)</code> on the <em>split</em> side is contiguous.</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<div class="code" data-lang="python">
+<pre><code>import torch
+
+T, C, H = 5, 16, 4
+D = C // H
+torch.manual_seed(0)
+value = torch.randn(T, C)
+weights = torch.softmax(torch.randn(H, T, T), dim=-1)   # attention weights
+
+v_heads = value.view(T, H, D).transpose(0, 1)    # split: (H, T, D), a view
+print(v_heads.transpose(0, 1).is_contiguous())  # True
+
+out = weights @ v_heads                          # (H, T, D), a NEW tensor
+print(out.stride())  # (20, 4, 1)
+back = out.transpose(0, 1)                       # (T, H, D) view of out
+print(back.is_contiguous())  # False
+
+try:
+    back.view(T, C)
+except RuntimeError as e:
+    print("view failed:", str(e)[:45])
+
+reference = torch.cat([out[h] for h in range(H)], dim=1)   # concat heads
+fix1 = back.reshape(T, C)                        # copies because it must
+fix2 = back.contiguous().view(T, C)              # explicit copy, then view
+fix3 = out.permute(1, 0, 2).flatten(1)           # flatten copies too
+for y in (fix1, fix2, fix3):
+    print(torch.equal(y, reference), y.data_ptr() == out.data_ptr())</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>True
+(20, 4, 1)
+False
+view failed: view size is not compatible with input tensor
+True False
+True False
+True False</code></pre>
+</div>
+<p>Transposing twice restores the original strides, so the split-then-unsplit view is just <code>value</code> again: contiguous. The matmul output is a new row-major <code>(H, T, D)</code> buffer (stride <code>(20, 4, 1)</code>), and its transpose has strides <code>(4, 20, 1)</code>; merging the last two dimensions would need one stride to walk 4 elements, then jump 20, so no view exists. All three fixes copy (the <code>data_ptr</code> differs from <code>out</code>). <code>reshape</code> is the idiomatic one. A subtle trap: if you replace the matmul with an elementwise op such as <code>v_heads * 2</code>, the result keeps <code>v_heads</code>' transposed layout and the merge would not need a copy at all.</p>
+</div>
+</details>
+</div>
+</div>
+
+<div class="exercise">
+<div class="exercise-hdr">
+  <span class="exercise-num">EX 2.7</span>
+  <span class="exercise-diff hard">hard</span>
+  <span class="exercise-title">Address arithmetic by hand</span>
+</div>
+<div class="exercise-body">
+<p>Write <code>element(t, index)</code> that reads an element of any view of <code>base = torch.arange(24)</code> using only <code>t.storage_offset()</code>, <code>t.stride()</code> and <code>base</code>. Check it against normal indexing for every element of: a <code>(2, 3, 4)</code> view, its <code>transpose(0, 2)</code>, a stepped slice, and an expanded tensor. Then rebuild each view from scratch with <code>torch.as_strided(base, size, stride, offset)</code>.</p>
+<details class="solution">
+<summary>Show solution</summary>
+<div>
+<div class="code" data-lang="python">
+<pre><code>import itertools
+
+import torch
+
+base = torch.arange(24)                  # owns the storage; base[k] is element k
+
+
+def element(t, index):
+    offset = t.storage_offset()
+    for i, stride in zip(index, t.stride()):
+        offset += i * stride
+    return base[offset]
+
+
+x = base.view(2, 3, 4)
+views = {
+    "x": x,
+    "x.transpose(0, 2)": x.transpose(0, 2),
+    "x[1, :, 1::2]": x[1, :, 1::2],
+    "x[:, 2].unsqueeze(1).expand(2, 3, 4)": x[:, 2].unsqueeze(1).expand(2, 3, 4),
+}
+for name, v in views.items():
+    ok = all(
+        element(v, idx) == v[idx]
+        for idx in itertools.product(*[range(n) for n in v.shape])
+    )
+    rebuilt = torch.as_strided(base, v.shape, v.stride(), v.storage_offset())
+    print(f"{name:38} {ok} {torch.equal(rebuilt, v)}")</code></pre>
+</div>
+<div class="code" data-lang="text">
+<pre><code>x                                      True True
+x.transpose(0, 2)                      True True
+x[1, :, 1::2]                          True True
+x[:, 2].unsqueeze(1).expand(2, 3, 4)   True True</code></pre>
+</div>
+<p>Every view in this chapter is the triple (shape, stride, offset) over the same storage, and <code>as_strided</code> lets you write that triple directly. It is the most general view constructor, and the most dangerous: nothing stops you from making overlapping or out-of-range views. Real code uses it for tricks such as sliding windows without copies; for this tutorial it is a way to check your mental model.</p>
+</div>
+</details>
+</div>
+</div>
+
+<h2 id="recap">Recap</h2>
+<ul>
+  <li>Create with <code>torch.tensor</code> (dtype inferred: int64, float32, bool) or factories: <code>zeros</code>, <code>ones</code>, <code>full</code>, <code>arange</code>, <code>linspace</code>, <code>randn</code>, <code>rand</code>, <code>randint</code>, <code>empty</code>, and <code>*_like</code>. Seed with <code>torch.manual_seed</code>.</li>
+  <li>Inspect with <code>.shape</code>, <code>.ndim</code>, <code>.numel()</code>, <code>.dtype</code>, <code>.device</code>. Operations need all inputs on one device.</li>
+  <li>Integer indices drop a dimension, slices keep it, <code>...</code> stands for the rest. Fancy indexing: the index's shape replaces the indexed dimension. Masks select where <code>True</code>.</li>
+  <li>The embedding lookup is <code>table[token_ids]</code>: <code>(T,)</code> ids give <code>(T, C)</code>, <code>(B, T)</code> give <code>(B, T, C)</code>.</li>
+  <li><code>view</code>/<code>reshape</code>, <code>unsqueeze</code>/<code>squeeze</code>, <code>flatten</code>, <code>transpose</code>/<code>permute</code>, <code>expand</code> (no copy) vs <code>repeat</code> (copy), <code>cat</code> (existing dim) vs <code>stack</code> (new dim).</li>
+  <li>A tensor is (storage, shape, stride, offset). Views share storage. Transposes are non-contiguous; <code>view</code> fails on them, <code>reshape</code> copies. That is why microgpt merges heads with <code>.reshape</code>.</li>
+  <li><code>.item()</code> and <code>.tolist()</code> leave PyTorch. <code>.numpy()</code> and <code>from_numpy</code> share memory; watch for NumPy's float64.</li>
+</ul>
+
+<div class="page-nav">
+  <a href="01-why-pytorch.html"><span class="lbl">← Prev</span><span class="ttl">Why PyTorch</span></a>
+  <a href="03-tensor-math.html" class="next"><span class="lbl">Next →</span><span class="ttl">Tensor Math &amp; Broadcasting</span></a>
+</div>
+
+</main>
+</div>
+<script src="../assets/site.js"></script>
+</body>
+</html>
